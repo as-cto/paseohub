@@ -219,8 +219,15 @@ export interface LinearAgentActivityHistory {
 }
 
 export interface LinearAgentActivityContent {
-  type: "thought" | "response" | "error";
+  type: "thought" | "response" | "error" | "elicitation";
   body: string;
+}
+
+/** Linear renders a `select` elicitation as a choice list built from `signalMetadata.options`. */
+export type LinearAgentActivitySignal = "select";
+
+export interface LinearAgentActivitySignalMetadata {
+  options: Array<{ label: string; value: string }>;
 }
 
 export interface LinearApiClient {
@@ -248,6 +255,8 @@ export interface LinearApiClient {
     agentSessionId: string;
     content: LinearAgentActivityContent;
     ephemeral?: boolean;
+    signal?: LinearAgentActivitySignal;
+    signalMetadata?: LinearAgentActivitySignalMetadata;
   }): Promise<void>;
 }
 
@@ -566,17 +575,23 @@ export function createLinearApiClient(options: {
             $agentSessionId: String!
             $content: JSONObject!
             $ephemeral: Boolean
+            $signal: AgentActivitySignal
+            $signalMetadata: JSONObject
           ) {
             agentActivityCreate(input: {
               agentSessionId: $agentSessionId
               content: $content
               ephemeral: $ephemeral
+              signal: $signal
+              signalMetadata: $signalMetadata
             }) { success }
           }`,
           variables: {
             agentSessionId: input.agentSessionId,
             content: input.content,
             ...(input.ephemeral === undefined ? {} : { ephemeral: input.ephemeral }),
+            ...(input.signal === undefined ? {} : { signal: input.signal }),
+            ...(input.signalMetadata === undefined ? {} : { signalMetadata: input.signalMetadata }),
           },
         }),
       );
