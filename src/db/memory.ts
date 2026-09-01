@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AgentExecutionStatus, MachineStatus } from "./schema.js";
+import { completesAtIdleDeadline } from "./idle-completion.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import {
@@ -607,9 +608,14 @@ class MemoryDatabase implements Database {
         );
       }
       if (deadlineKind !== undefined) {
-        const timedOut = this.timeoutWorkflowStep(execution.id, deadlineKind, observedAt);
-        const terminalRun = this.triggerRuns.get(run.id);
-        return transitionWithTerminalRun(timedOut, terminalRun);
+        const resolved = this.resolveWorkflowStepDeadline(
+          execution,
+          step,
+          run,
+          deadlineKind,
+          observedAt,
+        );
+        return transitionWithTerminalRun(resolved, this.triggerRuns.get(run.id));
       }
     }
 
@@ -679,6 +685,52 @@ class MemoryDatabase implements Database {
       });
     }
     this.workflowWakeups.delete(run.id);
+  }
+
+  /** A step whose execution already emitted an output completes at its idle deadline; any other step deadline times it out. */
+  private resolveWorkflowStepDeadline(
+    execution: AgentExecutionRecord,
+    step: WorkflowStepRunRecord,
+    run: TriggerRunRecord,
+    deadlineKind: Exclude<WorkflowDeadlineKind, "whole_run">,
+    now: Date,
+  ): TransitionAgentExecutionResult {
+    return deadlineKind === "step_idle" && completesAtIdleDeadline(execution)
+      ? this.completeWorkflowStepAtIdleDeadline(execution, step, run, now)
+      : this.timeoutWorkflowStep(execution.id, deadlineKind, now);
+  }
+
+  private completeWorkflowStepAtIdleDeadline(
+    execution: AgentExecutionRecord,
+    step: WorkflowStepRunRecord,
+    run: TriggerRunRecord,
+    now: Date,
+  ): TransitionAgentExecutionResult {
+    const result = { status: "succeeded" as const };
+    const hubAction: AgentExecutionRecord["hubAction"] =
+      execution.daemonId !== null && execution.launchIntent?.autoArchive === true
+        ? "archive"
+        : null;
+    const updatedExecution: AgentExecutionRecord = {
+      ...execution,
+      status: "succeeded",
+      completedAt: now,
+      result,
+      idleDeadlineAt: null,
+      hubAction,
+      hubActionCompletedAt: hubAction === null ? now : null,
+      hubActionReadyAt: null,
+      hubActionAcknowledgements: emptyHubActionAcknowledgements(),
+    };
+    this.agentExecutions.set(execution.id, updatedExecution);
+    this.finishWorkflowStep(step, run, {
+      executionId: execution.id,
+      executionStatus: "succeeded",
+      stepStatus: "succeeded",
+      result,
+      observedAt: now,
+    });
+    return { execution: updatedExecution, transitioned: true };
   }
 
   private timeoutWorkflowStep(
@@ -821,8 +873,18 @@ class MemoryDatabase implements Database {
         const deadlineKind = workflowDeadlineKind(execution, step, run, now);
         if (deadlineKind === undefined || deadlineKind === "whole_run") continue;
         if (execution !== undefined) {
-          const recovery = this.timeoutWorkflowStep(execution.id, deadlineKind, now);
-          recoveries.push({ triggerRunId: run.id, executionIds: [recovery.execution.id] });
+          const resolved = this.resolveWorkflowStepDeadline(
+            execution,
+            step,
+            run,
+            deadlineKind,
+            now,
+          );
+          recoveries.push(
+            resolved.execution.status === "succeeded"
+              ? { triggerRunId: run.id, executionIds: [], completedExecutionIds: [execution.id] }
+              : { triggerRunId: run.id, executionIds: [execution.id] },
+          );
         } else {
           this.workflowStepRuns.set(step.id, {
             ...step,

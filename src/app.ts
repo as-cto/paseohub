@@ -200,7 +200,10 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       ? {}
       : {
           onWorkflowDeadlineExceeded: async (recovery: WorkflowDeadlineRecovery) => {
-            await daemonModule.lifecycle.recoverWorkflowDeadlineExecutions(recovery.executionIds);
+            await daemonModule.lifecycle.recoverWorkflowDeadlineExecutions(
+              recovery.executionIds,
+              recovery.completedExecutionIds ?? [],
+            );
           },
           onWorkflowRunAccepted: (run: AcceptedTriggerRunRecord) =>
             daemonModule.lifecycle.notifyWorkflowRunAccepted(run),

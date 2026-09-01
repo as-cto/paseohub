@@ -19,6 +19,7 @@ import type {
   WorkflowAgentCompletionInput,
 } from "../db/types.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import { completesAtIdleDeadline } from "../db/idle-completion.js";
 import { logger as defaultLogger } from "../logger.js";
 import { reportFailure } from "../failures/index.js";
 import type { TriggerProvider } from "../triggers/index.js";
@@ -931,12 +932,21 @@ export class DaemonDispatchLifecycle {
     await Promise.all(executions.map((execution) => this.reconcileHubActionSafely(execution)));
   }
 
-  async recoverWorkflowDeadlineExecutions(executionIds: readonly string[]): Promise<void> {
+  async recoverWorkflowDeadlineExecutions(
+    executionIds: readonly string[],
+    completedExecutionIds: readonly string[] = [],
+  ): Promise<void> {
     for (const executionId of executionIds) {
       this.clearExecutionDeadline(executionId);
       this.releaseExecutionResources(executionId);
       this.startedExecutions.delete(executionId);
       this.completionWatchersByExecution.get(executionId)?.(new DaemonDispatchFailure("timeout"));
+    }
+    for (const executionId of completedExecutionIds) {
+      this.clearExecutionDeadline(executionId);
+      this.releaseExecutionResources(executionId);
+      this.startedExecutions.delete(executionId);
+      this.completionWatchersByExecution.get(executionId)?.();
     }
     await this.recoverPendingHubActions();
   }
@@ -1108,7 +1118,12 @@ export class DaemonDispatchLifecycle {
 
   private async completeAgentExecution(
     executionId: string,
-    options: { completedByAgent?: boolean; output?: unknown; deferHubAction?: boolean } = {},
+    options: {
+      completedByAgent?: boolean;
+      output?: unknown;
+      deferHubAction?: boolean;
+      deadlineCondition?: TransitionAgentExecutionFields["deadlineCondition"];
+    } = {},
   ): Promise<AgentExecutionRecord> {
     const existing = await this.options.database.findAgentExecutionById(executionId);
     if (existing === undefined) throw new Error(`agent execution not found: ${executionId}`);
@@ -1125,6 +1140,9 @@ export class DaemonDispatchLifecycle {
             ? { status: "succeeded" }
             : { status: "succeeded", output: options.output },
         completedByAgent: options.completedByAgent === true,
+        ...(options.deadlineCondition === undefined
+          ? {}
+          : { deadlineCondition: options.deadlineCondition }),
       },
       {
         stepStatus: "succeeded",
@@ -1723,6 +1741,9 @@ export class DaemonDispatchLifecycle {
     }
 
     const wholeRunExpired = await this.isWholeRunDeadlineExpired(execution);
+    if (deadline.kind === "idle" && !wholeRunExpired && completesAtIdleDeadline(execution)) {
+      return this.completeExecutionAtIdleDeadline(executionId, deadline);
+    }
     const failure = deadlineFailure(execution, deadline, wholeRunExpired);
     const failed = await this.failAgentExecution(executionId, failure.reason, {
       deadlineCondition: {
@@ -1743,6 +1764,27 @@ export class DaemonDispatchLifecycle {
     if (current !== undefined && !isTerminalExecutionStatus(current.status)) {
       this.armExecutionDeadline(current);
     }
+    return false;
+  }
+
+  /** See `completesAtIdleDeadline`: a reply followed by silence is a completion, not a timeout. */
+  private async completeExecutionAtIdleDeadline(
+    executionId: string,
+    deadline: ExecutionDeadline,
+  ): Promise<boolean> {
+    const completed = await this.completeAgentExecution(executionId, {
+      deadlineCondition: {
+        kind: deadline.kind,
+        deadlineAt: deadline.at,
+        observedAt: new Date(this.now()),
+      },
+    });
+    if (completed.status === "succeeded") {
+      this.completionWatchersByExecution.get(executionId)?.();
+      return true;
+    }
+    if (isTerminalExecutionStatus(completed.status)) return true;
+    this.armExecutionDeadline(completed);
     return false;
   }
 

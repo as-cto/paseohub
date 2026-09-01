@@ -169,6 +169,110 @@ describe("durable Hub action acknowledgement state", () => {
     await lifecycle.stop();
   });
 
+  describe("idle deadline after an emitted output", () => {
+    async function idleWorkflowExecution(options: { emitted: boolean }) {
+      const database = createMemoryDatabase();
+      const lifecycle = createDaemonDispatchLifecycle({
+        database,
+        connectionForDaemon: () => undefined,
+      });
+      const run = (
+        await database.createAcceptedTriggerRun({
+          organizationId: "org-idle-output",
+          projectId: "project-idle-output",
+          configurationRevisionId: "revision-idle-output",
+          providerEventReceiptId: `receipt-idle-output-${options.emitted ? "emitted" : "silent"}`,
+          configuredTriggerName: "idle",
+          prompt: "raw",
+          inputs: {},
+          triggerContext: { provider: "test" },
+          outputContext: { provider: "test" },
+          deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+          stepIds: ["step"],
+        })
+      ).run;
+      const step = (await database.listWorkflowStepRunsForTriggerRun(run.id))[0]!;
+      const execution = await database.insertAgentExecution({
+        id: "00000000-0000-4000-8000-0000000000ee",
+        organizationId: run.organizationId,
+        projectId: run.projectId,
+        machineId: null,
+        daemonId: DAEMON_ID,
+        triggerContext: run.triggerContext,
+        outputContext: run.outputContext,
+        configurationRevisionId: run.configurationRevisionId,
+        workflowStepRunId: step.id,
+        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+        idleDeadlineAt: new Date("2000-01-01T00:00:00.000Z"),
+      });
+      await database.linkWorkflowStepRunExecution(step.id, execution.id);
+      if (options.emitted) await emitOutput(database, execution.id);
+      return { database, lifecycle, run, step, execution };
+    }
+
+    it("completes a workflow step whose agent replied but never finished", async () => {
+      const fixture = await idleWorkflowExecution({ emitted: true });
+
+      await fixture.lifecycle.recoverAgentExecutionDeadlines();
+
+      const execution = await fixture.database.findAgentExecutionById(fixture.execution.id);
+      assert.deepEqual(
+        { status: execution?.status, result: execution?.result },
+        { status: "succeeded", result: { status: "succeeded" } },
+      );
+      assert.equal(execution?.completedByAgentAt, null);
+      const step = await fixture.database.findWorkflowStepRunById(fixture.step.id);
+      assert.equal(step?.status, "succeeded");
+      assert.equal((await fixture.database.findTriggerRunById(fixture.run.id))?.status, "running");
+      await fixture.lifecycle.stop();
+    });
+
+    it("still fails a workflow step whose agent went idle without replying", async () => {
+      const fixture = await idleWorkflowExecution({ emitted: false });
+
+      await fixture.lifecycle.recoverAgentExecutionDeadlines();
+
+      const execution = await fixture.database.findAgentExecutionById(fixture.execution.id);
+      assert.deepEqual(
+        { status: execution?.status, result: execution?.result },
+        { status: "failed", result: { status: "failed", reason: "step_idle_timeout" } },
+      );
+      const step = await fixture.database.findWorkflowStepRunById(fixture.step.id);
+      assert.equal(step?.status, "timed_out");
+      await fixture.lifecycle.stop();
+    });
+
+    it("completes a standalone execution whose agent replied but never finished", async () => {
+      const database = createMemoryDatabase();
+      const lifecycle = createDaemonDispatchLifecycle({
+        database,
+        connectionForDaemon: () => undefined,
+      });
+      const execution = await database.insertAgentExecution({
+        id: "00000000-0000-4000-8000-0000000000ef",
+        organizationId: "org-idle-output",
+        projectId: "project-idle-output",
+        machineId: null,
+        daemonId: DAEMON_ID,
+        triggerContext: {},
+        outputContext: {},
+        configurationRevisionId: "revision-idle-output",
+        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+        idleDeadlineAt: new Date("2000-01-01T00:00:00.000Z"),
+      });
+      await emitOutput(database, execution.id);
+
+      await lifecycle.recoverAgentExecutionDeadlines();
+
+      const current = await database.findAgentExecutionById(execution.id);
+      assert.deepEqual(
+        { status: current?.status, result: current?.result },
+        { status: "succeeded", result: { status: "succeeded" } },
+      );
+      await lifecycle.stop();
+    });
+  });
+
   it("ignores unrelated failed or canceled tools when finish_execution completes", async () => {
     const fixture = await acknowledgementFixture();
     await fixture.lifecycle.recoverPendingHubActions(DAEMON_ID);
@@ -268,6 +372,22 @@ async function acknowledgementFixture() {
     connection,
     lifecycle: createLifecycle(database, connection),
   };
+}
+
+async function emitOutput(
+  database: Awaited<ReturnType<typeof createMemoryDatabase>>,
+  executionId: string,
+): Promise<void> {
+  const startedAt = new Date("2000-01-01T00:00:00.000Z");
+  const attempt = await database.beginAgentExecutionOutput(
+    executionId,
+    "linear.reply",
+    undefined,
+    startedAt,
+  );
+  assert.ok(attempt !== undefined);
+  const updated = await database.completeAgentExecutionOutput(executionId, attempt.id, startedAt);
+  assert.equal(updated?.outputEmissions["linear.reply"], 1);
 }
 
 function createLifecycle(

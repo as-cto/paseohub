@@ -1131,7 +1131,10 @@ export interface TransitionTriggerRunResult {
 
 export interface WorkflowDeadlineRecovery {
   triggerRunId: string;
+  /** Executions failed by the deadline. */
   executionIds: readonly string[];
+  /** Executions completed at their idle deadline because they had already emitted an output. */
+  completedExecutionIds?: readonly string[];
 }
 
 export interface TerminateMachineFields {
