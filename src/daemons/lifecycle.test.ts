@@ -169,6 +169,80 @@ describe("durable Hub action acknowledgement state", () => {
     await lifecycle.stop();
   });
 
+  it("reports the outputs delivered across workflow steps to the completion hook", async () => {
+    const database = createMemoryDatabase();
+    const results: unknown[] = [];
+    const provider: TriggerProvider = {
+      name: "test",
+      eventNames: ["manual.test"],
+      match: () => Promise.resolve([]),
+      onAgentExecutionCompleted: async (_triggerContext, _outputContext, result) => {
+        results.push(result);
+      },
+    };
+    const lifecycle = createDaemonDispatchLifecycle({
+      database,
+      connectionForDaemon: () => undefined,
+      providers: [provider],
+    });
+    const run = (
+      await database.createAcceptedTriggerRun({
+        organizationId: "org-workflow-emissions",
+        projectId: "project-workflow-emissions",
+        configurationRevisionId: "revision-workflow-emissions",
+        providerEventReceiptId: "receipt-workflow-emissions",
+        configuredTriggerName: "emissions",
+        prompt: "raw",
+        inputs: {},
+        triggerContext: { provider: "test" },
+        outputContext: { provider: "test" },
+        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+        stepIds: ["first", "second", "skipped"],
+      })
+    ).run;
+    const steps = await database.listWorkflowStepRunsForTriggerRun(run.id);
+    const emitted: Record<string, string[]> = {
+      first: ["linear.reply", "linear.reply"],
+      second: ["linear.reply", "github.comment"],
+    };
+    for (const step of steps) {
+      const outputs = emitted[step.stepId];
+      if (outputs === undefined) continue;
+      const execution = await database.insertAgentExecution({
+        id: `00000000-0000-4000-8000-00000000${step.ordinal.toString().padStart(4, "0")}`,
+        organizationId: run.organizationId,
+        projectId: run.projectId,
+        machineId: null,
+        daemonId: DAEMON_ID,
+        triggerContext: run.triggerContext,
+        outputContext: run.outputContext,
+        configurationRevisionId: run.configurationRevisionId,
+        workflowStepRunId: step.id,
+      });
+      await database.linkWorkflowStepRunExecution(step.id, execution.id);
+      for (const outputType of outputs) {
+        const startedAt = new Date("2026-01-01T00:00:00.000Z");
+        const attempt = await database.beginAgentExecutionOutput(
+          execution.id,
+          outputType,
+          undefined,
+          startedAt,
+        );
+        assert.ok(attempt);
+        await database.completeAgentExecutionOutput(execution.id, attempt.id, startedAt);
+      }
+    }
+    const succeeded = await database.succeedTriggerRun(run.id);
+    if (succeeded?.transitioned !== true) throw new Error("expected the run to succeed");
+
+    await lifecycle.notifyWorkflowRunTerminal(succeeded.run);
+
+    assert.deepEqual(results, [
+      { status: "succeeded", outputEmissions: { "linear.reply": 3, "github.comment": 1 } },
+    ]);
+    await lifecycle.stop();
+  });
+
   it("ignores unrelated failed or canceled tools when finish_execution completes", async () => {
     const fixture = await acknowledgementFixture();
     await fixture.lifecycle.recoverPendingHubActions(DAEMON_ID);

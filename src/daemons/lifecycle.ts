@@ -255,7 +255,10 @@ export class DaemonDispatchLifecycle {
         provider,
         triggerContext: run.triggerContext,
         outputContext: run.outputContext,
-        result: { status: "succeeded" },
+        result: {
+          status: "succeeded",
+          outputEmissions: await this.readWorkflowRunOutputEmissions(run.id),
+        },
         reactionState: run.reactionState,
       });
     }
@@ -268,6 +271,24 @@ export class DaemonDispatchLifecycle {
         (run.status === "timed_out" ? "workflow_timed_out" : "workflow_failed"),
       reactionState: run.reactionState,
     });
+  }
+
+  /** Sums the outputs delivered by every agent execution of a workflow run, keyed by output type. */
+  private async readWorkflowRunOutputEmissions(
+    triggerRunId: string,
+  ): Promise<Readonly<Record<string, number>>> {
+    const emissions: Record<string, number> = {};
+    for (const step of await this.options.database.listWorkflowStepRunsForTriggerRun(
+      triggerRunId,
+    )) {
+      if (step.agentExecutionId === null) continue;
+      const execution = await this.options.database.findAgentExecutionById(step.agentExecutionId);
+      if (execution === undefined) continue;
+      for (const [outputType, count] of Object.entries(execution.outputEmissions)) {
+        emissions[outputType] = (emissions[outputType] ?? 0) + count;
+      }
+    }
+    return emissions;
   }
 
   private async claimFailedDurableDispatch(
