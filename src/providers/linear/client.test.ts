@@ -323,6 +323,39 @@ describe("Linear connection client", () => {
     });
   });
 
+  it("sends a select elicitation with its signal metadata", async () => {
+    const requests: string[] = [];
+    const connection = linearConnection();
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+      connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+      fetch: async (_url, init) => {
+        requests.push(readableBody(init?.body));
+        return json({ data: { agentActivityCreate: { success: true } } });
+      },
+    });
+
+    await api.createAgentActivity({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      content: { type: "elicitation", body: "Which branch?" },
+      signal: "select",
+      signalMetadata: { options: [{ label: "main", value: "main" }] },
+    });
+
+    const request = graphqlRequest(requests[0] ?? "{}");
+    assert.match(request.query, /\$signal: AgentActivitySignal/u);
+    assert.match(request.query, /\$signalMetadata: JSONObject/u);
+    assert.match(request.query, /signalMetadata: \$signalMetadata/u);
+    assert.deepEqual(request.variables, {
+      agentSessionId: "session-1",
+      content: { type: "elicitation", body: "Which branch?" },
+      signal: "select",
+      signalMetadata: { options: [{ label: "main", value: "main" }] },
+    });
+  });
+
   it("refreshes an expired token before calling the Linear GraphQL API", async () => {
     const updates: unknown[] = [];
     const requests: Array<{ url: string; authorization: string | null; body: string }> = [];
