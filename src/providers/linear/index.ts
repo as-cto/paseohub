@@ -173,10 +173,11 @@ export function createLinearRegistration(
     },
     connection,
     triggerProviders: [
-      ({ configurationStoreForProject }) =>
+      ({ configurationStoreForProject, executions }) =>
         createLinearTriggerProvider({
           configurationStoreForProject,
           ...(api === undefined ? {} : { client: api }),
+          ...(executions === undefined ? {} : { executions }),
         }),
     ],
     sources: [webhook],

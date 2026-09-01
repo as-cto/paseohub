@@ -4086,6 +4086,7 @@ class PgDatabase implements Database {
               receipts.repo, receipts.received_at, receipts.dropped_reason
        from provider_event_receipts receipts
        where receipts.organization_id = $1
+         -- Keep in sync with UNROUTED_PROVIDER_EVENT_DROP_REASON_CODES (drop-reason.ts).
          and receipts.dropped_reason in (
            'no_project_route',
            'no_trigger_for_source',

@@ -69,6 +69,8 @@ export const NormalizedLinearAgentSessionEventSchema = z.object({
       type: z.literal("prompt"),
       body: z.string(),
       createdAt: z.string().datetime(),
+      /** Linear's `stop` signal asks the agent to abandon the turn instead of starting one. */
+      signal: z.literal("stop").optional(),
     })
     .nullable(),
   /** The canonical prompt given to the workflow. `created` uses Linear's promptContext. */
@@ -367,17 +369,27 @@ function normalizePromptActivity(value: unknown):
       type: "prompt";
       body: string;
       createdAt: string;
+      signal?: "stop";
     }
   | undefined {
   const activity = asRecord(value);
   const content = asRecord(activity?.["content"]);
   if (activity === undefined || content?.["type"] !== "prompt") return undefined;
   const id = readString(activity["id"]);
-  const body = readString(content["body"]);
+  // Linear serializes the signal beside the content; older payloads nested it inside.
+  const signal = readStopSignal(activity["signal"]) ?? readStopSignal(content["signal"]);
+  // A stop prompt carries no user text, but the event still needs a non-empty prompt. The
+  // synthetic "Stop" body never reaches a run: the provider handles a `stop` signal before
+  // trigger matching and drops the event as `agent_session_stopped`.
+  const body = readString(content["body"]) ?? (signal === undefined ? undefined : "Stop");
   const createdAt = readDate(activity["createdAt"]);
   return id === undefined || body === undefined || createdAt === undefined
     ? undefined
-    : { id, type: "prompt", body, createdAt };
+    : { id, type: "prompt", body, createdAt, ...(signal === undefined ? {} : { signal }) };
+}
+
+function readStopSignal(value: unknown): "stop" | undefined {
+  return value === "stop" ? "stop" : undefined;
 }
 
 function issuePrompt(issue: NormalizedLinearIssue | null): string | undefined {
