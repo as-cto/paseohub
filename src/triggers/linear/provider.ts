@@ -19,6 +19,7 @@ import {
   readLinearAgentSessionInvocationParserMessage,
   readLinearCommentInvocationParserMessage,
 } from "./match.js";
+import { LINEAR_REPLY_OUTPUT_TYPE } from "./reply.js";
 
 export interface LinearOutputContext {
   provider: "linear";
@@ -281,6 +282,28 @@ export function createLinearTriggerProvider(options: {
       });
       return { phase: "accepted" };
     },
+    async onAgentExecutionCompleted(triggerContext, _outputContext, result, reactionState) {
+      const agentSession = triggerContext.event.linear.agent_session;
+      if (agentSession === null || options.client === undefined) return reactionState;
+      if (linearAgentReactionPhase(reactionState) === "completed") return reactionState;
+      // Linear keeps the session `active` (then `stale`) until a response or error
+      // lands. A reply already closed it; otherwise close it explicitly. Unknown
+      // emissions are left alone rather than risking a false "no reply" notice.
+      if (
+        result.outputEmissions !== undefined &&
+        (result.outputEmissions[LINEAR_REPLY_OUTPUT_TYPE] ?? 0) === 0
+      ) {
+        await options.client.createAgentActivity({
+          linearOrganizationId: triggerContext.event.linear.organization.id,
+          agentSessionId: agentSession.id,
+          content: {
+            type: "response",
+            body: "Paseo finished this workflow without posting a reply.",
+          },
+        });
+      }
+      return { phase: "completed" };
+    },
     async onAgentExecutionFailed(triggerContext, _outputContext, reason, reactionState) {
       return notifyLinearAgentFailure(options.client, triggerContext, reason, reactionState);
     },
@@ -462,12 +485,12 @@ function linearThreadContextLocator(
 
 function linearAgentReactionPhase(
   reactionState: TriggerProviderReactionState | undefined,
-): "accepted" | "failed" | undefined {
+): "accepted" | "completed" | "failed" | undefined {
   if (typeof reactionState !== "object" || reactionState === null || Array.isArray(reactionState)) {
     return undefined;
   }
   const phase = reactionState["phase"];
-  return phase === "accepted" || phase === "failed" ? phase : undefined;
+  return phase === "accepted" || phase === "completed" || phase === "failed" ? phase : undefined;
 }
 
 async function notifyLinearAgentFailure(

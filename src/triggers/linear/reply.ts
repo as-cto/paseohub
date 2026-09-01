@@ -2,6 +2,13 @@ import { z } from "zod";
 import type { OutputExecutor } from "../../execution-capabilities/outputs.js";
 import type { LinearApiClient } from "../../providers/linear/client.js";
 
+/**
+ * Output type of the Linear reply tool. Shared by the provider registration
+ * (which registers the output) and the trigger provider (which reads the
+ * emission count to decide whether a session still needs an explicit close).
+ */
+export const LINEAR_REPLY_OUTPUT_TYPE = "linear.reply";
+
 const LinearReplyArgsSchema = z.object({ content: z.string().min(1) });
 const LinearReplyOutputContextSchema = z.object({
   provider: z.literal("linear"),

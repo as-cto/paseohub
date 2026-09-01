@@ -400,6 +400,84 @@ describe("Linear trigger provider", () => {
     ]);
   });
 
+  it("closes an agent session explicitly when the workflow ends without a reply", async () => {
+    const { match, acceptedState, provider, client } = await acceptedAgentSession();
+
+    const completedState = await provider.onAgentExecutionCompleted?.(
+      match.triggerContext,
+      match.outputContext,
+      { status: "succeeded", outputEmissions: {} },
+      acceptedState ?? undefined,
+    );
+    assert.deepEqual(completedState, { phase: "completed" });
+    // Redelivered completion notifications must not post twice.
+    await provider.onAgentExecutionCompleted?.(
+      match.triggerContext,
+      match.outputContext,
+      { status: "succeeded", outputEmissions: {} },
+      completedState ?? undefined,
+    );
+    assert.deepEqual(client.createdActivities, [
+      {
+        linearOrganizationId: "linear-org",
+        agentSessionId: "session-1",
+        content: {
+          type: "thought",
+          body: "Paseo accepted this task and is starting the workflow.",
+        },
+        ephemeral: true,
+      },
+      {
+        linearOrganizationId: "linear-org",
+        agentSessionId: "session-1",
+        content: {
+          type: "response",
+          body: "Paseo finished this workflow without posting a reply.",
+        },
+      },
+    ]);
+  });
+
+  it("does not close an agent session that a delivered reply already closed", async () => {
+    const { match, acceptedState, provider, client } = await acceptedAgentSession();
+    client.createdActivities.length = 0;
+
+    const repliedState = await provider.onAgentExecutionCompleted?.(
+      match.triggerContext,
+      match.outputContext,
+      { status: "succeeded", outputEmissions: { "linear.reply": 1 } },
+      acceptedState ?? undefined,
+    );
+    assert.deepEqual(repliedState, { phase: "completed" });
+    // Unknown emissions are left alone.
+    await provider.onAgentExecutionCompleted?.(
+      match.triggerContext,
+      match.outputContext,
+      { status: "succeeded" },
+      acceptedState ?? undefined,
+    );
+    assert.deepEqual(client.createdActivities, []);
+  });
+
+  it("has no agent session to close for issue-comment triggers", async () => {
+    const { project, revision, store } = await activeConfiguration();
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+    });
+    const match = (await provider.match(external(project.id, revision.id)))[0];
+    if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+
+    const completedState = await provider.onAgentExecutionCompleted?.(
+      match.triggerContext,
+      match.outputContext,
+      { status: "succeeded", outputEmissions: {} },
+    );
+    assert.equal(completedState, undefined);
+    assert.deepEqual(client.createdActivities, []);
+  });
+
   it("materializes only bounded causal activity for prompted agent-session turns", async () => {
     const { project, revision, store } = await activeConfiguration(agentSessionConfiguration());
     const triggerAt = "2026-01-02T00:01:00.000Z";
@@ -641,6 +719,27 @@ function agentSessionConfiguration() {
       },
     ],
   };
+}
+
+/** Accepts a freshly created native agent session so completion hooks can be exercised. */
+async function acceptedAgentSession() {
+  const { project, revision, store } = await activeConfiguration(agentSessionConfiguration());
+  const client = new RecordingHistoryClient({ complete: true, comments: [] });
+  const provider = createLinearTriggerProvider({
+    configurationStoreForProject: () => store,
+    client,
+  });
+  const match = (
+    await provider.match(
+      externalAgentSession(project.id, revision.id, agentSessionEvent({ action: "created" })),
+    )
+  )[0];
+  if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+  const acceptedState = await provider.onDispatchAccepted?.(
+    match.triggerContext,
+    match.outputContext,
+  );
+  return { match, acceptedState, provider, client };
 }
 
 function external(
