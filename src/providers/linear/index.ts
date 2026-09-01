@@ -21,7 +21,10 @@ import type {
 import { outputContextProvider, replyOutputTool } from "../../execution-capabilities/outputs.js";
 import { logger } from "../../logger.js";
 import { createLinearTriggerProvider } from "../../triggers/linear/provider.js";
-import { createLinearReplyExecutor } from "../../triggers/linear/reply.js";
+import {
+  LINEAR_REPLY_OUTPUT_TYPE,
+  createLinearReplyExecutor,
+} from "../../triggers/linear/reply.js";
 import { createLinearWebhookSource } from "../../triggers/linear/webhook.js";
 import type { ProviderConnectionRegistration, ProviderRegistration } from "../registration.js";
 import {
@@ -181,7 +184,7 @@ export function createLinearRegistration(
         ? []
         : [
             {
-              type: "linear.reply",
+              type: LINEAR_REPLY_OUTPUT_TYPE,
               tool: replyOutputTool,
               available: outputContextProvider("linear"),
               execute: createLinearReplyExecutor({ client: api }),

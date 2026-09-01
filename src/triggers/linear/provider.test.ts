@@ -401,23 +401,8 @@ describe("Linear trigger provider", () => {
   });
 
   it("closes an agent session explicitly when the workflow ends without a reply", async () => {
-    const { project, revision, store } = await activeConfiguration(agentSessionConfiguration());
-    const client = new RecordingHistoryClient({ complete: true, comments: [] });
-    const provider = createLinearTriggerProvider({
-      configurationStoreForProject: () => store,
-      client,
-    });
-    const match = (
-      await provider.match(
-        externalAgentSession(project.id, revision.id, agentSessionEvent({ action: "created" })),
-      )
-    )[0];
-    if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+    const { match, acceptedState, provider, client } = await acceptedAgentSession();
 
-    const acceptedState = await provider.onDispatchAccepted?.(
-      match.triggerContext,
-      match.outputContext,
-    );
     const completedState = await provider.onAgentExecutionCompleted?.(
       match.triggerContext,
       match.outputContext,
@@ -451,46 +436,46 @@ describe("Linear trigger provider", () => {
         },
       },
     ]);
+  });
 
-    // A delivered reply already closed the session; unknown emissions are left alone.
-    const repliedClient = new RecordingHistoryClient({ complete: true, comments: [] });
-    const repliedProvider = createLinearTriggerProvider({
-      configurationStoreForProject: () => store,
-      client: repliedClient,
-    });
-    const repliedState = await repliedProvider.onAgentExecutionCompleted?.(
+  it("does not close an agent session that a delivered reply already closed", async () => {
+    const { match, acceptedState, provider, client } = await acceptedAgentSession();
+    client.createdActivities.length = 0;
+
+    const repliedState = await provider.onAgentExecutionCompleted?.(
       match.triggerContext,
       match.outputContext,
       { status: "succeeded", outputEmissions: { "linear.reply": 1 } },
       acceptedState ?? undefined,
     );
     assert.deepEqual(repliedState, { phase: "completed" });
-    await repliedProvider.onAgentExecutionCompleted?.(
+    // Unknown emissions are left alone.
+    await provider.onAgentExecutionCompleted?.(
       match.triggerContext,
       match.outputContext,
       { status: "succeeded" },
       acceptedState ?? undefined,
     );
-    assert.deepEqual(repliedClient.createdActivities, []);
+    assert.deepEqual(client.createdActivities, []);
+  });
 
-    // Issue-comment triggers have no agent session to close.
-    const comment = await activeConfiguration();
-    const commentClient = new RecordingHistoryClient({ complete: true, comments: [] });
-    const commentProvider = createLinearTriggerProvider({
-      configurationStoreForProject: () => comment.store,
-      client: commentClient,
+  it("has no agent session to close for issue-comment triggers", async () => {
+    const { project, revision, store } = await activeConfiguration();
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
     });
-    const commentMatch = (
-      await commentProvider.match(external(comment.project.id, comment.revision.id))
-    )[0];
-    if (!isAcceptedTriggerProviderMatch(commentMatch)) throw new Error("expected accepted match");
-    const commentState = await commentProvider.onAgentExecutionCompleted?.(
-      commentMatch.triggerContext,
-      commentMatch.outputContext,
+    const match = (await provider.match(external(project.id, revision.id)))[0];
+    if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+
+    const completedState = await provider.onAgentExecutionCompleted?.(
+      match.triggerContext,
+      match.outputContext,
       { status: "succeeded", outputEmissions: {} },
     );
-    assert.equal(commentState, undefined);
-    assert.deepEqual(commentClient.createdActivities, []);
+    assert.equal(completedState, undefined);
+    assert.deepEqual(client.createdActivities, []);
   });
 
   it("materializes only bounded causal activity for prompted agent-session turns", async () => {
@@ -734,6 +719,27 @@ function agentSessionConfiguration() {
       },
     ],
   };
+}
+
+/** Accepts a freshly created native agent session so completion hooks can be exercised. */
+async function acceptedAgentSession() {
+  const { project, revision, store } = await activeConfiguration(agentSessionConfiguration());
+  const client = new RecordingHistoryClient({ complete: true, comments: [] });
+  const provider = createLinearTriggerProvider({
+    configurationStoreForProject: () => store,
+    client,
+  });
+  const match = (
+    await provider.match(
+      externalAgentSession(project.id, revision.id, agentSessionEvent({ action: "created" })),
+    )
+  )[0];
+  if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+  const acceptedState = await provider.onDispatchAccepted?.(
+    match.triggerContext,
+    match.outputContext,
+  );
+  return { match, acceptedState, provider, client };
 }
 
 function external(

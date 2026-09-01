@@ -19,8 +19,7 @@ import {
   readLinearAgentSessionInvocationParserMessage,
   readLinearCommentInvocationParserMessage,
 } from "./match.js";
-
-const LINEAR_REPLY_OUTPUT_TYPE = "linear.reply";
+import { LINEAR_REPLY_OUTPUT_TYPE } from "./reply.js";
 
 export interface LinearOutputContext {
   provider: "linear";
