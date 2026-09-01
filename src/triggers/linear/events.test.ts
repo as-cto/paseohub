@@ -162,6 +162,49 @@ describe("Linear event normalization", () => {
     assert.equal(event.occurredAt, "2026-01-02T00:01:00.000Z");
   });
 
+  it("normalizes Linear's stop signal on a prompted agent session", () => {
+    const event = normalizeLinearEvent(
+      agentSessionEnvelope({
+        action: "prompted",
+        agentActivity: { signal: "stop", content: { type: "prompt", body: "" } },
+      }),
+      "AgentSessionEvent",
+      hydratedIssue(),
+    );
+
+    assert.equal(event?.type, "agent_session");
+    if (event?.type !== "agent_session") throw new Error("expected an agent session event");
+    assert.equal(event.agentActivity?.signal, "stop");
+    assert.equal(event.prompt, "Stop");
+  });
+
+  it("reads a stop signal nested in the prompt content", () => {
+    const event = normalizeLinearEvent(
+      agentSessionEnvelope({
+        action: "prompted",
+        agentActivity: { content: { type: "prompt", body: "Stop", signal: "stop" } },
+      }),
+      "AgentSessionEvent",
+      hydratedIssue(),
+    );
+
+    assert.equal(event?.type, "agent_session");
+    if (event?.type !== "agent_session") throw new Error("expected an agent session event");
+    assert.equal(event.agentActivity?.signal, "stop");
+  });
+
+  it("ignores an unknown prompt signal", () => {
+    const event = normalizeLinearEvent(
+      agentSessionEnvelope({ action: "prompted", agentActivity: { signal: "select" } }),
+      "AgentSessionEvent",
+      hydratedIssue(),
+    );
+
+    assert.equal(event?.type, "agent_session");
+    if (event?.type !== "agent_session") throw new Error("expected an agent session event");
+    assert.equal(event.agentActivity?.signal, undefined);
+  });
+
   it("ignores non-lifecycle agent session actions", () => {
     assert.equal(
       normalizeLinearEvent(
@@ -203,7 +246,10 @@ function hydratedIssue() {
   };
 }
 
-function agentSessionEnvelope(input: { action: "created" | "prompted" }) {
+function agentSessionEnvelope(input: {
+  action: "created" | "prompted";
+  agentActivity?: Record<string, unknown>;
+}) {
   return {
     action: input.action,
     type: "AgentSessionEvent",
@@ -246,6 +292,7 @@ function agentSessionEnvelope(input: { action: "created" | "prompted" }) {
             userId: "user-2",
             user: { id: "user-2", name: "Reviewer" },
             content: { type: "prompt", body: "Please also add a regression test" },
+            ...input.agentActivity,
           },
         }
       : {}),

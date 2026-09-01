@@ -169,6 +169,85 @@ describe("durable Hub action acknowledgement state", () => {
     await lifecycle.stop();
   });
 
+  it("stops only the matching pending executions at a user's request", async () => {
+    const database = createMemoryDatabase();
+    const connection = new AcknowledgementConnection();
+    const lifecycle = createLifecycle(database, connection);
+    const run = (
+      await database.createAcceptedTriggerRun({
+        organizationId: "org-stop",
+        projectId: "project-stop",
+        configurationRevisionId: "revision-stop",
+        providerEventReceiptId: "receipt-stop",
+        configuredTriggerName: "agent-session",
+        prompt: "raw",
+        inputs: {},
+        triggerContext: { provider: "test" },
+        outputContext: { provider: "linear", agentSessionId: "session-1" },
+        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+        stepIds: ["step"],
+      })
+    ).run;
+    const step = (await database.listWorkflowStepRunsForTriggerRun(run.id))[0]!;
+    const stopped = await database.insertAgentExecution({
+      id: "00000000-0000-4000-8000-0000000000e1",
+      organizationId: run.organizationId,
+      projectId: run.projectId,
+      machineId: null,
+      daemonId: DAEMON_ID,
+      triggerContext: run.triggerContext,
+      outputContext: run.outputContext,
+      configurationRevisionId: run.configurationRevisionId,
+      workflowStepRunId: step.id,
+    });
+    await database.linkWorkflowStepRunExecution(step.id, stopped.id);
+    await database.attachAgentToExecution(stopped.id, DAEMON_ID, AGENT_ID);
+    await database.transitionAgentExecution(stopped.id, "running");
+    const untouched = await database.insertAgentExecution({
+      id: "00000000-0000-4000-8000-0000000000e2",
+      organizationId: run.organizationId,
+      projectId: run.projectId,
+      machineId: null,
+      daemonId: DAEMON_ID,
+      triggerContext: { provider: "test" },
+      outputContext: { provider: "linear", agentSessionId: "session-2" },
+      configurationRevisionId: run.configurationRevisionId,
+    });
+    await database.transitionAgentExecution(untouched.id, "running");
+
+    const result = await lifecycle.stopAgentExecutions({
+      projectId: run.projectId,
+      reason: "stopped_by_user",
+      matches: (execution) => agentSessionIdOf(execution.outputContext) === "session-1",
+    });
+
+    assert.deepEqual(
+      result.map((execution) => execution.id),
+      [stopped.id],
+    );
+    const failed = await database.findAgentExecutionById(stopped.id);
+    assert.equal(failed?.status, "failed");
+    assert.deepEqual(failed?.result, { status: "failed", reason: "stopped_by_user" });
+    assert.equal(failed?.hubAction, "interrupt");
+    assert.deepEqual(connection.actions, ["interrupt"]);
+    const terminalRun = await database.findTriggerRunById(run.id);
+    assert.equal(terminalRun?.status, "failed");
+    assert.equal(terminalRun?.failureReason, "stopped_by_user");
+    assert.equal((await database.findAgentExecutionById(untouched.id))?.status, "running");
+
+    // A repeated stop finds nothing pending for the session and changes nothing.
+    assert.deepEqual(
+      await lifecycle.stopAgentExecutions({
+        projectId: run.projectId,
+        reason: "stopped_by_user",
+        matches: (execution) => agentSessionIdOf(execution.outputContext) === "session-1",
+      }),
+      [],
+    );
+    assert.equal((await database.findAgentExecutionById(untouched.id))?.status, "running");
+    await lifecycle.stop();
+  });
+
   it("ignores unrelated failed or canceled tools when finish_execution completes", async () => {
     const fixture = await acknowledgementFixture();
     await fixture.lifecycle.recoverPendingHubActions(DAEMON_ID);
@@ -244,6 +323,14 @@ describe("durable Hub action acknowledgement state", () => {
     await fixture.lifecycle.stop();
   });
 });
+
+function agentSessionIdOf(outputContext: unknown): unknown {
+  return typeof outputContext === "object" &&
+    outputContext !== null &&
+    "agentSessionId" in outputContext
+    ? outputContext.agentSessionId
+    : undefined;
+}
 
 async function acknowledgementFixture() {
   const database = createMemoryDatabase({ now: () => new Date("2026-01-01T00:00:00.000Z") });

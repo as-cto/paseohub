@@ -6,6 +6,7 @@ import type {
   LinearIssueCommentHistory,
 } from "../../providers/linear/client.js";
 import { createMemoryDatabase } from "../../db/memory.js";
+import type { TriggerProviderExecutionControl } from "../../providers/registration.js";
 import { createActiveProjectConfiguration } from "../../test-utils/project-configuration.js";
 import { isAcceptedTriggerProviderMatch, type ExternalTrigger } from "../index.js";
 import type { NormalizedLinearAgentSessionEvent, NormalizedLinearCommentEvent } from "./events.js";
@@ -468,6 +469,136 @@ describe("Linear trigger provider", () => {
       ),
       false,
     );
+  });
+
+  it("stops the session's executions instead of starting a run on Linear's stop signal", async () => {
+    const { project, revision, store } = await activeConfiguration(agentSessionConfiguration());
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    const stops: Parameters<TriggerProviderExecutionControl["stopActive"]>[0][] = [];
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+      executions: {
+        stopActive: async (input) => {
+          stops.push(input);
+          return { stopped: 1 };
+        },
+      },
+    });
+    const stopEvent = agentSessionEvent({
+      agentActivity: {
+        id: "trigger-activity",
+        type: "prompt",
+        body: "Stop",
+        createdAt: "2026-01-02T00:01:00.000Z",
+        signal: "stop",
+      },
+      prompt: "Stop",
+      parserMessage: "Stop",
+    });
+
+    const result = await provider.match(externalAgentSession(project.id, revision.id, stopEvent));
+
+    assert.equal(result, "agent_session_stopped");
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0]?.projectId, project.id);
+    assert.equal(stops[0]?.reason, "stopped_by_user");
+    const matches = stops[0].matches;
+    assert.equal(
+      matches({
+        outputContext: {
+          provider: "linear",
+          linearOrganizationId: "linear-org",
+          issueId: "issue-1",
+          agentSessionId: "session-1",
+        },
+      }),
+      true,
+    );
+    assert.equal(
+      matches({
+        outputContext: {
+          provider: "linear",
+          linearOrganizationId: "linear-org",
+          issueId: "issue-1",
+          agentSessionId: "session-2",
+        },
+      }),
+      false,
+    );
+    assert.equal(
+      matches({ outputContext: { provider: "slack", agentSessionId: "session-1" } }),
+      false,
+    );
+    assert.equal(matches({ outputContext: null }), false);
+    assert.deepEqual(client.createdActivities, [
+      {
+        linearOrganizationId: "linear-org",
+        agentSessionId: "session-1",
+        content: { type: "response", body: "Stopped at your request." },
+      },
+    ]);
+  });
+
+  it("confirms a stop even when nothing is running so Linear can settle the session", async () => {
+    const { project, revision, store } = await activeConfiguration(agentSessionConfiguration());
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+    });
+    const stopEvent = agentSessionEvent({
+      agentActivity: {
+        id: "trigger-activity",
+        type: "prompt",
+        body: "Stop",
+        createdAt: "2026-01-02T00:01:00.000Z",
+        signal: "stop",
+      },
+    });
+
+    const result = await provider.match(externalAgentSession(project.id, revision.id, stopEvent));
+
+    assert.equal(result, "agent_session_stopped");
+    assert.equal(client.createdActivities.length, 1);
+    assert.equal(client.createdActivities[0]?.content.type, "response");
+  });
+
+  it("does not post an error for an execution the user stopped", async () => {
+    const { project, revision, store } = await activeConfiguration(agentSessionConfiguration());
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+    });
+    const match = (
+      await provider.match(externalAgentSession(project.id, revision.id, agentSessionEvent()))
+    )[0];
+    if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+    const acceptedState = await provider.onDispatchAccepted?.(
+      match.triggerContext,
+      match.outputContext,
+    );
+
+    const failedState = await provider.onAgentExecutionFailed?.(
+      match.triggerContext,
+      match.outputContext,
+      "stopped_by_user",
+      acceptedState ?? undefined,
+    );
+
+    assert.deepEqual(failedState, { phase: "failed" });
+    assert.deepEqual(
+      client.createdActivities.map((activity) => activity.content.type),
+      ["thought"],
+    );
+    // The reaction is settled: a later failure signal for the same run stays silent too.
+    await provider.onMachineTerminated?.(
+      match.triggerContext,
+      "daemon disconnected",
+      failedState ?? undefined,
+    );
+    assert.equal(client.createdActivities.length, 1);
   });
 
   it("fails open when optional agent-session activity history is unavailable", async () => {

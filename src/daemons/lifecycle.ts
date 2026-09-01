@@ -1091,6 +1091,33 @@ export class DaemonDispatchLifecycle {
     );
   }
 
+  /**
+   * Fails the project's pending executions selected by `matches` at a user's request. The
+   * regular failure path derives the hub action, so the daemon agent is interrupted or archived,
+   * and the provider's failure hook receives `reason` to decide what (if anything) to post.
+   */
+  async stopAgentExecutions(input: {
+    projectId: string;
+    reason: string;
+    matches: (execution: AgentExecutionRecord) => boolean;
+  }): Promise<AgentExecutionRecord[]> {
+    const executions = (await this.options.database.findPendingAgentExecutions()).filter(
+      (execution) => execution.projectId === input.projectId && input.matches(execution),
+    );
+    const stopped = await Promise.all(
+      executions.map(async (execution) => {
+        const failed = await this.failAgentExecution(execution.id, input.reason);
+        if (failed !== undefined) {
+          this.completionWatchersByExecution.get(execution.id)?.(
+            new DaemonDispatchFailure(input.reason),
+          );
+        }
+        return failed;
+      }),
+    );
+    return stopped.filter((execution) => execution !== undefined);
+  }
+
   private async startAgentExecution(executionId: string): Promise<void> {
     const alreadyStarted = this.startedExecutions.has(executionId);
     this.startedExecutions.add(executionId);

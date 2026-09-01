@@ -15,6 +15,21 @@ export interface TriggerProviderResources {
   configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
   connectionsForProject: (projectId: string) => ConnectionResolver;
   attachments?: AttachmentCapabilityRegistry;
+  executions?: TriggerProviderExecutionControl;
+}
+
+/** Lets a provider end running work on behalf of its platform, e.g. a user pressing Stop. */
+export interface TriggerProviderExecutionControl {
+  /**
+   * Fails the project's pending executions selected by `matches` with `reason`. The failure
+   * follows the usual terminal path: the daemon agent is interrupted and the provider's
+   * failure hook receives `reason`.
+   */
+  stopActive(input: {
+    projectId: string;
+    reason: string;
+    matches: (execution: { outputContext: unknown }) => boolean;
+  }): Promise<{ stopped: number }>;
 }
 
 export type TriggerProviderFactory = (

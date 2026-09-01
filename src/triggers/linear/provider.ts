@@ -7,13 +7,18 @@ import {
   type LinearIssueComment,
 } from "../../providers/linear/client.js";
 import { reportFailure } from "../../failures/index.js";
+import type { TriggerProviderExecutionControl } from "../../providers/registration.js";
 import type {
   TriggerProvider,
   TriggerProviderMatch,
   TriggerProviderReactionState,
 } from "../index.js";
 import { matchesInputFilters, parseInvocation } from "../invocation.js";
-import { NormalizedLinearEventSchema, type NormalizedLinearEvent } from "./events.js";
+import {
+  NormalizedLinearEventSchema,
+  type NormalizedLinearAgentSessionEvent,
+  type NormalizedLinearEvent,
+} from "./events.js";
 import {
   matchLinearTriggers,
   readLinearAgentSessionInvocationParserMessage,
@@ -62,6 +67,7 @@ export interface LinearTriggerContext {
         type: "prompt";
         body: string;
         created_at: string;
+        signal?: "stop";
       } | null;
       prompt_context: string | null;
       trigger_thread_context:
@@ -97,12 +103,16 @@ export interface LinearMaterializedContext {
   };
 }
 
+/** Failure reason of an execution ended by Linear's `stop` signal; not an error for the user. */
+export const LINEAR_STOPPED_BY_USER_REASON = "stopped_by_user";
+
 export function createLinearTriggerProvider(options: {
   configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
   client?: Pick<
     LinearApiClient,
     "readIssueComments" | "readAgentSessionActivities" | "createAgentActivity"
   >;
+  executions?: TriggerProviderExecutionControl;
 }): TriggerProvider<
   "linear",
   LinearTriggerContext,
@@ -120,6 +130,10 @@ export function createLinearTriggerProvider(options: {
       if (stored === undefined) return "configuration_unavailable";
       if (!hasSourceTrigger(stored.configuration.triggers, externalTrigger.source)) {
         return "no_trigger_for_source";
+      }
+      if (event.type === "agent_session" && event.agentActivity?.signal === "stop") {
+        await stopLinearAgentSession(options, externalTrigger.projectId, event);
+        return "agent_session_stopped";
       }
       const matched = matchLinearTriggers(
         stored.configuration,
@@ -433,6 +447,9 @@ function buildLinearContext(
             type: event.agentActivity.type,
             body: event.agentActivity.body,
             created_at: event.agentActivity.createdAt,
+            ...(event.agentActivity.signal === undefined
+              ? {}
+              : { signal: event.agentActivity.signal }),
           }
         : null,
     prompt_context: event.type === "agent_session" ? event.promptContext : null,
@@ -470,6 +487,39 @@ function linearAgentReactionPhase(
   return phase === "accepted" || phase === "failed" ? phase : undefined;
 }
 
+/**
+ * Linear's `stop` signal arrives as a prompt; it must not start a run. The session's pending
+ * executions are failed with a dedicated reason (so no error is posted for them), and Linear
+ * receives the `response` it expects to settle the session.
+ */
+async function stopLinearAgentSession(
+  options: {
+    client?: Pick<LinearApiClient, "createAgentActivity">;
+    executions?: TriggerProviderExecutionControl;
+  },
+  projectId: string,
+  event: NormalizedLinearAgentSessionEvent,
+): Promise<void> {
+  const agentSessionId = event.agentSession.id;
+  await options.executions?.stopActive({
+    projectId,
+    reason: LINEAR_STOPPED_BY_USER_REASON,
+    matches: (execution) => readLinearAgentSessionId(execution.outputContext) === agentSessionId,
+  });
+  await options.client?.createAgentActivity({
+    linearOrganizationId: event.organizationId,
+    agentSessionId,
+    content: { type: "response", body: "Stopped at your request." },
+  });
+}
+
+function readLinearAgentSessionId(outputContext: unknown): string | null {
+  if (typeof outputContext !== "object" || outputContext === null) return null;
+  const context = outputContext as Partial<LinearOutputContext>;
+  if (context.provider !== "linear") return null;
+  return typeof context.agentSessionId === "string" ? context.agentSessionId : null;
+}
+
 async function notifyLinearAgentFailure(
   client: Pick<LinearApiClient, "createAgentActivity"> | undefined,
   triggerContext: LinearTriggerContext,
@@ -479,6 +529,8 @@ async function notifyLinearAgentFailure(
   const agentSession = triggerContext.event.linear.agent_session;
   if (agentSession === null || client === undefined) return reactionState;
   if (linearAgentReactionPhase(reactionState) === "failed") return reactionState;
+  // The stop handler already confirmed the stop; an error would contradict it.
+  if (reason === LINEAR_STOPPED_BY_USER_REASON) return { phase: "failed" };
   await client.createAgentActivity({
     linearOrganizationId: triggerContext.event.linear.organization.id,
     agentSessionId: agentSession.id,
