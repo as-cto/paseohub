@@ -1783,7 +1783,15 @@ export class DaemonDispatchLifecycle {
       this.completionWatchersByExecution.get(executionId)?.();
       return true;
     }
-    if (isTerminalExecutionStatus(completed.status)) return true;
+    if (isTerminalExecutionStatus(completed.status)) {
+      // The database settled the execution another way (for example the whole
+      // run expired in the same transaction); the dispatch must still learn
+      // its terminal outcome, otherwise its watcher never settles.
+      this.completionWatchersByExecution.get(executionId)?.(
+        new DaemonDispatchFailure(executionFailureReason(completed) ?? completed.status),
+      );
+      return true;
+    }
     this.armExecutionDeadline(completed);
     return false;
   }

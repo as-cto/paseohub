@@ -8,6 +8,7 @@ import type { AgentExecutionRecord, Database } from "../db/types.js";
 import { registerResponseLifecycle } from "../http/response-lifecycle.js";
 import { reportFailure, withReference } from "../failures/index.js";
 import { compileJsonSchema, formatJsonSchemaErrors } from "../workflows/json-schema.js";
+import { missingRequiredOutputs } from "./required-outputs.js";
 import {
   executionToolDefinitions,
   finishExecutionToolName,
@@ -180,7 +181,7 @@ async function finishExecutionCall(
   materializedOutputs: readonly MaterializedOutputCapability[],
 ) {
   try {
-    const missingOutputs = missingRequiredOutputs(execution, materializedOutputs);
+    const missingOutputs = missingRequiredOutputTools(execution, materializedOutputs);
     if (missingOutputs.length > 0) {
       reportFailure(
         new Error("required execution outputs are missing"),
@@ -360,20 +361,17 @@ function validationMessage(errors: readonly ErrorObject[] | null | undefined): s
     : `Invalid arguments for tool: ${messages.join("; ")}`;
 }
 
-function missingRequiredOutputs(
+function missingRequiredOutputTools(
   execution: AgentExecutionRecord,
   materializedOutputs: readonly MaterializedOutputCapability[],
 ): readonly { type: string; toolName: string }[] {
   const toolsByType = new Map(
     materializedOutputs.map((output) => [output.declaration.type, output.capability.tool.name]),
   );
-  return (execution.launchIntent?.allowOutputs ?? [])
-    .filter((output) => output.required === true)
-    .filter((output) => (execution.outputEmissions[output.type] ?? 0) < 1)
-    .map((output) => ({
-      type: output.type,
-      toolName: toolsByType.get(output.type) ?? "unavailable",
-    }));
+  return missingRequiredOutputs(execution).map((output) => ({
+    type: output.type,
+    toolName: toolsByType.get(output.type) ?? "unavailable",
+  }));
 }
 
 function requiredOutputsGuidance(

@@ -11,7 +11,9 @@ import {
   createDaemonDispatchLifecycle,
   DaemonDispatchFailure,
   type DaemonDispatchLifecycle,
+  type ExecutionDeadlineClock,
 } from "./lifecycle.js";
+import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { createDurableWorkflowHandler } from "../workflows/engine.js";
 import type { TriggerProvider } from "../triggers/index.js";
 import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
@@ -170,75 +172,152 @@ describe("durable Hub action acknowledgement state", () => {
   });
 
   describe("idle deadline after an emitted output", () => {
-    async function idleWorkflowExecution(options: { emitted: boolean }) {
-      const database = createMemoryDatabase();
-      const lifecycle = createDaemonDispatchLifecycle({
-        database,
-        connectionForDaemon: () => undefined,
+    const IDLE_TIMEOUT_MS = 10_000;
+
+    /**
+     * A real dispatch: the lifecycle registers the completion watcher itself,
+     * so the test proves which way the idle deadline settles that watcher.
+     * The memory database would complete the step on its own; what is under
+     * test here is the lifecycle branch that runs before it.
+     */
+    async function dispatchedWorkflowExecution(options: { emitted: boolean }) {
+      const clock = new ManualDeadlineClock(new Date("2026-01-01T00:00:00.000Z"));
+      const database = createMemoryDatabase({ now: () => new Date(clock.now()) });
+      const organizationId = "org-idle-output";
+      const project = await database.createProject({
+        organizationId,
+        name: "Idle output",
+        slug: "idle-output",
+        createdByUserId: null,
       });
-      const run = (
-        await database.createAcceptedTriggerRun({
-          organizationId: "org-idle-output",
-          projectId: "project-idle-output",
-          configurationRevisionId: "revision-idle-output",
-          providerEventReceiptId: `receipt-idle-output-${options.emitted ? "emitted" : "silent"}`,
-          configuredTriggerName: "idle",
-          prompt: "raw",
-          inputs: {},
-          triggerContext: { provider: "test" },
-          outputContext: { provider: "test" },
-          deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
-          stepIds: ["step"],
-        })
-      ).run;
-      const step = (await database.listWorkflowStepRunsForTriggerRun(run.id))[0]!;
-      const execution = await database.insertAgentExecution({
-        id: "00000000-0000-4000-8000-0000000000ee",
-        organizationId: run.organizationId,
-        projectId: run.projectId,
-        machineId: null,
+      const revision = await database.insertProjectConfigurationRevision({
+        projectId: project.id,
+        sourceKind: "manual",
+        sourceEvidence: { kind: "test" },
+        normalizedConfiguration: { environments: [], triggers: [] },
+        contentHash: "idle-output",
+      });
+      await database.issueEnrollmentToken({
+        id: "enrollment-idle-output",
+        verifier: "enrollment-verifier-idle-output",
+        organizationId,
+        expiresAt: new Date(clock.now() + 60_000),
+        consumedAt: null,
+      });
+      const daemon = await database.enrollDaemon({
         daemonId: DAEMON_ID,
+        idempotencyKey: "enroll-idle-output",
+        tokenVerifier: "enrollment-verifier-idle-output",
+        serverId: "server-idle-output",
+        daemonPublicKey: "public-key",
+        credentialVerifier: "verifier",
+        permissions: ["hub.execute"],
+        now: new Date(clock.now()),
+      });
+      assert.ok(daemon !== undefined && "machineId" in daemon);
+      const { run } = await database.createAcceptedTriggerRun({
+        organizationId,
+        projectId: project.id,
+        configurationRevisionId: revision.id,
+        providerEventReceiptId: "receipt-idle-output",
+        configuredTriggerName: "idle",
+        prompt: "raw",
+        inputs: {},
+        triggerContext: { provider: "test" },
+        outputContext: { provider: "test" },
+        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+        stepIds: ["step"],
+      });
+      const step = (await database.listWorkflowStepRunsForTriggerRun(run.id))[0]!;
+      const intent: LaunchMachineIntent = {
+        kind: "launch_machine",
+        organizationId,
+        projectId: project.id,
+        triggerRunId: run.id,
+        workflowStepRunId: step.id,
+        triggerName: "idle",
+        environmentName: "work",
+        environment: { kind: "daemon", daemonId: DAEMON_ID, authoredSlug: "work", cwd: "/repo" },
+        prompt: "reply",
+        agent: { provider: "test", mode: "default" },
+        allowOutputs: [{ type: "linear.reply" }],
+        timeoutMs: 60_000,
+        idleTimeoutMs: IDLE_TIMEOUT_MS,
+        autoArchive: false,
         triggerContext: run.triggerContext,
         outputContext: run.outputContext,
-        configurationRevisionId: run.configurationRevisionId,
-        workflowStepRunId: step.id,
-        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
-        idleDeadlineAt: new Date("2000-01-01T00:00:00.000Z"),
+        configurationRevisionId: revision.id,
+        hubConfig: {},
+      };
+      const connection = new DispatchConnection();
+      const stream = new FailureLogStream();
+      const lifecycle = createDaemonDispatchLifecycle({
+        database,
+        connectionForDaemon: (daemonId) => (daemonId === DAEMON_ID ? connection : undefined),
+        publicBaseUrl: "http://hub.test",
+        completionTokenSecret: "completion-secret",
+        test: { logger: createLogger(stream), deadlineClock: clock },
       });
-      await database.linkWorkflowStepRunExecution(step.id, execution.id);
-      if (options.emitted) await emitOutput(database, execution.id);
-      return { database, lifecycle, run, step, execution };
+
+      const dispatched = await lifecycle.dispatchLaunchMachineIntent(intent);
+      const executionId = dispatched.execution.id;
+      assert.equal(connection.subscriptions(), 1, "the dispatch watches its agent");
+      if (options.emitted) await emitOutput(database, executionId);
+      await connection.emit({
+        type: "agent_update",
+        executionId,
+        agentId: dispatched.agentId,
+        agent: { id: dispatched.agentId, status: "idle" },
+        timestamp: new Date(clock.now()).toISOString(),
+      });
+      assert.equal(
+        (await database.findAgentExecutionById(executionId))?.idleDeadlineAt?.getTime(),
+        clock.now() + IDLE_TIMEOUT_MS,
+      );
+      return { clock, connection, database, lifecycle, stream, run, step, executionId };
     }
 
-    it("completes a workflow step whose agent replied but never finished", async () => {
-      const fixture = await idleWorkflowExecution({ emitted: true });
+    it("settles the dispatch as a success when the agent replied but never finished", async () => {
+      const fixture = await dispatchedWorkflowExecution({ emitted: true });
 
-      await fixture.lifecycle.recoverAgentExecutionDeadlines();
+      await fixture.clock.advance(IDLE_TIMEOUT_MS);
+      await fixture.connection.unsubscribed();
 
-      const execution = await fixture.database.findAgentExecutionById(fixture.execution.id);
+      const execution = await fixture.database.findAgentExecutionById(fixture.executionId);
       assert.deepEqual(
         { status: execution?.status, result: execution?.result },
         { status: "succeeded", result: { status: "succeeded" } },
       );
       assert.equal(execution?.completedByAgentAt, null);
-      const step = await fixture.database.findWorkflowStepRunById(fixture.step.id);
-      assert.equal(step?.status, "succeeded");
+      assert.equal(
+        (await fixture.database.findWorkflowStepRunById(fixture.step.id))?.status,
+        "succeeded",
+      );
       assert.equal((await fixture.database.findTriggerRunById(fixture.run.id))?.status, "running");
+      assert.deepEqual(
+        dispatchFailures(fixture.stream),
+        [],
+        "the completion watcher resolved without a DaemonDispatchFailure",
+      );
       await fixture.lifecycle.stop();
     });
 
-    it("still fails a workflow step whose agent went idle without replying", async () => {
-      const fixture = await idleWorkflowExecution({ emitted: false });
+    it("still settles the dispatch as an idle timeout when the agent never replied", async () => {
+      const fixture = await dispatchedWorkflowExecution({ emitted: false });
 
-      await fixture.lifecycle.recoverAgentExecutionDeadlines();
+      await fixture.clock.advance(IDLE_TIMEOUT_MS);
+      await fixture.connection.unsubscribed();
 
-      const execution = await fixture.database.findAgentExecutionById(fixture.execution.id);
+      const execution = await fixture.database.findAgentExecutionById(fixture.executionId);
       assert.deepEqual(
         { status: execution?.status, result: execution?.result },
         { status: "failed", result: { status: "failed", reason: "step_idle_timeout" } },
       );
-      const step = await fixture.database.findWorkflowStepRunById(fixture.step.id);
-      assert.equal(step?.status, "timed_out");
+      assert.equal(
+        (await fixture.database.findWorkflowStepRunById(fixture.step.id))?.status,
+        "timed_out",
+      );
+      assert.deepEqual(dispatchFailures(fixture.stream), ["step_idle_timeout"]);
       await fixture.lifecycle.stop();
     });
 
@@ -388,6 +467,88 @@ async function emitOutput(
   assert.ok(attempt !== undefined);
   const updated = await database.completeAgentExecutionOutput(executionId, attempt.id, startedAt);
   assert.equal(updated?.outputEmissions["linear.reply"], 1);
+}
+
+/** Dispatch failures the lifecycle reported after the completion watcher rejected. */
+function dispatchFailures(stream: FailureLogStream): string[] {
+  return stream
+    .records()
+    .filter((record) => record["operation"] === "daemon.dispatch")
+    .map((record) => {
+      const error = record["err"];
+      const code: unknown =
+        typeof error === "object" && error !== null ? Reflect.get(error, "code") : undefined;
+      return typeof code === "string" ? code : "unknown";
+    });
+}
+
+class ManualDeadlineClock implements ExecutionDeadlineClock {
+  private nowMs: number;
+  private readonly timers = new Map<number, { at: number; callback: () => Promise<void> }>();
+  private nextTimerId = 1;
+
+  constructor(start: Date) {
+    this.nowMs = start.getTime();
+  }
+
+  now(): number {
+    return this.nowMs;
+  }
+
+  schedule(callback: () => Promise<void>, delayMs: number): () => void {
+    const id = this.nextTimerId++;
+    this.timers.set(id, { at: this.nowMs + delayMs, callback });
+    return () => {
+      this.timers.delete(id);
+    };
+  }
+
+  /** Moves time forward and runs every deadline that became due, in order. */
+  async advance(ms: number): Promise<void> {
+    const target = this.nowMs + ms;
+    for (;;) {
+      const due = Array.from(this.timers.entries())
+        .filter(([, timer]) => timer.at <= target)
+        .sort(([, left], [, right]) => left.at - right.at)[0];
+      if (due === undefined) break;
+      const [id, timer] = due;
+      this.timers.delete(id);
+      this.nowMs = Math.max(this.nowMs, timer.at);
+      await timer.callback();
+    }
+    this.nowMs = target;
+  }
+}
+
+class DispatchConnection implements DaemonConnection {
+  private readonly handlers = new Set<DaemonEventHandler>();
+
+  on(handler: DaemonEventHandler): () => void {
+    this.handlers.add(handler);
+    return () => this.handlers.delete(handler);
+  }
+
+  subscriptions(): number {
+    return this.handlers.size;
+  }
+
+  /** Resolves once the dispatch released its event subscription, which only happens after its completion watcher settled. */
+  async unsubscribed(): Promise<void> {
+    for (let attempt = 0; attempt < 50 && this.handlers.size > 0; attempt += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.equal(this.handlers.size, 0, "the dispatch never settled");
+  }
+
+  async emit(event: DaemonEvent): Promise<void> {
+    for (const handler of this.handlers) await handler(event);
+  }
+
+  async createAgent(): Promise<{ id: string }> {
+    return { id: AGENT_ID };
+  }
+
+  async controlExecution(): Promise<void> {}
 }
 
 function createLifecycle(

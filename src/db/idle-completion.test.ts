@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import { createMemoryDatabase } from "./memory.js";
 import { completesAtIdleDeadline } from "./idle-completion.js";
+import { missingRequiredOutputs } from "../execution-capabilities/required-outputs.js";
 
 const IDLE_DEADLINE = new Date("2026-08-05T12:00:10.000Z");
 const AFTER_IDLE = new Date("2026-08-05T12:00:11.000Z");
@@ -23,10 +24,59 @@ describe("completesAtIdleDeadline", () => {
     assert.equal(
       completesAtIdleDeadline({
         outputEmissions: { "linear.reply": 1 },
-        launchIntent: { outputSchema: { type: "object" } },
+        launchIntent: { outputSchema: { type: "object" }, allowOutputs: [] },
       }),
       false,
     );
+  });
+
+  it("applies the finish_execution bar: every required output must have been emitted", () => {
+    const allowOutputs = [
+      { type: "linear.reply", required: true },
+      { type: "github.comment", required: true },
+      { type: "slack.message" },
+    ];
+    assert.equal(
+      completesAtIdleDeadline({
+        outputEmissions: { "linear.reply": 1, "slack.message": 1 },
+        launchIntent: { allowOutputs },
+      }),
+      false,
+      "a missing required output keeps the idle deadline on the timeout path",
+    );
+    assert.equal(
+      completesAtIdleDeadline({
+        outputEmissions: { "linear.reply": 1, "github.comment": 1 },
+        launchIntent: { allowOutputs },
+      }),
+      true,
+      "optional outputs are not owed",
+    );
+    assert.equal(
+      completesAtIdleDeadline({
+        outputEmissions: { "slack.message": 2 },
+        launchIntent: { allowOutputs: [{ type: "slack.message" }] },
+      }),
+      true,
+      "without a required output any emission completes the execution",
+    );
+  });
+
+  it("shares its notion of owed outputs with finish_execution", () => {
+    const execution = {
+      outputEmissions: { "linear.reply": 1 },
+      launchIntent: {
+        allowOutputs: [
+          { type: "linear.reply", required: true },
+          { type: "github.comment", required: true },
+        ],
+      },
+    };
+    assert.deepEqual(
+      missingRequiredOutputs(execution).map((output) => output.type),
+      ["github.comment"],
+    );
+    assert.equal(completesAtIdleDeadline(execution), false);
   });
 });
 
