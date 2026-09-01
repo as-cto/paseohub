@@ -346,6 +346,8 @@ describe("Linear connection client", () => {
 
     const request = graphqlRequest(requests[0] ?? "{}");
     assert.match(request.query, /\$signal: AgentActivitySignal/u);
+    assert.match(request.query, /\$signalMetadata: JSONObject/u);
+    assert.match(request.query, /signalMetadata: \$signalMetadata/u);
     assert.deepEqual(request.variables, {
       agentSessionId: "session-1",
       content: { type: "elicitation", body: "Which branch?" },

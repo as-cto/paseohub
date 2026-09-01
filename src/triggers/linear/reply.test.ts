@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import type { LinearApiClient } from "../../providers/linear/client.js";
+import { compileJsonSchema } from "../../workflows/json-schema.js";
 import { createLinearReplyExecutor, linearReplyOutputTool } from "./reply.js";
 
 describe("Linear reply output", () => {
@@ -161,6 +162,33 @@ describe("Linear reply output", () => {
       "options",
     ]);
     assert.deepEqual(linearReplyOutputTool.inputSchema.required, ["content"]);
+  });
+
+  it("validates reply arguments against the tool schema", () => {
+    const { validate } = compileJsonSchema(linearReplyOutputTool.inputSchema);
+    assert.equal(linearReplyOutputTool.inputSchema["additionalProperties"], false);
+    assert.equal(validate({ content: "Which branch?", kind: "question", options: ["a"] }), true);
+    assert.equal(validate({ content: "Done", kind: "thought" }), false);
+    assert.equal(validate({ content: "Which branch?", options: [] }), false);
+    assert.equal(validate({ content: "Done", extra: 1 }), false);
+  });
+
+  it("drops duplicated choices before offering them", async () => {
+    const client = new RecordingLinearClient();
+    const execute = createLinearReplyExecutor({ client });
+    await execute({
+      agentExecutionId: "execution-1",
+      toolType: "linear.reply",
+      args: { content: "Which branch?", kind: "question", options: ["main", "main", "dev"] },
+      outputContext: sessionContext(),
+    });
+
+    assert.deepEqual(client.activities[0]?.signalMetadata, {
+      options: [
+        { label: "main", value: "main" },
+        { label: "dev", value: "dev" },
+      ],
+    });
   });
 
   it("fails closed for an output context from another provider", async () => {

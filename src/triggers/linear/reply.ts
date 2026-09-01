@@ -18,13 +18,18 @@ const LinearReplyOutputContextSchema = z.object({
  * The shared reply tool only carries `content`; Linear agent sessions additionally distinguish a
  * final answer (`response`, closes the session) from a question (`elicitation`, leaves the session
  * awaiting input), optionally with a fixed list of choices.
+ *
+ * The elicitation body does not repeat the choices: they travel in `signalMetadata`, which the
+ * session history reread on the next execution does not retain (only `body` is kept). The
+ * question text should therefore stand on its own once the user's answer comes back.
  */
 export const linearReplyOutputTool: OutputToolDefinition = {
   name: "reply",
   description:
     "Sends a reply to the conversation that triggered this execution. " +
-    'Use kind "question" when you need an answer from the user before continuing: the session ' +
-    "waits for their reply instead of completing. Provide options to offer fixed choices.",
+    'Use kind "question" when you need an answer before continuing: post the question, then call ' +
+    "finish_execution. The user's answer arrives as a NEW execution; do not wait for it here. " +
+    "Provide options to offer fixed choices (the user may still answer freely).",
   inputSchema: {
     type: "object",
     properties: {
@@ -47,7 +52,7 @@ export function createLinearReplyExecutor(options: { client: LinearApiClient }):
     const args = LinearReplyArgsSchema.parse(input.args);
     const context = LinearReplyOutputContextSchema.parse(input.outputContext);
     if (context.agentSessionId !== null) {
-      const choices = args.kind === "question" ? (args.options ?? []) : [];
+      const choices = questionChoices(args);
       await options.client.createAgentActivity({
         linearOrganizationId: context.linearOrganizationId,
         agentSessionId: context.agentSessionId,
@@ -79,8 +84,13 @@ export function createLinearReplyExecutor(options: { client: LinearApiClient }):
 
 /** Issue comments have no elicitation: a question with choices lists them in Markdown instead. */
 function commentBody(args: z.infer<typeof LinearReplyArgsSchema>): string {
-  const choices = args.kind === "question" ? (args.options ?? []) : [];
+  const choices = questionChoices(args);
   return choices.length === 0
     ? args.content
     : `${args.content}\n\n${choices.map((choice) => `- ${choice}`).join("\n")}`;
+}
+
+/** Only a question carries choices; a duplicated choice would render twice in Linear's select. */
+function questionChoices(args: z.infer<typeof LinearReplyArgsSchema>): string[] {
+  return args.kind === "question" ? [...new Set(args.options ?? [])] : [];
 }
