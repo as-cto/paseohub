@@ -378,7 +378,9 @@ function normalizePromptActivity(value: unknown):
   const id = readString(activity["id"]);
   // Linear serializes the signal beside the content; older payloads nested it inside.
   const signal = readStopSignal(activity["signal"]) ?? readStopSignal(content["signal"]);
-  // A stop prompt carries no user text, but the event still needs a non-empty prompt.
+  // A stop prompt carries no user text, but the event still needs a non-empty prompt. The
+  // synthetic "Stop" body never reaches a run: the provider handles a `stop` signal before
+  // trigger matching and drops the event as `agent_session_stopped`.
   const body = readString(content["body"]) ?? (signal === undefined ? undefined : "Stop");
   const createdAt = readDate(activity["createdAt"]);
   return id === undefined || body === undefined || createdAt === undefined

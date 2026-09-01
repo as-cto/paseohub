@@ -130,8 +130,8 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     options.database === null ? undefined : createManualRunProvider(storeForProject);
   const attachments = createAttachmentRegistry(options);
   // Providers are created before the daemon module that depends on them, so execution control
-  // binds to the lifecycle lazily; it is only ever invoked while handling live events.
-  let executionLifecycle: DaemonModule["lifecycle"] | undefined;
+  // binds to the module lazily; it is only ever invoked while handling live events.
+  let executionDaemonModule: DaemonModule | null | undefined;
   const configuredProviders =
     options.database === null
       ? []
@@ -144,7 +144,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
                 throw new Error("no connection resolver registered");
               }),
             ...(attachments === undefined ? {} : { attachments }),
-            executions: executionControlFor(() => executionLifecycle),
+            executions: executionControlFor(() => executionDaemonModule),
           }),
         );
   const providers = [manualProvider, ...configuredProviders, ...(options.providers ?? [])].filter(
@@ -152,7 +152,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
   );
   const outputRegistry = options.outputRegistry ?? new OutputExecutorRegistry();
   const daemonModule = createAppDaemonModule(options, daemons, providers, outputRegistry);
-  executionLifecycle = daemonModule?.lifecycle;
+  executionDaemonModule = daemonModule;
   const capabilityServer = createAppExecutionCapabilityServer(
     options,
     daemonModule,
@@ -426,16 +426,16 @@ function connectDaemonLifecycle(
 }
 
 function executionControlFor(
-  lifecycle: () => DaemonModule["lifecycle"] | undefined,
+  daemonModule: () => DaemonModule | null | undefined,
 ): TriggerProviderExecutionControl {
   return {
     stopActive: async (input) => {
-      const current = lifecycle();
+      const current = daemonModule()?.lifecycle;
       if (current === undefined) {
         throw new Error("execution control is unavailable before the daemon module");
       }
       const stopped = await current.stopAgentExecutions(input);
-      return { stopped: stopped.length };
+      return { stopped: stopped.executions.length + stopped.runs.length };
     },
   };
 }

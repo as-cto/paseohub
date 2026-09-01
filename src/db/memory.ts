@@ -107,7 +107,7 @@ import {
 } from "../entitlements/catalog.js";
 import { toProviderEventReceiptRecordSummary } from "./mappers.js";
 import {
-  isProviderEventDropReasonCode,
+  isUnroutedProviderEventDropReasonCode,
   type ProviderEventDropReasonCode,
 } from "../triggers/drop-reason.js";
 
@@ -2943,7 +2943,8 @@ class MemoryDatabase implements Database {
         (receipt) =>
           receipt.organizationId === organizationId &&
           receipt.droppedReason !== null &&
-          isProviderEventDropReasonCode(receipt.droppedReason) &&
+          // Same codes as the Postgres query: a stop receipt was handled, not left unrouted.
+          isUnroutedProviderEventDropReasonCode(receipt.droppedReason) &&
           !routedReceiptIds.has(receipt.id),
       )
       .sort(

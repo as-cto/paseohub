@@ -21,9 +21,10 @@ export interface TriggerProviderResources {
 /** Lets a provider end running work on behalf of its platform, e.g. a user pressing Stop. */
 export interface TriggerProviderExecutionControl {
   /**
-   * Fails the project's pending executions selected by `matches` with `reason`. The failure
-   * follows the usual terminal path: the daemon agent is interrupted and the provider's
-   * failure hook receives `reason`.
+   * Fails the project's work selected by `matches` with `reason`: pending executions and
+   * accepted runs whose execution was not dispatched yet. The failure follows the usual
+   * terminal path: the daemon agent is interrupted and the provider's failure hook receives
+   * `reason`. `stopped` counts both kinds.
    */
   stopActive(input: {
     projectId: string;

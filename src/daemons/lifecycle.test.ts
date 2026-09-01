@@ -214,6 +214,37 @@ describe("durable Hub action acknowledgement state", () => {
       configurationRevisionId: run.configurationRevisionId,
     });
     await database.transitionAgentExecution(untouched.id, "running");
+    // Accepted for the same session, but its wakeup has not created an execution yet.
+    const undispatched = (
+      await database.createAcceptedTriggerRun({
+        organizationId: "org-stop",
+        projectId: "project-stop",
+        configurationRevisionId: "revision-stop",
+        providerEventReceiptId: "receipt-stop-undispatched",
+        configuredTriggerName: "agent-session",
+        prompt: "raw",
+        inputs: {},
+        triggerContext: { provider: "test" },
+        outputContext: { provider: "linear", agentSessionId: "session-1" },
+        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+        stepIds: ["step"],
+      })
+    ).run;
+    const otherSessionRun = (
+      await database.createAcceptedTriggerRun({
+        organizationId: "org-stop",
+        projectId: "project-stop",
+        configurationRevisionId: "revision-stop",
+        providerEventReceiptId: "receipt-stop-other-session",
+        configuredTriggerName: "agent-session",
+        prompt: "raw",
+        inputs: {},
+        triggerContext: { provider: "test" },
+        outputContext: { provider: "linear", agentSessionId: "session-2" },
+        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+        stepIds: ["step"],
+      })
+    ).run;
 
     const result = await lifecycle.stopAgentExecutions({
       projectId: run.projectId,
@@ -222,9 +253,21 @@ describe("durable Hub action acknowledgement state", () => {
     });
 
     assert.deepEqual(
-      result.map((execution) => execution.id),
+      result.executions.map((execution) => execution.id),
       [stopped.id],
     );
+    assert.deepEqual(
+      result.runs.map((candidate) => candidate.id),
+      [undispatched.id],
+    );
+    const undispatchedRun = await database.findTriggerRunById(undispatched.id);
+    assert.equal(undispatchedRun?.status, "failed");
+    assert.equal(undispatchedRun?.failureReason, "stopped_by_user");
+    assert.equal(
+      (await database.listWorkflowStepRunsForTriggerRun(undispatched.id))[0]?.status,
+      "failed",
+    );
+    assert.equal((await database.findTriggerRunById(otherSessionRun.id))?.status, "running");
     const failed = await database.findAgentExecutionById(stopped.id);
     assert.equal(failed?.status, "failed");
     assert.deepEqual(failed?.result, { status: "failed", reason: "stopped_by_user" });
@@ -242,9 +285,78 @@ describe("durable Hub action acknowledgement state", () => {
         reason: "stopped_by_user",
         matches: (execution) => agentSessionIdOf(execution.outputContext) === "session-1",
       }),
-      [],
+      { executions: [], runs: [] },
     );
     assert.equal((await database.findAgentExecutionById(untouched.id))?.status, "running");
+    assert.equal((await database.findTriggerRunById(otherSessionRun.id))?.status, "running");
+    await lifecycle.stop();
+  });
+
+  it("hands a stopped undispatched run to the outbox with the stop reason", async () => {
+    const database = createMemoryDatabase();
+    const failures: string[] = [];
+    const provider: TriggerProvider = {
+      name: "test",
+      eventNames: ["manual.test"],
+      match: () => Promise.resolve([]),
+      onAgentExecutionFailed: async (_context, _output, reason) => {
+        failures.push(reason);
+      },
+    };
+    const lifecycle = createDaemonDispatchLifecycle({
+      database,
+      connectionForDaemon: () => undefined,
+      providers: [provider],
+    });
+    const run = (
+      await database.createAcceptedTriggerRun({
+        organizationId: "org-stop-outbox",
+        projectId: "project-stop-outbox",
+        configurationRevisionId: "revision-stop-outbox",
+        providerEventReceiptId: "receipt-stop-outbox",
+        configuredTriggerName: "agent-session",
+        prompt: "raw",
+        inputs: {},
+        triggerContext: { provider: "test" },
+        outputContext: { provider: "linear", agentSessionId: "session-1" },
+        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+        stepIds: ["step"],
+      })
+    ).run;
+
+    const result = await lifecycle.stopAgentExecutions({
+      projectId: run.projectId,
+      reason: "stopped_by_user",
+      matches: (work) => agentSessionIdOf(work.outputContext) === "session-1",
+    });
+
+    assert.deepEqual(result.executions, []);
+    assert.deepEqual(
+      result.runs.map((candidate) => candidate.id),
+      [run.id],
+    );
+    // The provider hears about it through the engine's outbox, like any workflow failure.
+    assert.deepEqual(failures, []);
+    const engine = createDurableWorkflowHandler({
+      database,
+      entitlements: createUnlimitedEntitlementsService(),
+      providers: [],
+      onWorkflowRunTerminal: (terminalRun) => lifecycle.notifyWorkflowRunTerminal(terminalRun),
+    }).engine;
+    await engine.processAvailable();
+    assert.deepEqual(failures, ["stopped_by_user"]);
+    const delivered = await database.findTriggerRunById(run.id);
+    assert.equal(
+      delivered?.outcome === "accepted"
+        ? delivered.terminalNotificationDeliveredAt !== null
+        : false,
+      true,
+    );
+    // The stopped run never dispatches: its wakeup is gone.
+    assert.equal(
+      await database.claimWorkflowWakeup(new Date("2099-01-01T00:00:00.000Z"), 1),
+      undefined,
+    );
     await lifecycle.stop();
   });
 

@@ -489,8 +489,8 @@ function linearAgentReactionPhase(
 
 /**
  * Linear's `stop` signal arrives as a prompt; it must not start a run. The session's pending
- * executions are failed with a dedicated reason (so no error is posted for them), and Linear
- * receives the `response` it expects to settle the session.
+ * executions and not-yet-dispatched runs are failed with a dedicated reason (so no error is
+ * posted for them), and Linear receives the `response` it expects to settle the session.
  */
 async function stopLinearAgentSession(
   options: {

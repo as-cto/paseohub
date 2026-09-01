@@ -94,6 +94,9 @@ const systemExecutionDeadlineClock: ExecutionDeadlineClock = {
   },
 };
 
+/** How many of a project's most recent runs a user stop inspects for undispatched work. */
+const STOP_RUN_SCAN_LIMIT = 200;
+
 export interface DaemonDispatchLifecycleOptions {
   database: Database;
   connectionForDaemon(daemonId: string): DaemonConnection | undefined;
@@ -1092,15 +1095,29 @@ export class DaemonDispatchLifecycle {
   }
 
   /**
-   * Fails the project's pending executions selected by `matches` at a user's request. The
-   * regular failure path derives the hub action, so the daemon agent is interrupted or archived,
-   * and the provider's failure hook receives `reason` to decide what (if anything) to post.
+   * Stops the project's work selected by `matches` (on its output context) at a user's request.
+   *
+   * Two kinds of work exist, and both are covered:
+   * - pending executions (`spawning`/`running`) are failed through the regular failure path,
+   *   which derives the hub action (the daemon agent is interrupted or archived) and lets the
+   *   provider's failure hook decide what, if anything, to post for `reason`;
+   * - accepted runs still `running` without a pending execution. That window is real: a run
+   *   is accepted, then a wakeup creates its execution later (`processWakeup`), and between two
+   *   steps of a multi-step workflow no execution exists at all. Left alone, such a run would
+   *   dispatch after the stop and post a response on a session the user already settled. They
+   *   are failed with `failWorkflowRun`, which refuses further step executions and queues the
+   *   terminal notification the workflow engine's outbox delivers with `reason`.
+   *
+   * Executions are failed first: their terminal transition already settles their run, so the
+   * second pass only sees runs that had nothing dispatched. The run scan reads the project's
+   * most recent {@link STOP_RUN_SCAN_LIMIT} runs; a run older than that has long passed its
+   * deadline.
    */
   async stopAgentExecutions(input: {
     projectId: string;
     reason: string;
-    matches: (execution: AgentExecutionRecord) => boolean;
-  }): Promise<AgentExecutionRecord[]> {
+    matches: (work: { outputContext: unknown }) => boolean;
+  }): Promise<{ executions: AgentExecutionRecord[]; runs: AcceptedTriggerRunRecord[] }> {
     const executions = (await this.options.database.findPendingAgentExecutions()).filter(
       (execution) => execution.projectId === input.projectId && input.matches(execution),
     );
@@ -1115,7 +1132,24 @@ export class DaemonDispatchLifecycle {
         return failed;
       }),
     );
-    return stopped.filter((execution) => execution !== undefined);
+    const undispatched = (
+      await this.options.database.listTriggerRunsForProject(input.projectId, STOP_RUN_SCAN_LIMIT)
+    ).filter(
+      (run): run is AcceptedTriggerRunRecord =>
+        run.outcome === "accepted" && run.status === "running" && input.matches(run),
+    );
+    const failedRuns = await Promise.all(
+      undispatched.map(async (run) => {
+        const failed = await this.options.database.failWorkflowRun(run.id, "failed", input.reason);
+        return failed?.transitioned === true && failed.run.outcome === "accepted"
+          ? failed.run
+          : undefined;
+      }),
+    );
+    return {
+      executions: stopped.filter((execution) => execution !== undefined),
+      runs: failedRuns.filter((run) => run !== undefined),
+    };
   }
 
   private async startAgentExecution(executionId: string): Promise<void> {

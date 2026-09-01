@@ -543,25 +543,45 @@ describe("Linear trigger provider", () => {
   it("confirms a stop even when nothing is running so Linear can settle the session", async () => {
     const { project, revision, store } = await activeConfiguration(agentSessionConfiguration());
     const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    let stops = 0;
     const provider = createLinearTriggerProvider({
       configurationStoreForProject: () => store,
       client,
-    });
-    const stopEvent = agentSessionEvent({
-      agentActivity: {
-        id: "trigger-activity",
-        type: "prompt",
-        body: "Stop",
-        createdAt: "2026-01-02T00:01:00.000Z",
-        signal: "stop",
+      executions: {
+        stopActive: async () => {
+          stops += 1;
+          return { stopped: 0 };
+        },
       },
     });
 
-    const result = await provider.match(externalAgentSession(project.id, revision.id, stopEvent));
+    const result = await provider.match(
+      externalAgentSession(project.id, revision.id, stopSignalEvent()),
+    );
 
     assert.equal(result, "agent_session_stopped");
+    assert.equal(stops, 1);
     assert.equal(client.createdActivities.length, 1);
     assert.equal(client.createdActivities[0]?.content.type, "response");
+  });
+
+  it("does not confirm a stop it could not apply", async () => {
+    const { project, revision, store } = await activeConfiguration(agentSessionConfiguration());
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+      executions: {
+        stopActive: () => Promise.reject(new Error("execution control unavailable")),
+      },
+    });
+
+    await assert.rejects(
+      provider.match(externalAgentSession(project.id, revision.id, stopSignalEvent())),
+      /execution control unavailable/,
+    );
+    // No "Stopped" response: the work may still be running and Linear must not be told otherwise.
+    assert.deepEqual(client.createdActivities, []);
   });
 
   it("does not post an error for an execution the user stopped", async () => {
@@ -840,6 +860,18 @@ function event(
     },
     occurredAt,
   };
+}
+
+function stopSignalEvent(): NormalizedLinearAgentSessionEvent {
+  return agentSessionEvent({
+    agentActivity: {
+      id: "trigger-activity",
+      type: "prompt",
+      body: "Stop",
+      createdAt: "2026-01-02T00:01:00.000Z",
+      signal: "stop",
+    },
+  });
 }
 
 function agentSessionEvent(
