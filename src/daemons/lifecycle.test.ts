@@ -171,59 +171,80 @@ describe("durable Hub action acknowledgement state", () => {
     await lifecycle.stop();
   });
 
-  describe("idle deadline after an emitted output", () => {
-    const IDLE_TIMEOUT_MS = 10_000;
-
-    /**
-     * A real dispatch: the lifecycle registers the completion watcher itself,
-     * so the test proves which way the idle deadline settles that watcher.
-     * The memory database would complete the step on its own; what is under
-     * test here is the lifecycle branch that runs before it.
-     */
-    async function dispatchedWorkflowExecution(options: { emitted: boolean }) {
-      const clock = new ManualDeadlineClock(new Date("2026-01-01T00:00:00.000Z"));
-      const database = createMemoryDatabase({ now: () => new Date(clock.now()) });
-      const organizationId = "org-idle-output";
-      const project = await database.createProject({
-        organizationId,
-        name: "Idle output",
-        slug: "idle-output",
-        createdByUserId: null,
-      });
-      const revision = await database.insertProjectConfigurationRevision({
-        projectId: project.id,
-        sourceKind: "manual",
-        sourceEvidence: { kind: "test" },
-        normalizedConfiguration: { environments: [], triggers: [] },
-        contentHash: "idle-output",
-      });
-      await database.issueEnrollmentToken({
-        id: "enrollment-idle-output",
-        verifier: "enrollment-verifier-idle-output",
-        organizationId,
-        expiresAt: new Date(clock.now() + 60_000),
-        consumedAt: null,
-      });
-      const daemon = await database.enrollDaemon({
-        daemonId: DAEMON_ID,
-        idempotencyKey: "enroll-idle-output",
-        tokenVerifier: "enrollment-verifier-idle-output",
-        serverId: "server-idle-output",
-        daemonPublicKey: "public-key",
-        credentialVerifier: "verifier",
-        permissions: ["hub.execute"],
-        now: new Date(clock.now()),
-      });
-      assert.ok(daemon !== undefined && "machineId" in daemon);
-      const { run } = await database.createAcceptedTriggerRun({
-        organizationId,
-        projectId: project.id,
-        configurationRevisionId: revision.id,
-        providerEventReceiptId: "receipt-idle-output",
-        configuredTriggerName: "idle",
   it("reports the outputs delivered across workflow steps to the completion hook", async () => {
     const database = createMemoryDatabase();
     const results: unknown[] = [];
+    const provider: TriggerProvider = {
+      name: "test",
+      eventNames: ["manual.test"],
+      match: () => Promise.resolve([]),
+      onAgentExecutionCompleted: async (_triggerContext, _outputContext, result) => {
+        results.push(result);
+      },
+    };
+    const lifecycle = createDaemonDispatchLifecycle({
+      database,
+      connectionForDaemon: () => undefined,
+      providers: [provider],
+    });
+    const run = (
+      await database.createAcceptedTriggerRun({
+        organizationId: "org-workflow-emissions",
+        projectId: "project-workflow-emissions",
+        configurationRevisionId: "revision-workflow-emissions",
+        providerEventReceiptId: "receipt-workflow-emissions",
+        configuredTriggerName: "emissions",
+        prompt: "raw",
+        inputs: {},
+        triggerContext: { provider: "test" },
+        outputContext: { provider: "test" },
+        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+        stepIds: ["first", "second", "skipped"],
+      })
+    ).run;
+    const steps = await database.listWorkflowStepRunsForTriggerRun(run.id);
+    const emitted: Record<string, string[]> = {
+      first: ["linear.reply", "linear.reply"],
+      second: ["linear.reply", "github.comment"],
+    };
+    for (const step of steps) {
+      const outputs = emitted[step.stepId];
+      if (outputs === undefined) continue;
+      const execution = await database.insertAgentExecution({
+        id: `00000000-0000-4000-8000-00000000${step.ordinal.toString().padStart(4, "0")}`,
+        organizationId: run.organizationId,
+        projectId: run.projectId,
+        machineId: null,
+        daemonId: DAEMON_ID,
+        triggerContext: run.triggerContext,
+        outputContext: run.outputContext,
+        configurationRevisionId: run.configurationRevisionId,
+        workflowStepRunId: step.id,
+      });
+      await database.linkWorkflowStepRunExecution(step.id, execution.id);
+      for (const outputType of outputs) {
+        const startedAt = new Date("2026-01-01T00:00:00.000Z");
+        const attempt = await database.beginAgentExecutionOutput(
+          execution.id,
+          outputType,
+          undefined,
+          startedAt,
+        );
+        assert.ok(attempt);
+        await database.completeAgentExecutionOutput(execution.id, attempt.id, startedAt);
+      }
+    }
+    const succeeded = await database.succeedTriggerRun(run.id);
+    if (succeeded?.transitioned !== true) throw new Error("expected the run to succeed");
+
+    await lifecycle.notifyWorkflowRunTerminal(succeeded.run);
+
+    assert.deepEqual(results, [
+      { status: "succeeded", outputEmissions: { "linear.reply": 3, "github.comment": 1 } },
+    ]);
+    await lifecycle.stop();
+  });
+
   it("stops only the matching pending executions at a user's request", async () => {
     const database = createMemoryDatabase();
     const connection = new AcknowledgementConnection();
@@ -354,8 +375,6 @@ describe("durable Hub action acknowledgement state", () => {
       name: "test",
       eventNames: ["manual.test"],
       match: () => Promise.resolve([]),
-      onAgentExecutionCompleted: async (_triggerContext, _outputContext, result) => {
-        results.push(result);
       onAgentExecutionFailed: async (_context, _output, reason) => {
         failures.push(reason);
       },
@@ -367,11 +386,106 @@ describe("durable Hub action acknowledgement state", () => {
     });
     const run = (
       await database.createAcceptedTriggerRun({
-        organizationId: "org-workflow-emissions",
-        projectId: "project-workflow-emissions",
-        configurationRevisionId: "revision-workflow-emissions",
-        providerEventReceiptId: "receipt-workflow-emissions",
-        configuredTriggerName: "emissions",
+        organizationId: "org-stop-outbox",
+        projectId: "project-stop-outbox",
+        configurationRevisionId: "revision-stop-outbox",
+        providerEventReceiptId: "receipt-stop-outbox",
+        configuredTriggerName: "agent-session",
+        prompt: "raw",
+        inputs: {},
+        triggerContext: { provider: "test" },
+        outputContext: { provider: "linear", agentSessionId: "session-1" },
+        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+        stepIds: ["step"],
+      })
+    ).run;
+
+    const result = await lifecycle.stopAgentExecutions({
+      projectId: run.projectId,
+      reason: "stopped_by_user",
+      matches: (work) => agentSessionIdOf(work.outputContext) === "session-1",
+    });
+
+    assert.deepEqual(result.executions, []);
+    assert.deepEqual(
+      result.runs.map((candidate) => candidate.id),
+      [run.id],
+    );
+    // The provider hears about it through the engine's outbox, like any workflow failure.
+    assert.deepEqual(failures, []);
+    const engine = createDurableWorkflowHandler({
+      database,
+      entitlements: createUnlimitedEntitlementsService(),
+      providers: [],
+      onWorkflowRunTerminal: (terminalRun) => lifecycle.notifyWorkflowRunTerminal(terminalRun),
+    }).engine;
+    await engine.processAvailable();
+    assert.deepEqual(failures, ["stopped_by_user"]);
+    const delivered = await database.findTriggerRunById(run.id);
+    assert.equal(
+      delivered?.outcome === "accepted"
+        ? delivered.terminalNotificationDeliveredAt !== null
+        : false,
+      true,
+    );
+    // The stopped run never dispatches: its wakeup is gone.
+    assert.equal(
+      await database.claimWorkflowWakeup(new Date("2099-01-01T00:00:00.000Z"), 1),
+      undefined,
+    );
+    await lifecycle.stop();
+  });
+
+  describe("idle deadline after an emitted output", () => {
+    const IDLE_TIMEOUT_MS = 10_000;
+
+    /**
+     * A real dispatch: the lifecycle registers the completion watcher itself,
+     * so the test proves which way the idle deadline settles that watcher.
+     * The memory database would complete the step on its own; what is under
+     * test here is the lifecycle branch that runs before it.
+     */
+    async function dispatchedWorkflowExecution(options: { emitted: boolean }) {
+      const clock = new ManualDeadlineClock(new Date("2026-01-01T00:00:00.000Z"));
+      const database = createMemoryDatabase({ now: () => new Date(clock.now()) });
+      const organizationId = "org-idle-output";
+      const project = await database.createProject({
+        organizationId,
+        name: "Idle output",
+        slug: "idle-output",
+        createdByUserId: null,
+      });
+      const revision = await database.insertProjectConfigurationRevision({
+        projectId: project.id,
+        sourceKind: "manual",
+        sourceEvidence: { kind: "test" },
+        normalizedConfiguration: { environments: [], triggers: [] },
+        contentHash: "idle-output",
+      });
+      await database.issueEnrollmentToken({
+        id: "enrollment-idle-output",
+        verifier: "enrollment-verifier-idle-output",
+        organizationId,
+        expiresAt: new Date(clock.now() + 60_000),
+        consumedAt: null,
+      });
+      const daemon = await database.enrollDaemon({
+        daemonId: DAEMON_ID,
+        idempotencyKey: "enroll-idle-output",
+        tokenVerifier: "enrollment-verifier-idle-output",
+        serverId: "server-idle-output",
+        daemonPublicKey: "public-key",
+        credentialVerifier: "verifier",
+        permissions: ["hub.execute"],
+        now: new Date(clock.now()),
+      });
+      assert.ok(daemon !== undefined && "machineId" in daemon);
+      const { run } = await database.createAcceptedTriggerRun({
+        organizationId,
+        projectId: project.id,
+        configurationRevisionId: revision.id,
+        providerEventReceiptId: "receipt-idle-output",
+        configuredTriggerName: "idle",
         prompt: "raw",
         inputs: {},
         triggerContext: { provider: "test" },
@@ -501,97 +615,6 @@ describe("durable Hub action acknowledgement state", () => {
       );
       await lifecycle.stop();
     });
-        stepIds: ["first", "second", "skipped"],
-      })
-    ).run;
-    const steps = await database.listWorkflowStepRunsForTriggerRun(run.id);
-    const emitted: Record<string, string[]> = {
-      first: ["linear.reply", "linear.reply"],
-      second: ["linear.reply", "github.comment"],
-    };
-    for (const step of steps) {
-      const outputs = emitted[step.stepId];
-      if (outputs === undefined) continue;
-      const execution = await database.insertAgentExecution({
-        id: `00000000-0000-4000-8000-00000000${step.ordinal.toString().padStart(4, "0")}`,
-        organizationId: run.organizationId,
-        projectId: run.projectId,
-        machineId: null,
-        daemonId: DAEMON_ID,
-        triggerContext: run.triggerContext,
-        outputContext: run.outputContext,
-        configurationRevisionId: run.configurationRevisionId,
-        workflowStepRunId: step.id,
-      });
-      await database.linkWorkflowStepRunExecution(step.id, execution.id);
-      for (const outputType of outputs) {
-        const startedAt = new Date("2026-01-01T00:00:00.000Z");
-        const attempt = await database.beginAgentExecutionOutput(
-          execution.id,
-          outputType,
-          undefined,
-          startedAt,
-        );
-        assert.ok(attempt);
-        await database.completeAgentExecutionOutput(execution.id, attempt.id, startedAt);
-      }
-    }
-    const succeeded = await database.succeedTriggerRun(run.id);
-    if (succeeded?.transitioned !== true) throw new Error("expected the run to succeed");
-
-    await lifecycle.notifyWorkflowRunTerminal(succeeded.run);
-
-    assert.deepEqual(results, [
-      { status: "succeeded", outputEmissions: { "linear.reply": 3, "github.comment": 1 } },
-    ]);
-        organizationId: "org-stop-outbox",
-        projectId: "project-stop-outbox",
-        configurationRevisionId: "revision-stop-outbox",
-        providerEventReceiptId: "receipt-stop-outbox",
-        configuredTriggerName: "agent-session",
-        prompt: "raw",
-        inputs: {},
-        triggerContext: { provider: "test" },
-        outputContext: { provider: "linear", agentSessionId: "session-1" },
-        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
-        stepIds: ["step"],
-      })
-    ).run;
-
-    const result = await lifecycle.stopAgentExecutions({
-      projectId: run.projectId,
-      reason: "stopped_by_user",
-      matches: (work) => agentSessionIdOf(work.outputContext) === "session-1",
-    });
-
-    assert.deepEqual(result.executions, []);
-    assert.deepEqual(
-      result.runs.map((candidate) => candidate.id),
-      [run.id],
-    );
-    // The provider hears about it through the engine's outbox, like any workflow failure.
-    assert.deepEqual(failures, []);
-    const engine = createDurableWorkflowHandler({
-      database,
-      entitlements: createUnlimitedEntitlementsService(),
-      providers: [],
-      onWorkflowRunTerminal: (terminalRun) => lifecycle.notifyWorkflowRunTerminal(terminalRun),
-    }).engine;
-    await engine.processAvailable();
-    assert.deepEqual(failures, ["stopped_by_user"]);
-    const delivered = await database.findTriggerRunById(run.id);
-    assert.equal(
-      delivered?.outcome === "accepted"
-        ? delivered.terminalNotificationDeliveredAt !== null
-        : false,
-      true,
-    );
-    // The stopped run never dispatches: its wakeup is gone.
-    assert.equal(
-      await database.claimWorkflowWakeup(new Date("2099-01-01T00:00:00.000Z"), 1),
-      undefined,
-    );
-    await lifecycle.stop();
   });
 
   it("ignores unrelated failed or canceled tools when finish_execution completes", async () => {
