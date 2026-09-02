@@ -24,7 +24,7 @@ describe("required output delivery", () => {
       outputContext: {},
       configurationRevisionId: "revision-delivery",
     });
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attemptIndex = 0; attemptIndex < 3; attemptIndex += 1) {
       const began = await database.beginAgentExecutionOutput(
         execution.id,
         "linear.reply",
@@ -32,7 +32,10 @@ describe("required output delivery", () => {
         STARTED_AT,
       );
       assert.ok(began !== undefined);
-      assert.equal(await database.failAgentExecutionOutput(execution.id, began.id, STARTED_AT), true);
+      assert.equal(
+        await database.failAgentExecutionOutput(execution.id, began.id, STARTED_AT),
+        true,
+      );
     }
 
     const failedOnly = await deliveryState(database, execution.id);
@@ -90,7 +93,11 @@ describe("required output delivery", () => {
   });
 
   it("keeps a never-attempted required output recoverable", () => {
-    const execution = { outputEmissions: {}, outputDeliveryAttempts: {}, launchIntent: REQUIRED_REPLY };
+    const execution = {
+      outputEmissions: {},
+      outputDeliveryAttempts: {},
+      launchIntent: REQUIRED_REPLY,
+    };
 
     assert.equal(missingRequiredOutputs(execution).length, 1);
     assert.deepEqual(failedRequiredOutputDeliveries(execution), []);

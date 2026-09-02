@@ -514,7 +514,11 @@ describe("agent execution PostgreSQL repository", () => {
         );
         const step = await fixture.database.findWorkflowStepRunById(fixture.step.id);
         assert.deepEqual(
-          { status: step?.status, failureReason: step?.failureReason, deadlineKind: step?.deadlineKind },
+          {
+            status: step?.status,
+            failureReason: step?.failureReason,
+            deadlineKind: step?.deadlineKind,
+          },
           { status: "failed", failureReason: "output_delivery_failed", deadlineKind: null },
         );
         const run = await fixture.database.findTriggerRunById(fixture.run.id);

@@ -141,7 +141,11 @@ export class DaemonSpawnAckTimeoutError extends Error {
 
 export class AgentExecutionCompletionFailure extends Error {
   constructor(
-    readonly reason: "not_found" | "unauthorized" | "expired" | typeof OUTPUT_DELIVERY_FAILED_REASON,
+    readonly reason:
+      | "not_found"
+      | "unauthorized"
+      | "expired"
+      | typeof OUTPUT_DELIVERY_FAILED_REASON,
   ) {
     super(`agent execution completion failed: ${reason}`);
     this.name = "AgentExecutionCompletionFailure";

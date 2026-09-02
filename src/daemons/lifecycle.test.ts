@@ -667,9 +667,7 @@ describe("durable Hub action acknowledgement state", () => {
           executionId: fixture.executionId,
           token: deriveAgentExecutionCompletionToken("completion-secret", fixture.executionId),
         }),
-        (error: unknown) =>
-          error instanceof AgentExecutionCompletionFailure &&
-          error.reason === "output_delivery_failed",
+        isOutputDeliveryFailedCompletionFailure,
       );
       await fixture.connection.unsubscribed();
 
@@ -690,9 +688,7 @@ describe("durable Hub action acknowledgement state", () => {
         { status: "failed", failureReason: "output_delivery_failed" },
       );
       assert.deepEqual(dispatchFailures(fixture.stream), ["output_delivery_failed"]);
-      const logged = fixture.stream
-        .records()
-        .find((record) => record["operation"] === "daemon.execution.output-delivery");
+      const logged = fixture.stream.records().find(isOutputDeliveryLogRecord);
       assert.deepEqual(
         logged?.["diagnostic"],
         {
@@ -848,6 +844,18 @@ async function failOutputDelivery(
     (await database.findAgentExecutionById(executionId))?.outputEmissions["linear.reply"],
     undefined,
   );
+}
+
+/** Whether a completion rejection is the one raised for undelivered required outputs. */
+function isOutputDeliveryFailedCompletionFailure(error: unknown): boolean {
+  return (
+    error instanceof AgentExecutionCompletionFailure && error.reason === "output_delivery_failed"
+  );
+}
+
+/** Whether a log record is the daemon's output-delivery diagnostic. */
+function isOutputDeliveryLogRecord(record: Record<string, unknown>): boolean {
+  return record["operation"] === "daemon.execution.output-delivery";
 }
 
 /** Dispatch failures the lifecycle reported after the completion watcher rejected. */
