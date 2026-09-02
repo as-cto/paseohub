@@ -122,6 +122,21 @@ const CommentThreadResponseSchema = z.object({
         .nullable()
         .optional(),
       children: CommentRepliesSchema,
+      issue: z
+        .object({
+          agentSessions: z.object({
+            nodes: z.array(
+              z.object({
+                comment: z
+                  .object({ id: z.string().min(1) })
+                  .nullable()
+                  .optional(),
+              }),
+            ),
+          }),
+        })
+        .nullable()
+        .optional(),
     }).nullable(),
   }),
 });
@@ -225,6 +240,12 @@ export interface LinearCommentThread {
   rootId: string;
   /** Distinct authors of the root and its replies: `user.id`, or `botActor.id` without a user. */
   authorIds: string[];
+  /**
+   * Root comments of the issue's agent-session threads. Linear materializes a session as a
+   * comment thread (bot root, human prompts, app responses), so one of these as `rootId` marks
+   * a thread the session already handles.
+   */
+  agentSessionRootIds: string[];
 }
 
 export interface LinearIssueCommentHistory {
@@ -610,6 +631,7 @@ export function createLinearApiClient(options: {
                 children(first: 100) { nodes { user { id } botActor { id } } }
               }
               children(first: 100) { nodes { user { id } botActor { id } } }
+              issue { agentSessions(first: 50) { nodes { comment { id } } } }
             }
           }`,
           variables: { id: input.commentId },
@@ -625,7 +647,17 @@ export function createLinearApiClient(options: {
         const id = author.user?.id ?? author.botActor?.id ?? undefined;
         if (id !== undefined) authorIds.add(id);
       }
-      return { rootId: root.id, authorIds: [...authorIds] };
+      const agentSessionRootIds = new Set<string>();
+      for (const session of comment.issue?.agentSessions.nodes ?? []) {
+        if (session.comment !== undefined && session.comment !== null) {
+          agentSessionRootIds.add(session.comment.id);
+        }
+      }
+      return {
+        rootId: root.id,
+        authorIds: [...authorIds],
+        agentSessionRootIds: [...agentSessionRootIds],
+      };
     },
     async createComment(input) {
       const result = CommentResponseSchema.parse(

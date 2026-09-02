@@ -227,7 +227,7 @@ export function createLinearTriggerProvider(
         }
       }
       if (matches.length === 0) return "trigger_filters_rejected";
-      if (event.type === "agent_session" && event.action === "created") {
+      if (event.type === "agent_session") {
         await supersedeLinearCommentRuns(options, externalTrigger.projectId, event);
       }
       return matches;
@@ -533,10 +533,10 @@ function linearThreadContextLocator(
 }
 
 /**
- * `thread_with_app` needs two things the webhook does not carry: who wrote in the thread, and
- * which Linear user the connection acts as. Both are read only when a configured trigger asks
- * for them, and a failed read leaves the event as delivered so the filter fails closed while
- * every other trigger still dispatches.
+ * `thread_with_app` needs three things the webhook does not carry: who wrote in the thread,
+ * whether the thread is an agent session's, and which Linear user the connection acts as. All
+ * are read only when a configured trigger asks for them, and a failed read leaves the event as
+ * delivered so the filter fails closed while every other trigger still dispatches.
  */
 async function hydrateLinearCommentThread(
   options: Pick<LinearTriggerProviderOptions, "client" | "connectionForLinearOrganization">,
@@ -572,8 +572,16 @@ async function hydrateLinearCommentThread(
   if (appUserId === undefined || event.threadAuthorIds !== undefined) return { event, appUserId };
   try {
     const thread = await options.client?.readCommentThread(diagnostic);
+    if (thread === undefined) return { event, appUserId };
+    const threadIsAgentSession = thread.agentSessionRootIds.includes(thread.rootId);
+    if (threadIsAgentSession) {
+      logger.debug(
+        { ...diagnostic, rootCommentId: thread.rootId },
+        "Linear comment is in an agent-session thread; thread_with_app triggers leave it to the session",
+      );
+    }
     return {
-      event: thread === undefined ? event : { ...event, threadAuthorIds: thread.authorIds },
+      event: { ...event, threadAuthorIds: thread.authorIds, threadIsAgentSession },
       appUserId,
     };
   } catch (error) {
@@ -586,24 +594,20 @@ async function hydrateLinearCommentThread(
 }
 
 /**
- * A mention that opens an agent session also arrives as a comment, moments earlier. When a
- * comment trigger already started a run from that comment, the session is the canonical
- * handling: the comment run is stopped so the user is not answered twice. The mention may sit
- * in a reply, so the comment that created the session is checked as well as the thread's root.
- * A failure here is reported but does not hold back the session's own run.
+ * A mention that opens an agent session also arrives as a comment, moments earlier, and so does
+ * a reply in the session's thread before Linear turns it into a prompt. When a comment trigger
+ * already started a run from that comment, the session is the canonical handling: the comment
+ * run is stopped so the user is not answered twice. For a new session the mention may sit in a
+ * reply, so the comment that created it is checked as well as the thread's root; a prompt is
+ * tied to the one comment behind it. A failure here is reported but does not hold back the
+ * session's own run.
  */
 async function supersedeLinearCommentRuns(
   options: Pick<LinearTriggerProviderOptions, "database" | "executions">,
   projectId: string,
   event: NormalizedLinearAgentSessionEvent,
 ): Promise<void> {
-  const commentIds = [
-    ...new Set(
-      [event.agentSession.rootCommentId, event.agentSession.sourceCommentId].filter(
-        (id): id is string => id !== undefined,
-      ),
-    ),
-  ];
+  const commentIds = supersededCommentIds(event);
   if (
     commentIds.length === 0 ||
     options.database === undefined ||
@@ -634,6 +638,13 @@ async function supersedeLinearCommentRuns(
       { diagnostic: { projectId, agentSessionId: event.agentSession.id, commentIds } },
     );
   }
+}
+
+function supersededCommentIds(event: NormalizedLinearAgentSessionEvent): string[] {
+  const { rootCommentId, sourceCommentId } = event.agentSession;
+  const candidates =
+    event.action === "prompted" ? [sourceCommentId] : [rootCommentId, sourceCommentId];
+  return [...new Set(candidates.filter((id): id is string => id !== undefined))];
 }
 
 function linearAgentReactionPhase(
