@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it, vi } from "vitest";
+import { deriveAgentExecutionCompletionToken } from "../agent-executions/completion-token.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import type {
   DaemonExecutionControlOptions,
@@ -8,12 +9,14 @@ import type {
   DaemonConnection,
 } from "./protocol.js";
 import {
+  AgentExecutionCompletionFailure,
   createDaemonDispatchLifecycle,
   DaemonDispatchFailure,
   type DaemonDispatchLifecycle,
   type ExecutionDeadlineClock,
 } from "./lifecycle.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import { OutputExecutorRegistry, replyOutputTool } from "../execution-capabilities/outputs.js";
 import { createDurableWorkflowHandler } from "../workflows/engine.js";
 import type { TriggerProvider } from "../triggers/index.js";
 import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
@@ -445,7 +448,11 @@ describe("durable Hub action acknowledgement state", () => {
      * The memory database would complete the step on its own; what is under
      * test here is the lifecycle branch that runs before it.
      */
-    async function dispatchedWorkflowExecution(options: { emitted: boolean }) {
+    async function dispatchedWorkflowExecution(options: {
+      emitted: boolean;
+      required?: boolean;
+      failedDeliveries?: number;
+    }) {
       const clock = new ManualDeadlineClock(new Date("2026-01-01T00:00:00.000Z"));
       const database = createMemoryDatabase({ now: () => new Date(clock.now()) });
       const organizationId = "org-idle-output";
@@ -505,7 +512,9 @@ describe("durable Hub action acknowledgement state", () => {
         environment: { kind: "daemon", daemonId: DAEMON_ID, authoredSlug: "work", cwd: "/repo" },
         prompt: "reply",
         agent: { provider: "test", mode: "default" },
-        allowOutputs: [{ type: "linear.reply" }],
+        allowOutputs: [
+          { type: "linear.reply", ...(options.required === true ? { required: true } : {}) },
+        ],
         timeoutMs: 60_000,
         idleTimeoutMs: IDLE_TIMEOUT_MS,
         autoArchive: false,
@@ -516,8 +525,16 @@ describe("durable Hub action acknowledgement state", () => {
       };
       const connection = new DispatchConnection();
       const stream = new FailureLogStream();
+      // A required output needs a materialized Hub tool for the dispatch to be prepared.
+      const executionCapabilities = new OutputExecutorRegistry();
+      executionCapabilities.register({
+        type: "linear.reply",
+        tool: replyOutputTool,
+        execute: async () => {},
+      });
       const lifecycle = createDaemonDispatchLifecycle({
         database,
+        executionCapabilities,
         connectionForDaemon: (daemonId) => (daemonId === DAEMON_ID ? connection : undefined),
         publicBaseUrl: "http://hub.test",
         completionTokenSecret: "completion-secret",
@@ -528,6 +545,9 @@ describe("durable Hub action acknowledgement state", () => {
       const executionId = dispatched.execution.id;
       assert.equal(connection.subscriptions(), 1, "the dispatch watches its agent");
       if (options.emitted) await emitOutput(database, executionId);
+      for (let attempt = 0; attempt < (options.failedDeliveries ?? 0); attempt += 1) {
+        await failOutputDelivery(database, executionId);
+      }
       await connection.emit({
         type: "agent_update",
         executionId,
@@ -614,6 +634,74 @@ describe("durable Hub action acknowledgement state", () => {
         { status: "succeeded", result: { status: "succeeded" } },
       );
       await lifecycle.stop();
+    });
+
+    it("still settles the dispatch as an idle timeout when every required delivery failed", async () => {
+      const fixture = await dispatchedWorkflowExecution({
+        emitted: false,
+        required: true,
+        failedDeliveries: 3,
+      });
+
+      await fixture.clock.advance(IDLE_TIMEOUT_MS);
+      await fixture.connection.unsubscribed();
+
+      const execution = await fixture.database.findAgentExecutionById(fixture.executionId);
+      assert.deepEqual(
+        { status: execution?.status, result: execution?.result },
+        { status: "failed", result: { status: "failed", reason: "step_idle_timeout" } },
+      );
+      assert.deepEqual(dispatchFailures(fixture.stream), ["step_idle_timeout"]);
+      await fixture.lifecycle.stop();
+    });
+
+    it("ends the run as failed when finish_execution follows only failed required deliveries", async () => {
+      const fixture = await dispatchedWorkflowExecution({
+        emitted: false,
+        required: true,
+        failedDeliveries: 3,
+      });
+
+      await assert.rejects(
+        fixture.lifecycle.completeAgentExecutionFromCallback({
+          executionId: fixture.executionId,
+          token: deriveAgentExecutionCompletionToken("completion-secret", fixture.executionId),
+        }),
+        (error: unknown) =>
+          error instanceof AgentExecutionCompletionFailure &&
+          error.reason === "output_delivery_failed",
+      );
+      await fixture.connection.unsubscribed();
+
+      const execution = await fixture.database.findAgentExecutionById(fixture.executionId);
+      assert.deepEqual(
+        { status: execution?.status, result: execution?.result },
+        { status: "failed", result: { status: "failed", reason: "output_delivery_failed" } },
+      );
+      const step = await fixture.database.findWorkflowStepRunById(fixture.step.id);
+      assert.deepEqual(
+        { status: step?.status, failureReason: step?.failureReason },
+        { status: "failed", failureReason: "output_delivery_failed" },
+      );
+      const run = await fixture.database.findTriggerRunById(fixture.run.id);
+      if (run?.outcome !== "accepted") throw new Error("accepted run was not persisted");
+      assert.deepEqual(
+        { status: run.status, failureReason: run.failureReason },
+        { status: "failed", failureReason: "output_delivery_failed" },
+      );
+      assert.deepEqual(dispatchFailures(fixture.stream), ["output_delivery_failed"]);
+      const logged = fixture.stream
+        .records()
+        .find((record) => record["operation"] === "daemon.execution.output-delivery");
+      assert.deepEqual(
+        logged?.["diagnostic"],
+        {
+          executionId: fixture.executionId,
+          outputs: [{ type: "linear.reply", failedAttempts: 3 }],
+        },
+        "the log line carries the attempt count",
+      );
+      await fixture.lifecycle.stop();
     });
   });
 
@@ -740,6 +828,26 @@ async function emitOutput(
   assert.ok(attempt !== undefined);
   const updated = await database.completeAgentExecutionOutput(executionId, attempt.id, startedAt);
   assert.equal(updated?.outputEmissions["linear.reply"], 1);
+}
+
+/** A delivery the provider refused: an attempt exists, but nothing was emitted. */
+async function failOutputDelivery(
+  database: Awaited<ReturnType<typeof createMemoryDatabase>>,
+  executionId: string,
+): Promise<void> {
+  const startedAt = new Date("2000-01-01T00:00:00.000Z");
+  const attempt = await database.beginAgentExecutionOutput(
+    executionId,
+    "linear.reply",
+    undefined,
+    startedAt,
+  );
+  assert.ok(attempt !== undefined);
+  assert.equal(await database.failAgentExecutionOutput(executionId, attempt.id, startedAt), true);
+  assert.equal(
+    (await database.findAgentExecutionById(executionId))?.outputEmissions["linear.reply"],
+    undefined,
+  );
 }
 
 /** Dispatch failures the lifecycle reported after the completion watcher rejected. */

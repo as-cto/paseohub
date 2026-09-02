@@ -6,6 +6,7 @@ import {
   type LinearAgentActivity,
   type LinearIssueComment,
 } from "../../providers/linear/client.js";
+import { OUTPUT_DELIVERY_FAILED_REASON } from "../../execution-capabilities/required-outputs.js";
 import { reportFailure } from "../../failures/index.js";
 import type { TriggerProviderExecutionControl } from "../../providers/registration.js";
 import type {
@@ -557,10 +558,15 @@ async function notifyLinearAgentFailure(
   await client.createAgentActivity({
     linearOrganizationId: triggerContext.event.linear.organization.id,
     agentSessionId: agentSession.id,
-    content: {
-      type: "error",
-      body: `Paseo could not complete this workflow: ${reason.slice(0, 1_000)}`,
-    },
+    content: { type: "error", body: linearFailureBody(reason) },
   });
   return { phase: "failed" };
+}
+
+function linearFailureBody(reason: string): string {
+  // The reply itself is what failed; the internal reason would not help the user.
+  if (reason === OUTPUT_DELIVERY_FAILED_REASON) {
+    return "Paseo could not deliver its reply to this session.";
+  }
+  return `Paseo could not complete this workflow: ${reason.slice(0, 1_000)}`;
 }

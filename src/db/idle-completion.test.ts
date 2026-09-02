@@ -126,6 +126,19 @@ describe("memory database idle deadline after an emitted output", () => {
     assert.equal((await fixture.database.findTriggerRunById(fixture.runId))?.status, "failed");
   });
 
+  it("still times out the step when every delivery attempt failed", async () => {
+    const fixture = await workflowExecution({ emitted: false, failedDeliveries: 3 });
+
+    const recoveries = await fixture.database.recoverWorkflowDeadlines(AFTER_IDLE);
+
+    assert.deepEqual(recoveries, [
+      { triggerRunId: fixture.runId, executionIds: [fixture.executionId] },
+    ]);
+    const execution = await fixture.database.findAgentExecutionById(fixture.executionId);
+    assert.deepEqual(execution?.outputEmissions, {}, "failed attempts are not emissions");
+    assert.deepEqual(execution?.result, { status: "failed", reason: "step_idle_timeout" });
+  });
+
   it("turns a late completion into a success instead of an idle timeout once an output was emitted", async () => {
     const fixture = await workflowExecution({ emitted: true });
 
@@ -165,7 +178,7 @@ describe("memory database idle deadline after an emitted output", () => {
   });
 });
 
-async function workflowExecution(options: { emitted: boolean }) {
+async function workflowExecution(options: { emitted: boolean; failedDeliveries?: number }) {
   const database = createMemoryDatabase({ now: () => AFTER_IDLE });
   const run = (
     await database.createAcceptedTriggerRun({
@@ -207,6 +220,17 @@ async function workflowExecution(options: { emitted: boolean }) {
     );
     assert.ok(attempt !== undefined);
     await database.completeAgentExecutionOutput(execution.id, attempt.id, startedAt);
+  }
+  for (let failed = 0; failed < (options.failedDeliveries ?? 0); failed += 1) {
+    const startedAt = new Date("2026-08-05T12:00:05.000Z");
+    const attempt = await database.beginAgentExecutionOutput(
+      execution.id,
+      "linear.reply",
+      undefined,
+      startedAt,
+    );
+    assert.ok(attempt !== undefined);
+    await database.failAgentExecutionOutput(execution.id, attempt.id, startedAt);
   }
   return { database, runId: run.id, stepId: step.id, executionId: execution.id };
 }
