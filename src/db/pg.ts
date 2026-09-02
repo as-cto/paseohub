@@ -4235,6 +4235,23 @@ class PgDatabase implements Database {
     return rows.rows[0] === undefined ? undefined : toProviderEventReceiptRecord(rows.rows[0]);
   }
 
+  async listLinearAgentSessionReceiptsForComment(organizationId: string, commentId: string) {
+    const rows = await query<ProviderEventReceiptRow>(
+      this.pool,
+      `select * from provider_event_receipts
+       where organization_id = $1
+         and source = 'linear.agent_session'
+         and dropped_reason is null
+         and $2::text in (
+           payload #>> '{agentSession,rootCommentId}',
+           payload #>> '{agentSession,sourceCommentId}'
+         )
+       order by received_at desc, id desc`,
+      [organizationId, commentId],
+    );
+    return rows.rows.map(toProviderEventReceiptRecord);
+  }
+
   async insertAttachment(input: InsertAttachmentInput): Promise<AttachmentRecord> {
     try {
       const rows = await query<AttachmentRow>(

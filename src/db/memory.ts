@@ -1295,6 +1295,21 @@ class MemoryDatabase implements Database {
     return this.providerEventReceipts.get(id);
   }
 
+  async listLinearAgentSessionReceiptsForComment(organizationId: string, commentId: string) {
+    return [...this.providerEventReceipts.values()]
+      .filter(
+        (receipt) =>
+          receipt.organizationId === organizationId &&
+          receipt.source === "linear.agent_session" &&
+          receipt.droppedReason === null &&
+          linearAgentSessionCommentIdsOf(receipt.payload).includes(commentId),
+      )
+      .sort(
+        (left, right) =>
+          right.receivedAt.getTime() - left.receivedAt.getTime() || right.id.localeCompare(left.id),
+      );
+  }
+
   async insertAttachment(input: InsertAttachmentInput): Promise<AttachmentRecord> {
     const sourceKey = attachmentSourceKey(
       input.providerEventReceiptId,
@@ -3482,6 +3497,14 @@ function linearCommentIdOf(triggerContext: unknown): string | undefined {
   const comment = nestedRecord(nestedRecord(event?.["linear"])?.["comment"]);
   const id = comment?.["id"];
   return typeof id === "string" ? id : undefined;
+}
+
+/** The comments a persisted agent-session event names: the thread root and the turn's source. */
+function linearAgentSessionCommentIdsOf(payload: unknown): string[] {
+  const session = nestedRecord(nestedRecord(payload)?.["agentSession"]);
+  return [session?.["rootCommentId"], session?.["sourceCommentId"]].filter(
+    (id): id is string => typeof id === "string",
+  );
 }
 
 function nestedRecord(value: unknown): Record<string, unknown> | undefined {

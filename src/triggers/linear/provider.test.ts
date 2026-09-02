@@ -837,6 +837,8 @@ describe("Linear trigger provider", () => {
           lookups.push(commentIds);
           return database.listTriggerRunsForLinearComments(projectId, commentIds);
         },
+        listLinearAgentSessionReceiptsForComment: (organizationId, commentId) =>
+          database.listLinearAgentSessionReceiptsForComment(organizationId, commentId),
       },
       executions: {
         stopActive: async (input) => {
@@ -902,6 +904,8 @@ describe("Linear trigger provider", () => {
           lookups.push(commentIds);
           return database.listTriggerRunsForLinearComments(projectId, commentIds);
         },
+        listLinearAgentSessionReceiptsForComment: (organizationId, commentId) =>
+          database.listLinearAgentSessionReceiptsForComment(organizationId, commentId),
       },
       executions: {
         stopActive: async (input) => {
@@ -976,6 +980,115 @@ describe("Linear trigger provider", () => {
       if (typeof matches === "string") throw new Error(`expected a match, got ${matches}`);
     }
     assert.equal(stops, 0);
+  });
+
+  it("starts no comment run when a persisted session receipt already names the comment", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      commentAndAgentSessionConfiguration(),
+      { organizationId: "hub-org" },
+    );
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client: new RecordingHistoryClient({ complete: true, comments: [] }),
+      database,
+    });
+    const comment = () => external(project.id, revision.id);
+    // Intake persists the normalized session event as the receipt payload, before matching.
+    const persistSession = async (
+      deliveryId: string,
+      comments: { rootCommentId?: string; sourceCommentId?: string },
+      overrides: Partial<NormalizedLinearAgentSessionEvent> = {},
+    ) => {
+      const session = agentSessionEvent(overrides);
+      const receipt = await database.persistManualEvent({
+        organizationId: "hub-org",
+        projectId: project.id,
+        source: "linear.agent_session",
+        deliveryId,
+        receivedAt: new Date("2026-01-02T00:00:00.123Z"),
+        payload: { ...session, agentSession: { ...session.agentSession, ...comments } },
+      });
+      if (receipt.status !== "accepted") throw new Error("expected an accepted receipt");
+      return receipt.event.providerEventReceiptId;
+    };
+
+    // A session prompted from another comment, or one this project's agent-session trigger
+    // would not run, leaves the comment to its own trigger.
+    await persistSession("session-elsewhere", { sourceCommentId: "other-comment" });
+    await persistSession(
+      "session-from-stranger",
+      { sourceCommentId: "trigger-comment" },
+      { actor: { id: "stranger" } },
+    );
+    assert.deepEqual(await matchedTriggerNames(provider, comment()), ["comment"]);
+
+    // The prompt Linear made of the comment, received moments after it.
+    const prompted = await persistSession("session-prompted", {
+      sourceCommentId: "trigger-comment",
+    });
+    assert.equal(await provider.match(comment()), "superseded_by_agent_session");
+
+    // Dropped, that session answers for nothing: the comment is on its own again.
+    await database.markProviderEventDropped(prompted, "trigger_filters_rejected");
+    assert.deepEqual(await matchedTriggerNames(provider, comment()), ["comment"]);
+
+    // A session opened from the comment names it as the root of its thread.
+    await persistSession(
+      "session-created",
+      { rootCommentId: "trigger-comment" },
+      { action: "created" },
+    );
+    assert.equal(await provider.match(comment()), "superseded_by_agent_session");
+  });
+
+  it("lets a comment run when no agent-session trigger would answer for it or its receipts cannot be read", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      linearCommentConfiguration(),
+      { organizationId: "hub-org" },
+    );
+    const session = agentSessionEvent();
+    const receipt = await database.persistManualEvent({
+      organizationId: "hub-org",
+      projectId: project.id,
+      source: "linear.agent_session",
+      deliveryId: "session-prompted",
+      receivedAt: new Date("2026-01-02T00:00:00.123Z"),
+      payload: {
+        ...session,
+        agentSession: { ...session.agentSession, sourceCommentId: "trigger-comment" },
+      },
+    });
+    assert.equal(receipt.status, "accepted");
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+
+    // The session is nobody's here: without an agent-session trigger it never starts a run.
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+      database,
+    });
+    assert.deepEqual(await matchedTriggerNames(provider, external(project.id, revision.id)), [
+      "comment",
+    ]);
+
+    // A failed lookup is reported and the comment runs: answering twice is recoverable.
+    const unreadable = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+      database: {
+        listTriggerRunsForLinearComments: (projectId, commentIds) =>
+          database.listTriggerRunsForLinearComments(projectId, commentIds),
+        listLinearAgentSessionReceiptsForComment: () =>
+          Promise.reject(new Error("receipts unavailable")),
+      },
+    });
+    assert.deepEqual(await matchedTriggerNames(unreadable, external(project.id, revision.id)), [
+      "comment",
+    ]);
   });
 
   it("stops the session's executions instead of starting a run on Linear's stop signal", async () => {
@@ -1360,6 +1473,15 @@ function agentSessionConfiguration() {
         ],
       },
     ],
+  };
+}
+
+/** A project answering plain comments and its agent sessions, as one with a mentionable app does. */
+function commentAndAgentSessionConfiguration() {
+  const configuration = linearCommentConfiguration();
+  return {
+    ...configuration,
+    triggers: [...configuration.triggers, ...agentSessionConfiguration().triggers],
   };
 }
 

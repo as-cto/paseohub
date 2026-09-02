@@ -1248,6 +1248,16 @@ export interface Database {
     organizationId?: string,
   ): Promise<ProviderEventReceiptRecord | undefined>;
   findProviderEventReceiptById(id: string): Promise<ProviderEventReceiptRecord | undefined>;
+  /**
+   * Undropped `linear.agent_session` receipts of the organization whose session was opened from
+   * `commentId` (`agentSession.rootCommentId`) or prompted by it (`agentSession.sourceCommentId`),
+   * newest first. A receipt is persisted at intake, before matching, so this sees a session that
+   * arrived while the comment was still being hydrated.
+   */
+  listLinearAgentSessionReceiptsForComment(
+    organizationId: string,
+    commentId: string,
+  ): Promise<ProviderEventReceiptRecord[]>;
   insertAttachment(input: InsertAttachmentInput): Promise<AttachmentRecord>;
   findAttachmentBySource(
     providerEventReceiptId: string,

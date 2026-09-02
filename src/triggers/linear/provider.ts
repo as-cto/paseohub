@@ -12,6 +12,7 @@ import { OUTPUT_DELIVERY_FAILED_REASON } from "../../execution-capabilities/requ
 import { reportFailure } from "../../failures/index.js";
 import { logger } from "../../logger.js";
 import type { TriggerProviderExecutionControl } from "../../providers/registration.js";
+import type { ProviderEventDropReasonCode } from "../drop-reason.js";
 import type {
   ExternalTrigger,
   TriggerProvider,
@@ -20,8 +21,10 @@ import type {
 } from "../index.js";
 import { matchesInputFilters, parseInvocation } from "../invocation.js";
 import {
+  NormalizedLinearAgentSessionEventSchema,
   NormalizedLinearEventSchema,
   type NormalizedLinearAgentSessionEvent,
+  type NormalizedLinearCommentEvent,
   type NormalizedLinearEvent,
 } from "./events.js";
 import {
@@ -131,8 +134,14 @@ export interface LinearTriggerProviderOptions {
     organizationId: string;
     linearOrganizationId: string;
   }) => Promise<Pick<LinearConnectionRecord, "appUserId"> | undefined>;
-  /** Finds the runs a comment trigger started, so a new agent session can supersede them. */
-  database?: Pick<Database, "listTriggerRunsForLinearComments">;
+  /**
+   * Finds the runs a comment trigger started, so a new agent session can supersede them, and
+   * the session receipts a comment already opened or prompted, so the comment starts none.
+   */
+  database?: Pick<
+    Database,
+    "listTriggerRunsForLinearComments" | "listLinearAgentSessionReceiptsForComment"
+  >;
   executions?: TriggerProviderExecutionControl;
 }
 
@@ -227,10 +236,13 @@ export function createLinearTriggerProvider(
         }
       }
       if (matches.length === 0) return "trigger_filters_rejected";
-      if (event.type === "agent_session") {
-        await supersedeLinearCommentRuns(options, externalTrigger.projectId, event);
-      }
-      return matches;
+      const superseded = await settleLinearCommentSessionDuplicate(
+        options,
+        externalTrigger,
+        event,
+        stored.configuration,
+      );
+      return superseded ?? matches;
     },
     async materializeContext(launch): Promise<LinearMaterializedContext> {
       const { trigger_thread_context: locator, ...linear } = launch.triggerContext.event.linear;
@@ -637,6 +649,88 @@ async function supersedeLinearCommentRuns(
       },
       { diagnostic: { projectId, agentSessionId: event.agentSession.id, commentIds } },
     );
+  }
+}
+
+/**
+ * A mention duplicates itself as a comment and an agent session, and either may be matched
+ * second. A session stops the comment runs that beat it; a comment yields to the session
+ * receipts that beat its run. Returns the drop reason when the event yields.
+ */
+async function settleLinearCommentSessionDuplicate(
+  options: Pick<LinearTriggerProviderOptions, "database" | "executions">,
+  externalTrigger: ExternalTrigger,
+  event: NormalizedLinearEvent,
+  configuration: { triggers: readonly Pick<CompiledTriggerConfig, "name" | "on" | "filters">[] },
+): Promise<ProviderEventDropReasonCode | undefined> {
+  if (event.type === "agent_session") {
+    await supersedeLinearCommentRuns(options, externalTrigger.projectId, event);
+    return undefined;
+  }
+  if (event.type !== "comment") return undefined;
+  const handled = await isLinearCommentHandledByAgentSession(
+    options,
+    externalTrigger,
+    event,
+    configuration,
+  );
+  return handled ? LINEAR_SUPERSEDED_BY_AGENT_SESSION_REASON : undefined;
+}
+
+/**
+ * The other side of `supersedeLinearCommentRuns`, which only finds a comment run that already
+ * exists. Usually none does: the comment arrives first, but its run waits for the issue and the
+ * thread to be hydrated. Measured in production: session receipt persisted 123 ms after the
+ * comment receipt, comment run inserted 144 ms after that, inside the 12 ms window in which the
+ * session side was looking for it. Receipts, however, are persisted at intake, before matching.
+ * So the comment checks them just before it starts a run: a session receipt that names this
+ * comment and would start a run in this project makes the comment its duplicate. A failed
+ * lookup is reported and the comment runs, because answering twice is the recoverable outcome.
+ */
+async function isLinearCommentHandledByAgentSession(
+  options: Pick<LinearTriggerProviderOptions, "database">,
+  externalTrigger: ExternalTrigger,
+  event: NormalizedLinearCommentEvent,
+  configuration: { triggers: readonly Pick<CompiledTriggerConfig, "name" | "on" | "filters">[] },
+): Promise<boolean> {
+  if (options.database === undefined) return false;
+  const diagnostic = {
+    linearOrganizationId: event.organizationId,
+    commentId: event.comment.id,
+    receiptId: externalTrigger.providerEventReceiptId,
+  };
+  try {
+    const receipts = await options.database.listLinearAgentSessionReceiptsForComment(
+      externalTrigger.organizationId,
+      event.comment.id,
+    );
+    const sessions = receipts.flatMap((receipt) => {
+      const session = NormalizedLinearAgentSessionEventSchema.safeParse(receipt.payload);
+      if (
+        !session.success ||
+        matchLinearTriggers(configuration, session.data, externalTrigger.connectionId).length === 0
+      ) {
+        return [];
+      }
+      return [{ receiptId: receipt.id, agentSessionId: session.data.agentSession.id }];
+    });
+    if (sessions.length === 0) return false;
+    logger.info(
+      { ...diagnostic, agentSessions: sessions },
+      "Linear comment already opened or prompted an agent session; leaving it to the session",
+    );
+    return true;
+  } catch (error) {
+    reportFailure(
+      error,
+      {
+        operation: "linear.comment.agent-session-receipts",
+        component: "triggers",
+        provider: "linear",
+      },
+      { diagnostic },
+    );
+    return false;
   }
 }
 

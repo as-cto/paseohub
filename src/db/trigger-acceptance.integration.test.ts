@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { createPostgresQueryRuntime } from "./test-utils/runtime.js";
 import { createDatabase } from "./test-utils/runtime.js";
+import { linearAgentSessionReceiptPayload } from "../test-utils/linear-agent-session-receipt.js";
 
 describe("trigger acceptance persistence", () => {
   let postgres: StartedPostgreSqlContainer;
@@ -193,6 +194,134 @@ describe("trigger acceptance persistence", () => {
     assert.deepEqual(await ids(["comment-2", "comment-1"]), [other.id, later.id, earlier.id]);
     assert.deepEqual(await ids(["comment-3"]), []);
     assert.deepEqual(await ids([]), []);
+    await database.close();
+  }, 120_000);
+
+  it("lists the undropped agent-session receipts that name a Linear comment, newest first", async () => {
+    const database = await createDatabase(databaseUrl);
+    const client = await createPostgresQueryRuntime(databaseUrl);
+    const organizationId = "session-receipts-org";
+    const projectId = "50000000-0000-4000-8000-000000000001";
+    const connectionId = "50000000-0000-4000-8000-000000000002";
+    const otherProjectId = "50000000-0000-4000-8000-000000000003";
+
+    await client.query(`
+      insert into organization (id, name, slug)
+      values ('${organizationId}', 'Session Receipts', 'session-receipts'),
+             ('session-receipts-other', 'Session Receipts Other', 'session-receipts-other');
+      insert into projects (id, organization_id, name, slug)
+      values ('${projectId}', '${organizationId}', 'Default', 'default'),
+             ('${otherProjectId}', 'session-receipts-other', 'Default', 'default');
+      insert into linear_connections
+        (id, organization_id, linear_organization_id, provider_application_id, slug,
+         linear_organization_name, app_user_id, access_token, refresh_token, scopes)
+      values
+        ('${connectionId}', '${organizationId}', 'session-receipts-workspace', 'linear-app',
+         'session-receipts', 'Session Receipts', 'linear-app-user', 'linear-access-token',
+         'linear-refresh-token', '["read", "write", "app:assignable", "app:mentionable"]'::jsonb);
+    `);
+    await client.close();
+    const revision = await database.insertProjectConfigurationRevision({
+      projectId,
+      sourceKind: "manual",
+      sourceEvidence: { kind: "test" },
+      normalizedConfiguration: { environments: [], triggers: [] },
+      contentHash: "session-receipts-config",
+    });
+    await database.activateProjectConfigurationRevision(projectId, revision.id, [
+      {
+        provider: "linear",
+        connectionId,
+        resourceId: "linear-project",
+        triggerName: "agent-session",
+      },
+    ]);
+    const otherRevision = await database.insertProjectConfigurationRevision({
+      projectId: otherProjectId,
+      sourceKind: "manual",
+      sourceEvidence: { kind: "test" },
+      normalizedConfiguration: { environments: [], triggers: [] },
+      contentHash: "session-receipts-other-config",
+    });
+    await database.activateProjectConfigurationRevision(otherProjectId, otherRevision.id);
+
+    // Receipts as the Linear webhook source persists them: bound to the connection, with the
+    // normalized event as payload.
+    const accept = async (
+      deliveryId: string,
+      source: string,
+      payload: unknown,
+      receivedAt: Date,
+    ) => {
+      const acceptance = await database.acceptLinearEvent({
+        linearOrganizationId: "session-receipts-workspace",
+        projectId: "linear-project",
+        deliveryId,
+        source,
+        payload,
+        receivedAt,
+      });
+      if (acceptance.status !== "accepted") {
+        throw new Error(`expected an accepted receipt, got ${acceptance.status}`);
+      }
+      return acceptance.receiptId;
+    };
+    const created = await accept(
+      "created",
+      "linear.agent_session",
+      linearAgentSessionReceiptPayload({
+        action: "created",
+        rootCommentId: "comment-1",
+        sourceCommentId: "comment-1",
+      }),
+      new Date(1_000),
+    );
+    const prompted = await accept(
+      "prompted",
+      "linear.agent_session",
+      linearAgentSessionReceiptPayload({ rootCommentId: "comment-1", sourceCommentId: "reply-1" }),
+      new Date(2_000),
+    );
+    const other = await accept(
+      "other",
+      "linear.agent_session",
+      linearAgentSessionReceiptPayload({ rootCommentId: "comment-2", sourceCommentId: "reply-2" }),
+      new Date(3_000),
+    );
+    // A comment receipt carries no session, whatever its payload names.
+    await accept(
+      "comment",
+      "linear.comment",
+      { type: "comment", agentSession: { rootCommentId: "comment-1", sourceCommentId: "reply-1" } },
+      new Date(4_000),
+    );
+    // A dropped receipt never starts a run, so it answers for no comment.
+    const dropped = await accept(
+      "dropped",
+      "linear.agent_session",
+      linearAgentSessionReceiptPayload({ sourceCommentId: "comment-1" }),
+      new Date(5_000),
+    );
+    await database.markProviderEventDropped(dropped, "no_trigger_for_source");
+    const elsewhere = await database.persistManualEvent({
+      organizationId: "session-receipts-other",
+      projectId: otherProjectId,
+      source: "linear.agent_session",
+      deliveryId: "elsewhere",
+      receivedAt: new Date(6_000),
+      payload: linearAgentSessionReceiptPayload({ sourceCommentId: "comment-1" }),
+    });
+    assert.equal(elsewhere.status, "accepted");
+
+    const ids = async (commentId: string) =>
+      (await database.listLinearAgentSessionReceiptsForComment(organizationId, commentId)).map(
+        (receipt) => receipt.id,
+      );
+    assert.deepEqual(await ids("comment-1"), [prompted, created]);
+    assert.deepEqual(await ids("reply-1"), [prompted]);
+    assert.deepEqual(await ids("comment-2"), [other]);
+    assert.deepEqual(await ids("reply-2"), [other]);
+    assert.deepEqual(await ids("comment-3"), []);
     await database.close();
   }, 120_000);
 
