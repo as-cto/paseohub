@@ -356,6 +356,66 @@ describe("Linear connection client", () => {
     });
   });
 
+  it("threads a comment under its parent only when a parent is given", async () => {
+    const requests: string[] = [];
+    const connection = linearConnection();
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+      connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+      fetch: async (_url, init) => {
+        requests.push(readableBody(init?.body));
+        return json({ data: { commentCreate: { success: true } } });
+      },
+    });
+
+    await api.createComment({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      body: "Done.",
+      parentId: "root-comment",
+    });
+    await api.createComment({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      body: "Done.",
+    });
+
+    const threaded = graphqlRequest(requests[0] ?? "{}");
+    assert.match(threaded.query, /\$parentId: String\b/u);
+    assert.match(threaded.query, /parentId: \$parentId/u);
+    assert.deepEqual(threaded.variables, {
+      issueId: "issue-1",
+      body: "Done.",
+      parentId: "root-comment",
+    });
+    assert.deepEqual(graphqlRequest(requests[1] ?? "{}").variables, {
+      issueId: "issue-1",
+      body: "Done.",
+    });
+  });
+
+  it("surfaces Linear's own message when it rejects a comment", async () => {
+    const connection = linearConnection();
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+      connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+      fetch: async () =>
+        json({ errors: [{ message: "Parent comment must be a top level comment." }] }),
+    });
+
+    await assert.rejects(
+      api.createComment({
+        linearOrganizationId: "linear-org",
+        issueId: "issue-1",
+        body: "Done.",
+        parentId: "nested-comment",
+      }),
+      { message: /Parent comment must be a top level comment\./u },
+    );
+  });
+
   it("refreshes an expired token before calling the Linear GraphQL API", async () => {
     const updates: unknown[] = [];
     const requests: Array<{ url: string; authorization: string | null; body: string }> = [];

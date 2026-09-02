@@ -228,6 +228,32 @@ describe("Linear trigger provider", () => {
     );
   });
 
+  it("targets the thread root so a reply nests where Linear allows", async () => {
+    const { project, revision, store } = await activeConfiguration();
+    const provider = createLinearTriggerProvider({ configurationStoreForProject: () => store });
+    const trigger = external(project.id, revision.id);
+
+    const nested = (await provider.match(trigger))[0];
+    if (!isAcceptedTriggerProviderMatch(nested)) throw new Error("expected accepted match");
+    assert.deepEqual(nested.outputContext, {
+      provider: "linear",
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      agentSessionId: null,
+      threadRootCommentId: "root-comment",
+    });
+
+    const comment = event("2026-01-02T00:00:00.000Z");
+    const topLevel = (
+      await provider.match({
+        ...trigger,
+        payload: { ...comment, comment: { ...comment.comment, parentId: null } },
+      })
+    )[0];
+    if (!isAcceptedTriggerProviderMatch(topLevel)) throw new Error("expected accepted match");
+    assert.equal(topLevel.outputContext.threadRootCommentId, "trigger-comment");
+  });
+
   it("keeps a valid Linear run usable when optional history retrieval fails", async () => {
     const { project, revision, store } = await activeConfiguration();
     const provider = createLinearTriggerProvider({
@@ -307,6 +333,7 @@ describe("Linear trigger provider", () => {
       linearOrganizationId: "linear-org",
       issueId: "issue-1",
       agentSessionId: "session-1",
+      threadRootCommentId: null,
     });
     assert.deepEqual(client.activityReads, []);
 

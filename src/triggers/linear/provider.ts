@@ -31,6 +31,11 @@ export interface LinearOutputContext {
   linearOrganizationId: string;
   issueId: string;
   agentSessionId: string | null;
+  /**
+   * Linear threads are one level deep: a reply's parent must be the top-level comment, and
+   * Linear rejects a nested comment as parent. Null when the trigger was not a comment.
+   */
+  threadRootCommentId: string | null;
 }
 
 export interface LinearTriggerContext {
@@ -158,6 +163,8 @@ export function createLinearTriggerProvider(options: {
           linearOrganizationId: event.organizationId,
           issueId: issue.id,
           agentSessionId: event.type === "agent_session" ? event.agentSession.id : null,
+          threadRootCommentId:
+            event.type === "comment" ? (event.comment.parentId ?? event.comment.id) : null,
         };
         const triggerContext: LinearTriggerContext = {
           provider: "linear",

@@ -19,6 +19,8 @@ const LinearReplyOutputContextSchema = z.object({
   linearOrganizationId: z.string().min(1),
   issueId: z.string().min(1),
   agentSessionId: z.string().min(1).nullable(),
+  // Optional: executions recorded before threading existed carry no root comment.
+  threadRootCommentId: z.string().min(1).nullable().optional(),
 });
 
 /**
@@ -53,7 +55,10 @@ export const linearReplyOutputTool: OutputToolDefinition = {
   },
 };
 
-/** Replies through the native agent session when present, otherwise through an issue comment. */
+/**
+ * Replies through the native agent session when present, otherwise through an issue comment,
+ * threaded under the triggering comment's root when the context carries one.
+ */
 export function createLinearReplyExecutor(options: { client: LinearApiClient }): OutputExecutor {
   return async function executeLinearReply(input) {
     const args = LinearReplyArgsSchema.parse(input.args);
@@ -85,6 +90,9 @@ export function createLinearReplyExecutor(options: { client: LinearApiClient }):
       linearOrganizationId: context.linearOrganizationId,
       issueId: context.issueId,
       body: commentBody(args),
+      ...(typeof context.threadRootCommentId === "string"
+        ? { parentId: context.threadRootCommentId }
+        : {}),
     });
   };
 }

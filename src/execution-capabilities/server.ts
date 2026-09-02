@@ -95,6 +95,23 @@ export function createExecutionCapabilityServer(
   };
 }
 
+const OUTPUT_DELIVERY_REASON_LIMIT = 200;
+
+/**
+ * The provider's own explanation, on one line, so the agent can adjust its next call instead of
+ * retrying blindly (for example when the provider enforces a threading rule).
+ */
+function outputDeliveryReason(error: unknown): string {
+  if (!(error instanceof Error)) return "";
+  const line = error.message.replace(/\s+/gu, " ").trim();
+  if (line.length === 0) return "";
+  const bounded =
+    line.length > OUTPUT_DELIVERY_REASON_LIMIT
+      ? `${line.slice(0, OUTPUT_DELIVERY_REASON_LIMIT - 1)}…`
+      : line;
+  return ` Provider said: "${bounded}".`;
+}
+
 function outputCapabilityMessage(error: unknown): string {
   if (error instanceof Error && error.name === "OutputCapabilityValidationError") {
     return error.message;
@@ -296,7 +313,7 @@ async function executeOutputCall(
     }
     return toolFailure(
       withReference(
-        `Output delivery failed. Check the provider connection and output configuration before calling \`${toolName}\` again.`,
+        `Output delivery failed. Check the provider connection and output configuration before calling \`${toolName}\` again.${outputDeliveryReason(error)}`,
         failure.requestId,
       ),
     );

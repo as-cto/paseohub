@@ -28,6 +28,62 @@ describe("Linear reply output", () => {
     ]);
   });
 
+  it("threads an issue comment under the root of the triggering comment", async () => {
+    const client = new RecordingLinearClient();
+    const execute = createLinearReplyExecutor({ client });
+    await execute({
+      agentExecutionId: "execution-1",
+      toolType: "linear.reply",
+      args: { content: "Done." },
+      outputContext: {
+        ...sessionContext(),
+        agentSessionId: null,
+        threadRootCommentId: "root-comment",
+      },
+    });
+
+    assert.deepEqual(client.comments, [
+      {
+        linearOrganizationId: "linear-org",
+        issueId: "issue-1",
+        body: "Done.",
+        parentId: "root-comment",
+      },
+    ]);
+  });
+
+  it("posts a top-level comment when the trigger was not a comment", async () => {
+    const client = new RecordingLinearClient();
+    const execute = createLinearReplyExecutor({ client });
+    await execute({
+      agentExecutionId: "execution-1",
+      toolType: "linear.reply",
+      args: { content: "Done." },
+      outputContext: { ...sessionContext(), agentSessionId: null, threadRootCommentId: null },
+    });
+
+    assert.deepEqual(client.comments, [
+      { linearOrganizationId: "linear-org", issueId: "issue-1", body: "Done." },
+    ]);
+    assert.equal("parentId" in (client.comments[0] ?? {}), false);
+  });
+
+  it("posts a top-level comment for a context recorded before threading existed", async () => {
+    const client = new RecordingLinearClient();
+    const execute = createLinearReplyExecutor({ client });
+    await execute({
+      agentExecutionId: "execution-1",
+      toolType: "linear.reply",
+      args: { content: "Done." },
+      outputContext: { ...sessionContext(), agentSessionId: null },
+    });
+
+    assert.deepEqual(client.comments, [
+      { linearOrganizationId: "linear-org", issueId: "issue-1", body: "Done." },
+    ]);
+    assert.equal("parentId" in (client.comments[0] ?? {}), false);
+  });
+
   it("responds through a native Linear agent session", async () => {
     const client = new RecordingLinearClient();
     const execute = createLinearReplyExecutor({ client });
@@ -216,7 +272,12 @@ function sessionContext() {
 }
 
 class RecordingLinearClient implements LinearApiClient {
-  comments: Array<{ linearOrganizationId: string; issueId: string; body: string }> = [];
+  comments: Array<{
+    linearOrganizationId: string;
+    issueId: string;
+    body: string;
+    parentId?: string;
+  }> = [];
   activities: Parameters<LinearApiClient["createAgentActivity"]>[0][] = [];
 
   async readIssue(): Promise<undefined> {

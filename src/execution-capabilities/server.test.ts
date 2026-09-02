@@ -685,7 +685,7 @@ describe("execution capability MCP boundary", () => {
     const fixture = await capabilityFixture(
       async () => {
         attempts += 1;
-        if (attempts === 1) throw new Error("delivery timeout");
+        if (attempts === 1) throw new Error("delivery timeout:\n  upstream closed the connection");
       },
       "succeeded",
       1,
@@ -703,6 +703,15 @@ describe("execution capability MCP boundary", () => {
     });
 
     assert.equal(ToolResultSchema.parse(failed.result).isError, true);
+    const failedText = z
+      .object({ content: z.array(z.object({ type: z.literal("text"), text: z.string() })) })
+      .parse(failed.result).content[0]?.text;
+    assert.match(failedText ?? "", /Output delivery failed\./u);
+    assert.match(
+      failedText ?? "",
+      /Provider said: "delivery timeout: upstream closed the connection"\./u,
+    );
+    assert.match(failedText ?? "", /quote reference [0-9a-f-]{36}/u);
     assert.equal(ToolResultSchema.parse(retry.result).isError, undefined);
     assert.equal(
       (await fixture.database.findAgentExecutionById(fixture.executionId))?.outputEmissions[

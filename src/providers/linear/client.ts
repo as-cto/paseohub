@@ -249,6 +249,8 @@ export interface LinearApiClient {
     linearOrganizationId: string;
     issueId: string;
     body: string;
+    /** Top-level comment to reply under; Linear rejects a nested comment as parent. */
+    parentId?: string;
   }): Promise<void>;
   createAgentActivity(input: {
     linearOrganizationId: string;
@@ -560,10 +562,16 @@ export function createLinearApiClient(options: {
     async createComment(input) {
       const result = CommentResponseSchema.parse(
         await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `mutation PaseoComment($issueId: String!, $body: String!) {
-            commentCreate(input: { issueId: $issueId, body: $body }) { success }
+          query: `mutation PaseoComment($issueId: String!, $body: String!, $parentId: String) {
+            commentCreate(input: { issueId: $issueId, body: $body, parentId: $parentId }) {
+              success
+            }
           }`,
-          variables: { issueId: input.issueId, body: input.body },
+          variables: {
+            issueId: input.issueId,
+            body: input.body,
+            ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
+          },
         }),
       );
       if (!result.data.commentCreate.success) throw new Error("Linear comment was not accepted");
