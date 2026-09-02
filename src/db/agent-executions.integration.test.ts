@@ -10,7 +10,12 @@ import {
   type CompiledHubConfig,
 } from "../config/compiler.js";
 import type { AgentExecutionRecord, Database } from "./types.js";
+import { completesAtIdleDeadline } from "./idle-completion.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import {
+  OUTPUT_DELIVERY_FAILED_REASON,
+  failedRequiredOutputDeliveries,
+} from "../execution-capabilities/required-outputs.js";
 import type { DurableProviderEvent } from "../db/types.js";
 import type { RejectedTriggerProviderMatch, TriggerProviderMatch } from "../triggers/index.js";
 import { createDurableWorkflowHandler } from "../workflows/engine.js";
@@ -446,6 +451,92 @@ describe("agent execution PostgreSQL repository", () => {
           (await fixture.database.findWorkflowStepRunById(fixture.step.id))?.status,
           "timed_out",
         );
+      } finally {
+        await fixture.database.close();
+      }
+    });
+  });
+
+  describe("finish without a delivered required output", () => {
+    const BEFORE_IDLE = new Date("2026-08-05T12:00:04.000Z");
+    const AFTER_IDLE = new Date("2026-08-05T12:00:08.000Z");
+
+    it("persists failed attempts as no delivery and keeps the idle deadline on the timeout path", async () => {
+      const fixture = await idleWorkflowFixture(postgres, {
+        emitted: false,
+        requiredOutput: true,
+        failedDeliveries: 3,
+      });
+      try {
+        assert.deepEqual(fixture.execution.outputEmissions, {});
+        assert.deepEqual(failedRequiredOutputDeliveries(fixture.execution), [
+          { type: "linear.reply", failedAttempts: 3 },
+        ]);
+        assert.equal(completesAtIdleDeadline(fixture.execution), false);
+
+        const recoveries = await fixture.database.recoverWorkflowDeadlines(AFTER_IDLE);
+
+        assert.deepEqual(recoveries, [
+          { triggerRunId: fixture.run.id, executionIds: [fixture.execution.id] },
+        ]);
+        assert.deepEqual(
+          (await fixture.database.findAgentExecutionById(fixture.execution.id))?.result,
+          { status: "failed", reason: "step_idle_timeout" },
+        );
+      } finally {
+        await fixture.database.close();
+      }
+    });
+
+    it("records an explicit completion after failed deliveries as a failed step and run", async () => {
+      const fixture = await idleWorkflowFixture(postgres, {
+        emitted: false,
+        requiredOutput: true,
+        failedDeliveries: 3,
+      });
+      try {
+        const transition = await fixture.database.completeWorkflowAgentExecution({
+          executionId: fixture.execution.id,
+          executionStatus: "failed",
+          stepStatus: "failed",
+          result: { status: "failed", reason: OUTPUT_DELIVERY_FAILED_REASON },
+          stepOutput: { status: "failed", reason: OUTPUT_DELIVERY_FAILED_REASON },
+          failureReason: OUTPUT_DELIVERY_FAILED_REASON,
+          observedAt: BEFORE_IDLE,
+          hubAction: null,
+        });
+
+        assert.equal(transition.transitioned, true);
+        assert.equal(transition.deadlineKind, undefined);
+        assert.deepEqual(
+          { status: transition.execution.status, result: transition.execution.result },
+          { status: "failed", result: { status: "failed", reason: "output_delivery_failed" } },
+        );
+        const step = await fixture.database.findWorkflowStepRunById(fixture.step.id);
+        assert.deepEqual(
+          {
+            status: step?.status,
+            failureReason: step?.failureReason,
+            deadlineKind: step?.deadlineKind,
+          },
+          { status: "failed", failureReason: "output_delivery_failed", deadlineKind: null },
+        );
+        const run = await fixture.database.findTriggerRunById(fixture.run.id);
+        if (run?.outcome !== "accepted") throw new Error("accepted run was not persisted");
+        assert.deepEqual(
+          {
+            status: run.status,
+            failureReason: run.failureReason,
+            completedAt: run.completedAt?.toISOString(),
+          },
+          {
+            status: "failed",
+            failureReason: "output_delivery_failed",
+            completedAt: BEFORE_IDLE.toISOString(),
+          },
+        );
+        assert.notEqual(run.terminalNotificationPendingAt, null, "the provider is told");
+        assert.equal(await fixture.database.claimWorkflowWakeup(AFTER_IDLE, 1_000), undefined);
       } finally {
         await fixture.database.close();
       }
@@ -1405,7 +1496,7 @@ describe("agent execution PostgreSQL repository", () => {
  */
 async function idleWorkflowFixture(
   postgres: StartedPostgreSqlContainer,
-  options: { emitted: boolean },
+  options: { emitted: boolean; requiredOutput?: boolean; failedDeliveries?: number },
 ): Promise<{
   database: Database;
   run: { id: string };
@@ -1414,7 +1505,10 @@ async function idleWorkflowFixture(
 }> {
   const fixture = await executionFixture(postgres);
   const now = new Date("2026-08-05T12:00:00.000Z");
-  const configuration = deadlineWorkflowConfiguration({ idleTimeout: "5s" });
+  const configuration = deadlineWorkflowConfiguration({
+    idleTimeout: "5s",
+    ...(options.requiredOutput === undefined ? {} : { requiredOutput: options.requiredOutput }),
+  });
   const revision = await fixture.database.insertProjectConfigurationRevision({
     projectId: fixture.execution.projectId,
     sourceKind: "manual",
@@ -1463,7 +1557,23 @@ async function idleWorkflowFixture(
     );
     assert.equal(updated?.outputEmissions["linear.reply"], 1);
   }
-  return { database: fixture.database, run, step, execution };
+  for (let failed = 0; failed < (options.failedDeliveries ?? 0); failed += 1) {
+    const startedAt = new Date("2026-08-05T12:00:03.000Z");
+    const attempt = await fixture.database.beginAgentExecutionOutput(
+      execution.id,
+      "linear.reply",
+      undefined,
+      startedAt,
+    );
+    assert.ok(attempt !== undefined);
+    assert.equal(
+      await fixture.database.failAgentExecutionOutput(execution.id, attempt.id, startedAt),
+      true,
+    );
+  }
+  const persisted = await fixture.database.findAgentExecutionById(execution.id);
+  if (persisted === undefined) throw new Error("workflow execution was not persisted");
+  return { database: fixture.database, run, step, execution: persisted };
 }
 
 function launchIntent(
@@ -1608,6 +1718,7 @@ function deadlineWorkflowConfiguration(
     stepRuntime?: string;
     idleTimeout?: string;
     stepCount?: number;
+    requiredOutput?: boolean;
   } = {},
 ): CompiledHubConfig {
   const stepCount = options.stepCount ?? 1;
@@ -1627,6 +1738,9 @@ function deadlineWorkflowConfiguration(
             idle_timeout: options.idleTimeout ?? "5s",
             agent: { provider: "test" },
             prompt: [{ text: "run" }],
+            ...(options.requiredOutput === true
+              ? { allow_outputs: [{ type: "linear.reply", required: true }] }
+              : {}),
           })),
         },
       ],

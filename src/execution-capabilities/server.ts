@@ -8,7 +8,12 @@ import type { AgentExecutionRecord, Database } from "../db/types.js";
 import { registerResponseLifecycle } from "../http/response-lifecycle.js";
 import { reportFailure, withReference } from "../failures/index.js";
 import { compileJsonSchema, formatJsonSchemaErrors } from "../workflows/json-schema.js";
-import { missingRequiredOutputs } from "./required-outputs.js";
+import {
+  OUTPUT_DELIVERY_FAILED_REASON,
+  describeRequiredOutputDeliveryFailures,
+  failedRequiredOutputDeliveries,
+  missingRequiredOutputs,
+} from "./required-outputs.js";
 import {
   executionToolDefinitions,
   finishExecutionToolName,
@@ -198,8 +203,10 @@ async function finishExecutionCall(
   materializedOutputs: readonly MaterializedOutputCapability[],
 ) {
   try {
+    // An output the agent never attempted is still recoverable: name its tool.
+    // One whose delivery failed is not; completion then ends the run as failed.
     const missingOutputs = missingRequiredOutputTools(execution, materializedOutputs);
-    if (missingOutputs.length > 0) {
+    if (missingOutputs.length > 0 && failedRequiredOutputDeliveries(execution).length === 0) {
       reportFailure(
         new Error("required execution outputs are missing"),
         {
@@ -238,6 +245,9 @@ async function finishExecutionCall(
     });
     return toolSuccess("Execution finished");
   } catch (error) {
+    if (isOutputDeliveryFailure(error)) {
+      return toolFailure(outputDeliveryFailureMessage(failedRequiredOutputDeliveries(execution)));
+    }
     const failure = reportFailure(error, {
       operation: "execution_capability.finish",
       component: "execution_capabilities",
@@ -398,6 +408,22 @@ function requiredOutputsGuidance(
     .map((output) => `${output.type} (call \`${output.toolName}\`)`)
     .join(", ");
   return `Required output missing: ${missing}. Call the named Hub tool, then retry \`finish_execution\`.`;
+}
+
+/** The completion authority ended the execution because a required output was never delivered. */
+function isOutputDeliveryFailure(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.name === "AgentExecutionCompletionFailure" &&
+    "reason" in error &&
+    error.reason === OUTPUT_DELIVERY_FAILED_REASON
+  );
+}
+
+function outputDeliveryFailureMessage(
+  failures: ReturnType<typeof failedRequiredOutputDeliveries>,
+): string {
+  return `Execution failed: required output not delivered (${describeRequiredOutputDeliveryFailures(failures)}). The run is recorded as failed and accepts no further tool calls.`;
 }
 
 function readBearerToken(header: string | undefined): string | undefined {

@@ -25,6 +25,11 @@ import { reportFailure } from "../failures/index.js";
 import type { TriggerProvider } from "../triggers/index.js";
 import type { ExecutionAuthority } from "../execution-authority/index.js";
 import { OutputExecutorRegistry } from "../execution-capabilities/outputs.js";
+import {
+  OUTPUT_DELIVERY_FAILED_REASON,
+  failedRequiredOutputDeliveries,
+  type RequiredOutputDeliveryFailure,
+} from "../execution-capabilities/required-outputs.js";
 import { executionToolPolicy } from "../execution-capabilities/tool-policy.js";
 import {
   notifyAgentExecutionCompleted,
@@ -135,7 +140,13 @@ export class DaemonSpawnAckTimeoutError extends Error {
 }
 
 export class AgentExecutionCompletionFailure extends Error {
-  constructor(readonly reason: "not_found" | "unauthorized" | "expired") {
+  constructor(
+    readonly reason:
+      | "not_found"
+      | "unauthorized"
+      | "expired"
+      | typeof OUTPUT_DELIVERY_FAILED_REASON,
+  ) {
     super(`agent execution completion failed: ${reason}`);
     this.name = "AgentExecutionCompletionFailure";
   }
@@ -901,6 +912,11 @@ export class DaemonDispatchLifecycle {
     if (await this.expireExecutionIfDeadlineElapsed(currentExecution)) {
       throw new AgentExecutionCompletionFailure("expired");
     }
+    const undelivered = failedRequiredOutputDeliveries(currentExecution);
+    if (undelivered.length > 0) {
+      await this.failUndeliveredExecution(currentExecution, undelivered);
+      throw new AgentExecutionCompletionFailure(OUTPUT_DELIVERY_FAILED_REASON);
+    }
 
     if (currentExecution.launchIntent?.outputSchema !== undefined) {
       validateStructuredOutput(currentExecution.launchIntent.outputSchema, input.output);
@@ -921,6 +937,31 @@ export class DaemonDispatchLifecycle {
       throw new AgentExecutionCompletionFailure("expired");
     }
     return execution;
+  }
+
+  /**
+   * `finish_execution` arrived while a required output had only failed
+   * deliveries. Recording a success here is what kept broken deliveries
+   * invisible: the execution, its step and its run end as failed instead, and
+   * the dispatch learns the reason.
+   */
+  private async failUndeliveredExecution(
+    execution: AgentExecutionRecord,
+    undelivered: readonly RequiredOutputDeliveryFailure[],
+  ): Promise<void> {
+    // The log line carries each output and its failed attempt count as diagnostics;
+    // error messages never reach the log.
+    this.report(new Error("required output not delivered"), "daemon.execution.output-delivery", {
+      executionId: execution.id,
+      outputs: undelivered,
+    });
+    this.clearExecutionDeadline(execution.id);
+    const failed = await this.failAgentExecution(execution.id, OUTPUT_DELIVERY_FAILED_REASON);
+    if (failed !== undefined) {
+      this.completionWatchersByExecution.get(execution.id)?.(
+        new DaemonDispatchFailure(OUTPUT_DELIVERY_FAILED_REASON),
+      );
+    }
   }
 
   async recoverAgentExecutionDeadlines(): Promise<void> {

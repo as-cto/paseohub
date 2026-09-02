@@ -487,6 +487,44 @@ describe("Linear trigger provider", () => {
     assert.deepEqual(client.createdActivities, []);
   });
 
+  it("posts a short error when the reply to an agent session could not be delivered", async () => {
+    const { match, acceptedState, provider, client } = await acceptedAgentSession();
+
+    const failedState = await provider.onAgentExecutionFailed?.(
+      match.triggerContext,
+      match.outputContext,
+      "output_delivery_failed",
+      acceptedState ?? undefined,
+    );
+
+    assert.deepEqual(failedState, { phase: "failed" });
+    assert.deepEqual(client.createdActivities.at(-1), {
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      content: { type: "error", body: "Paseo could not deliver its reply to this session." },
+    });
+  });
+
+  it("stays silent when an issue-comment run could not deliver its reply", async () => {
+    const { project, revision, store } = await activeConfiguration();
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+    });
+    const match = (await provider.match(external(project.id, revision.id)))[0];
+    if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+
+    const failedState = await provider.onAgentExecutionFailed?.(
+      match.triggerContext,
+      match.outputContext,
+      "output_delivery_failed",
+    );
+
+    assert.equal(failedState, undefined);
+    assert.deepEqual(client.createdActivities, []);
+  });
+
   it("has no agent session to close for issue-comment triggers", async () => {
     const { project, revision, store } = await activeConfiguration();
     const client = new RecordingHistoryClient({ complete: true, comments: [] });
