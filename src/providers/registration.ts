@@ -22,14 +22,15 @@ export interface TriggerProviderResources {
 export interface TriggerProviderExecutionControl {
   /**
    * Fails the project's work selected by `matches` with `reason`: pending executions and
-   * accepted runs whose execution was not dispatched yet. The failure follows the usual
-   * terminal path: the daemon agent is interrupted and the provider's failure hook receives
-   * `reason`. `stopped` counts both kinds.
+   * accepted runs whose execution was not dispatched yet. `matches` sees each candidate's
+   * output context and the id of the workflow run it belongs to (null for an execution outside
+   * a workflow run). The failure follows the usual terminal path: the daemon agent is
+   * interrupted and the provider's failure hook receives `reason`. `stopped` counts both kinds.
    */
   stopActive(input: {
     projectId: string;
     reason: string;
-    matches: (execution: { outputContext: unknown }) => boolean;
+    matches: (work: { outputContext: unknown; triggerRunId: string | null }) => boolean;
   }): Promise<{ stopped: number }>;
 }
 

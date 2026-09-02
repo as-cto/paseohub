@@ -380,6 +380,16 @@ class MemoryDatabase implements Database {
       .slice(0, limit);
   }
 
+  async listTriggerRunsForLinearComments(projectId: string, commentIds: readonly string[]) {
+    const wanted = new Set(commentIds);
+    return (await this.listTriggerRunsForProject(projectId, Number.POSITIVE_INFINITY)).filter(
+      (run) => {
+        const commentId = linearCommentIdOf(run.triggerContext);
+        return commentId !== undefined && wanted.has(commentId);
+      },
+    );
+  }
+
   async findWorkflowStepRunById(id: string) {
     return this.workflowStepRuns.get(id);
   }
@@ -3464,4 +3474,20 @@ function attachmentSourceKey(
   sourceId: string,
 ): string {
   return `${providerEventReceiptId}:${provider}:${sourceId}`;
+}
+
+/** The triggering comment a Linear trigger context records; mirrors the SQL JSON path. */
+function linearCommentIdOf(triggerContext: unknown): string | undefined {
+  const event = nestedRecord(nestedRecord(triggerContext)?.["event"]);
+  const comment = nestedRecord(nestedRecord(event?.["linear"])?.["comment"]);
+  const id = comment?.["id"];
+  return typeof id === "string" ? id : undefined;
+}
+
+function nestedRecord(value: unknown): Record<string, unknown> | undefined {
+  return isPlainRecord(value) ? value : undefined;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

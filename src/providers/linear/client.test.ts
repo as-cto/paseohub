@@ -215,6 +215,61 @@ describe("Linear connection client", () => {
     });
   });
 
+  it("reads a comment's thread root and the distinct authors who wrote in it", async () => {
+    const requests: string[] = [];
+    const connection = linearConnection();
+    let parent: unknown = {
+      id: "root-1",
+      user: { id: "user-1" },
+      botActor: null,
+      children: {
+        nodes: [
+          { user: { id: "app-user" }, botActor: null },
+          { user: null, botActor: { id: "bot-1" } },
+          { user: { id: "user-1" }, botActor: null },
+        ],
+      },
+    };
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+      connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+      fetch: async (_url, init) => {
+        requests.push(readableBody(init?.body));
+        return json({
+          data: {
+            comment: {
+              id: "reply-2",
+              user: { id: "user-2" },
+              botActor: null,
+              parent,
+              children: { nodes: [] },
+            },
+          },
+        });
+      },
+    });
+
+    assert.deepEqual(
+      await api.readCommentThread({ linearOrganizationId: "linear-org", commentId: "reply-2" }),
+      { rootId: "root-1", authorIds: ["user-1", "app-user", "bot-1"] },
+    );
+    const request = graphqlRequest(requests[0] ?? "{}");
+    assert.match(request.query, /comment\(id: \$id\)/u);
+    assert.match(
+      request.query,
+      /parent \{[\s\S]*children\(first: 100\) \{ nodes \{ user \{ id \} botActor \{ id \} \} \}/u,
+    );
+    assert.deepEqual(request.variables, { id: "reply-2" });
+
+    // A root comment is its own thread root.
+    parent = null;
+    assert.deepEqual(
+      await api.readCommentThread({ linearOrganizationId: "linear-org", commentId: "reply-2" }),
+      { rootId: "reply-2", authorIds: ["user-2"] },
+    );
+  });
+
   it("reads bounded agent-session activity before the prompting activity", async () => {
     const requests: string[] = [];
     const api = createLinearApiClient({

@@ -1184,15 +1184,30 @@ export class DaemonDispatchLifecycle {
    * second pass only sees runs that had nothing dispatched. The run scan reads the project's
    * most recent {@link STOP_RUN_SCAN_LIMIT} runs; a run older than that has long passed its
    * deadline.
+   *
+   * `matches` selects on the work's output context or on its workflow run id, which is
+   * resolved through the execution's step run (null outside a workflow run).
    */
   async stopAgentExecutions(input: {
     projectId: string;
     reason: string;
-    matches: (work: { outputContext: unknown }) => boolean;
+    matches: (work: { outputContext: unknown; triggerRunId: string | null }) => boolean;
   }): Promise<{ executions: AgentExecutionRecord[]; runs: AcceptedTriggerRunRecord[] }> {
-    const executions = (await this.options.database.findPendingAgentExecutions()).filter(
-      (execution) => execution.projectId === input.projectId && input.matches(execution),
+    const pending = (await this.options.database.findPendingAgentExecutions()).filter(
+      (execution) => execution.projectId === input.projectId,
     );
+    const executions = (
+      await Promise.all(
+        pending.map(async (execution) =>
+          input.matches({
+            outputContext: execution.outputContext,
+            triggerRunId: await this.triggerRunIdOf(execution),
+          })
+            ? execution
+            : undefined,
+        ),
+      )
+    ).filter((execution) => execution !== undefined);
     const stopped = await Promise.all(
       executions.map(async (execution) => {
         const failed = await this.failAgentExecution(execution.id, input.reason);
@@ -1208,7 +1223,9 @@ export class DaemonDispatchLifecycle {
       await this.options.database.listTriggerRunsForProject(input.projectId, STOP_RUN_SCAN_LIMIT)
     ).filter(
       (run): run is AcceptedTriggerRunRecord =>
-        run.outcome === "accepted" && run.status === "running" && input.matches(run),
+        run.outcome === "accepted" &&
+        run.status === "running" &&
+        input.matches({ outputContext: run.outputContext, triggerRunId: run.id }),
     );
     const failedRuns = await Promise.all(
       undispatched.map(async (run) => {
@@ -1222,6 +1239,12 @@ export class DaemonDispatchLifecycle {
       executions: stopped.filter((execution) => execution !== undefined),
       runs: failedRuns.filter((run) => run !== undefined),
     };
+  }
+
+  private async triggerRunIdOf(execution: AgentExecutionRecord): Promise<string | null> {
+    if (execution.workflowStepRunId === null) return null;
+    const step = await this.options.database.findWorkflowStepRunById(execution.workflowStepRunId);
+    return step?.triggerRunId ?? null;
   }
 
   private async startAgentExecution(executionId: string): Promise<void> {
