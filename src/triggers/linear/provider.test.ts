@@ -589,6 +589,30 @@ describe("Linear trigger provider", () => {
     assert.deepEqual(client.threadReads, []);
   });
 
+  it("does not read the thread when only a non-comment trigger asks for the app in it", async () => {
+    const configuration = linearCommentConfiguration();
+    const sessionTrigger = agentSessionConfiguration().triggers[0]!;
+    const sessionTriggerWithThreadFilter = {
+      ...sessionTrigger,
+      filters: { ...sessionTrigger.filters, thread_with_app: true },
+    };
+    const { project, revision, store } = await activeConfiguration({
+      ...configuration,
+      triggers: [...configuration.triggers, sessionTriggerWithThreadFilter],
+    });
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+      connectionForLinearOrganization: () => Promise.reject(new Error("must not be consulted")),
+    });
+
+    assert.deepEqual(await matchedTriggerNames(provider, external(project.id, revision.id)), [
+      "comment",
+    ]);
+    assert.deepEqual(client.threadReads, []);
+  });
+
   it("fails thread_with_app closed without holding back other triggers when reads fail", async () => {
     const { project, revision, store } = await activeConfiguration(threadWithAppConfiguration());
     const client = new RecordingHistoryClient({ complete: true, comments: [] });
@@ -663,6 +687,76 @@ describe("Linear trigger provider", () => {
     assert.equal(supersedes(commentRun.id), true);
     assert.equal(supersedes(otherCommentRun.id), false);
     assert.equal(supersedes(null), false);
+  });
+
+  it("stops the run started from the reply that opened an agent session as well as the root's", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      agentSessionConfiguration(),
+      { organizationId: "hub-org" },
+    );
+    const rootRun = (
+      await database.createAcceptedTriggerRun(
+        linearCommentRun(project.id, revision.id, "comment-1", "receipt-root-run"),
+      )
+    ).run;
+    const replyRun = (
+      await database.createAcceptedTriggerRun(
+        linearCommentRun(project.id, revision.id, "reply-1", "receipt-reply-run"),
+      )
+    ).run;
+    const otherRun = (
+      await database.createAcceptedTriggerRun(
+        linearCommentRun(project.id, revision.id, "comment-2", "receipt-other-run"),
+      )
+    ).run;
+    const lookups: (readonly string[])[] = [];
+    const stops: Parameters<TriggerProviderExecutionControl["stopActive"]>[0][] = [];
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client: new RecordingHistoryClient({ complete: true, comments: [] }),
+      database: {
+        listTriggerRunsForLinearComments: (projectId, commentIds) => {
+          lookups.push(commentIds);
+          return database.listTriggerRunsForLinearComments(projectId, commentIds);
+        },
+      },
+      executions: {
+        stopActive: async (input) => {
+          stops.push(input);
+          return { stopped: 2 };
+        },
+      },
+    });
+    const created = agentSessionEvent({ action: "created" });
+    const session = (comments: { rootCommentId?: string; sourceCommentId?: string }) =>
+      externalAgentSession(project.id, revision.id, {
+        ...created,
+        agentSession: { ...created.agentSession, ...comments },
+      });
+
+    const matches = await provider.match(
+      session({ rootCommentId: "comment-1", sourceCommentId: "reply-1" }),
+    );
+    if (typeof matches === "string") throw new Error(`expected a match, got ${matches}`);
+    assert.deepEqual(lookups, [["comment-1", "reply-1"]]);
+    assert.equal(stops.length, 1);
+    const supersedes = (triggerRunId: string) =>
+      stops[0]!.matches({ outputContext: rootRun.outputContext, triggerRunId });
+    assert.equal(supersedes(rootRun.id), true);
+    assert.equal(supersedes(replyRun.id), true);
+    assert.equal(supersedes(otherRun.id), false);
+
+    // A mention in the root names the same comment twice; a session may also name only its source.
+    for (const [comments, expected] of [
+      [{ rootCommentId: "comment-1", sourceCommentId: "comment-1" }, ["comment-1"]],
+      [{ sourceCommentId: "reply-1" }, ["reply-1"]],
+    ] as const) {
+      lookups.length = 0;
+      await provider.match(session(comments));
+      assert.deepEqual(lookups, [expected]);
+    }
   });
 
   it("stops nothing when no comment run preceded the agent session", async () => {

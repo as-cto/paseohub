@@ -157,6 +157,31 @@ describe("Linear event normalization", () => {
     assert.equal(fromAssignment.agentSession.rootCommentId, undefined);
   });
 
+  it("carries the comment that created an agent session wherever the payload places it", () => {
+    const envelope = agentSessionEnvelope({ action: "created" });
+    const normalize = (payload: Record<string, unknown>) => {
+      const event = normalizeLinearEvent(payload, "AgentSessionEvent", hydratedIssue());
+      if (event?.type !== "agent_session") throw new Error("expected an agent session event");
+      return event.agentSession;
+    };
+
+    const fromReply = normalize({
+      ...envelope,
+      agentSession: { ...envelope.agentSession, sourceCommentId: "reply-1" },
+    });
+    assert.equal(fromReply.rootCommentId, "comment-1");
+    assert.equal(fromReply.sourceCommentId, "reply-1");
+    assert.equal(
+      normalize({
+        ...envelope,
+        agentSession: { ...envelope.agentSession, sourceComment: { id: "reply-2" } },
+      }).sourceCommentId,
+      "reply-2",
+    );
+    assert.equal(normalize({ ...envelope, sourceCommentId: "reply-3" }).sourceCommentId, "reply-3");
+    assert.equal(normalize(envelope).sourceCommentId, undefined);
+  });
+
   it("normalizes a created agent session around Linear's canonical prompt context", () => {
     const event = normalizeLinearEvent(
       agentSessionEnvelope({ action: "created" }),

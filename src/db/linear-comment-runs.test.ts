@@ -4,7 +4,7 @@ import { createMemoryDatabase } from "./memory.js";
 import type { CreateAcceptedTriggerRunInput } from "./types.js";
 
 describe("trigger runs by Linear comment", () => {
-  it("lists the runs a Linear comment started within one project, newest first", async () => {
+  it("lists the runs any of the given Linear comments started within one project, newest first", async () => {
     const database = createMemoryDatabase();
     const earlier = (
       await database.createAcceptedTriggerRun(
@@ -16,9 +16,11 @@ describe("trigger runs by Linear comment", () => {
         linearRun("project-1", "receipt-2", "comment-1", new Date(2_000)),
       )
     ).run;
-    await database.createAcceptedTriggerRun(
-      linearRun("project-1", "receipt-3", "comment-2", new Date(3_000)),
-    );
+    const other = (
+      await database.createAcceptedTriggerRun(
+        linearRun("project-1", "receipt-3", "comment-2", new Date(3_000)),
+      )
+    ).run;
     await database.createAcceptedTriggerRun(
       linearRun("project-1", "receipt-4", null, new Date(4_000)),
     );
@@ -26,11 +28,12 @@ describe("trigger runs by Linear comment", () => {
       linearRun("project-2", "receipt-5", "comment-1", new Date(5_000)),
     );
 
-    assert.deepEqual(
-      (await database.listTriggerRunsForLinearComment("project-1", "comment-1")).map((r) => r.id),
-      [later.id, earlier.id],
-    );
-    assert.deepEqual(await database.listTriggerRunsForLinearComment("project-1", "comment-3"), []);
+    const ids = async (commentIds: readonly string[]) =>
+      (await database.listTriggerRunsForLinearComments("project-1", commentIds)).map((r) => r.id);
+    assert.deepEqual(await ids(["comment-1"]), [later.id, earlier.id]);
+    assert.deepEqual(await ids(["comment-2", "comment-1"]), [other.id, later.id, earlier.id]);
+    assert.deepEqual(await ids(["comment-3"]), []);
+    assert.deepEqual(await ids([]), []);
   });
 });
 

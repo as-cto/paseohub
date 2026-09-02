@@ -70,6 +70,8 @@ export const NormalizedLinearAgentSessionEventSchema = z.object({
     url: z.string().url().optional(),
     /** The root comment of the thread the session is attached to, when it was opened from one. */
     rootCommentId: LinearIdSchema.optional(),
+    /** The comment that created the session: the root itself, or a reply that mentioned the app. */
+    sourceCommentId: LinearIdSchema.optional(),
   }),
   agentActivity: z
     .object({
@@ -264,6 +266,11 @@ function normalizeAgentSessionEvent(
     readString(asRecord(session["comment"])?.["id"]),
     readString(session["commentId"]),
   );
+  const sourceCommentId = firstDefined(
+    readString(asRecord(session["sourceComment"])?.["id"]),
+    readString(session["sourceCommentId"]),
+    readString(payload["sourceCommentId"]),
+  );
   return NormalizedLinearAgentSessionEventSchema.parse({
     type: "agent_session",
     action,
@@ -277,6 +284,7 @@ function normalizeAgentSessionEvent(
       status,
       ...(url === undefined ? {} : { url }),
       ...(rootCommentId === undefined ? {} : { rootCommentId }),
+      ...(sourceCommentId === undefined ? {} : { sourceCommentId }),
     },
     agentActivity: turn.activity ?? null,
     prompt: turn.prompt,

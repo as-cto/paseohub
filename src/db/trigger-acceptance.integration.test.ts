@@ -114,7 +114,7 @@ describe("trigger acceptance persistence", () => {
     await database.close();
   }, 120_000);
 
-  it("lists the runs a Linear comment started within one project, newest first", async () => {
+  it("lists the runs any of the given Linear comments started within one project, newest first", async () => {
     const database = await createDatabase(databaseUrl);
     const client = await createPostgresQueryRuntime(databaseUrl);
     const projectId = "60000000-0000-4000-8000-000000000001";
@@ -183,15 +183,16 @@ describe("trigger acceptance persistence", () => {
     };
     const earlier = await run(projectId, "comment-1-earlier", "comment-1", new Date(1_000));
     const later = await run(projectId, "comment-1-later", "comment-1", new Date(2_000));
-    await run(projectId, "comment-2", "comment-2", new Date(3_000));
+    const other = await run(projectId, "comment-2", "comment-2", new Date(3_000));
     await run(projectId, "session", null, new Date(4_000));
     await run(otherProjectId, "comment-1-elsewhere", "comment-1", new Date(5_000));
 
-    assert.deepEqual(
-      (await database.listTriggerRunsForLinearComment(projectId, "comment-1")).map((r) => r.id),
-      [later.id, earlier.id],
-    );
-    assert.deepEqual(await database.listTriggerRunsForLinearComment(projectId, "comment-3"), []);
+    const ids = async (commentIds: readonly string[]) =>
+      (await database.listTriggerRunsForLinearComments(projectId, commentIds)).map((r) => r.id);
+    assert.deepEqual(await ids(["comment-1"]), [later.id, earlier.id]);
+    assert.deepEqual(await ids(["comment-2", "comment-1"]), [other.id, later.id, earlier.id]);
+    assert.deepEqual(await ids(["comment-3"]), []);
+    assert.deepEqual(await ids([]), []);
     await database.close();
   }, 120_000);
 

@@ -126,7 +126,7 @@ export interface LinearTriggerProviderOptions {
     linearOrganizationId: string;
   }) => Promise<Pick<LinearConnectionRecord, "appUserId"> | undefined>;
   /** Finds the runs a comment trigger started, so a new agent session can supersede them. */
-  database?: Pick<Database, "listTriggerRunsForLinearComment">;
+  database?: Pick<Database, "listTriggerRunsForLinearComments">;
   executions?: TriggerProviderExecutionControl;
 }
 
@@ -534,13 +534,16 @@ async function hydrateLinearCommentThread(
   options: Pick<LinearTriggerProviderOptions, "client" | "connectionForLinearOrganization">,
   externalTrigger: ExternalTrigger,
   event: NormalizedLinearEvent,
-  triggers: readonly Pick<CompiledTriggerConfig, "filters">[],
+  triggers: readonly Pick<CompiledTriggerConfig, "on" | "filters">[],
 ): Promise<{ event: NormalizedLinearEvent; appUserId: string | undefined }> {
   if (
     event.type !== "comment" ||
     event.action !== "create" ||
     event.comment.parentId === null ||
-    !triggers.some((trigger) => trigger.filters?.thread_with_app === true)
+    !triggers.some(
+      (trigger) =>
+        trigger.on === "linear.comment_created" && trigger.filters?.thread_with_app === true,
+    )
   ) {
     return { event, appUserId: undefined };
   }
@@ -577,17 +580,24 @@ async function hydrateLinearCommentThread(
 /**
  * A mention that opens an agent session also arrives as a comment, moments earlier. When a
  * comment trigger already started a run from that comment, the session is the canonical
- * handling: the comment run is stopped so the user is not answered twice. A failure here is
- * reported but does not hold back the session's own run.
+ * handling: the comment run is stopped so the user is not answered twice. The mention may sit
+ * in a reply, so the comment that created the session is checked as well as the thread's root.
+ * A failure here is reported but does not hold back the session's own run.
  */
 async function supersedeLinearCommentRuns(
   options: Pick<LinearTriggerProviderOptions, "database" | "executions">,
   projectId: string,
   event: NormalizedLinearAgentSessionEvent,
 ): Promise<void> {
-  const commentId = event.agentSession.rootCommentId;
+  const commentIds = [
+    ...new Set(
+      [event.agentSession.rootCommentId, event.agentSession.sourceCommentId].filter(
+        (id): id is string => id !== undefined,
+      ),
+    ),
+  ];
   if (
-    commentId === undefined ||
+    commentIds.length === 0 ||
     options.database === undefined ||
     options.executions === undefined
   ) {
@@ -595,7 +605,7 @@ async function supersedeLinearCommentRuns(
   }
   try {
     const superseded = new Set(
-      (await options.database.listTriggerRunsForLinearComment(projectId, commentId)).map(
+      (await options.database.listTriggerRunsForLinearComments(projectId, commentIds)).map(
         (run) => run.id,
       ),
     );
@@ -613,7 +623,7 @@ async function supersedeLinearCommentRuns(
         component: "triggers",
         provider: "linear",
       },
-      { diagnostic: { projectId, agentSessionId: event.agentSession.id, commentId } },
+      { diagnostic: { projectId, agentSessionId: event.agentSession.id, commentIds } },
     );
   }
 }

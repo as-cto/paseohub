@@ -258,7 +258,7 @@ describe("Linear connection client", () => {
     assert.match(request.query, /comment\(id: \$id\)/u);
     assert.match(
       request.query,
-      /parent \{[\s\S]*children \{ nodes \{ user \{ id \} botActor \{ id \} \} \}/u,
+      /parent \{[\s\S]*children\(first: 100\) \{ nodes \{ user \{ id \} botActor \{ id \} \} \}/u,
     );
     assert.deepEqual(request.variables, { id: "reply-2" });
 

@@ -605,9 +605,9 @@ export function createLinearApiClient(options: {
               id user { id } botActor { id }
               parent {
                 id user { id } botActor { id }
-                children { nodes { user { id } botActor { id } } }
+                children(first: 100) { nodes { user { id } botActor { id } } }
               }
-              children { nodes { user { id } botActor { id } } }
+              children(first: 100) { nodes { user { id } botActor { id } } }
             }
           }`,
           variables: { id: input.commentId },
