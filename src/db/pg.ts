@@ -621,6 +621,18 @@ class PgDatabase implements Database {
     return rows.rows.map(toTriggerRunRecord);
   }
 
+  async listTriggerRunsForLinearComment(projectId: string, commentId: string) {
+    const rows = await query<TriggerRunRow>(
+      this.pool,
+      `select * from trigger_runs
+       where project_id = $1
+         and trigger_context #>> '{event,linear,comment,id}' = $2
+       order by created_at desc, configured_trigger_name, id desc`,
+      [projectId, commentId],
+    );
+    return rows.rows.map(toTriggerRunRecord);
+  }
+
   async findWorkflowStepRunById(id: string) {
     const rows = await query<WorkflowStepRunRow>(
       this.pool,

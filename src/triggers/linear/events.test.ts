@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
-import { normalizeLinearEvent } from "./events.js";
+import { NormalizedLinearEventSchema, normalizeLinearEvent } from "./events.js";
 
 describe("Linear event normalization", () => {
   it("uses a comment's own timestamp as the causal history anchor", () => {
@@ -120,6 +120,41 @@ describe("Linear event normalization", () => {
       },
       { projectId: null, teamId: null, stateId: null, assigneeId: null },
     );
+  });
+
+  it("leaves thread authors to the trigger provider and preserves them once filled", () => {
+    const event = normalizeComment({ parentId: "root-comment" });
+    if (event?.type !== "comment") throw new Error("expected a comment event");
+    assert.equal(event.threadAuthorIds, undefined);
+
+    const hydrated = NormalizedLinearEventSchema.parse({
+      ...event,
+      threadAuthorIds: ["user-1", "app-user"],
+    });
+    if (hydrated.type !== "comment") throw new Error("expected a comment event");
+    assert.deepEqual(hydrated.threadAuthorIds, ["user-1", "app-user"]);
+  });
+
+  it("carries the root comment an agent session was opened from", () => {
+    const event = normalizeLinearEvent(
+      agentSessionEnvelope({ action: "created" }),
+      "AgentSessionEvent",
+      hydratedIssue(),
+    );
+    if (event?.type !== "agent_session") throw new Error("expected an agent session event");
+    assert.equal(event.agentSession.rootCommentId, "comment-1");
+
+    const envelope = agentSessionEnvelope({ action: "created" });
+    const { comment: _comment, ...sessionWithoutComment } = envelope.agentSession;
+    const fromAssignment = normalizeLinearEvent(
+      { ...envelope, agentSession: sessionWithoutComment },
+      "AgentSessionEvent",
+      hydratedIssue(),
+    );
+    if (fromAssignment?.type !== "agent_session") {
+      throw new Error("expected an agent session event");
+    }
+    assert.equal(fromAssignment.agentSession.rootCommentId, undefined);
   });
 
   it("normalizes a created agent session around Linear's canonical prompt context", () => {

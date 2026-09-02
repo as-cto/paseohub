@@ -177,6 +177,9 @@ export function createLinearRegistration(
         createLinearTriggerProvider({
           configurationStoreForProject,
           ...(api === undefined ? {} : { client: api }),
+          connectionForLinearOrganization: ({ organizationId, linearOrganizationId }) =>
+            database.findLinearConnectionForOrganization(organizationId, linearOrganizationId),
+          database,
           ...(executions === undefined ? {} : { executions }),
         }),
     ],

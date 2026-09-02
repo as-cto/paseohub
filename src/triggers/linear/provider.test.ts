@@ -3,6 +3,7 @@ import { describe, it } from "vitest";
 import type {
   LinearAgentActivityHistory,
   LinearApiClient,
+  LinearCommentThread,
   LinearIssueCommentHistory,
 } from "../../providers/linear/client.js";
 import { createMemoryDatabase } from "../../db/memory.js";
@@ -549,6 +550,156 @@ describe("Linear trigger provider", () => {
     );
   });
 
+  it("reads the thread's authors for thread_with_app and fires only when the app wrote in it", async () => {
+    const { project, revision, store } = await activeConfiguration(threadWithAppConfiguration());
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    client.thread = { rootId: "root-comment", authorIds: ["operator", "app-user"] };
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+      connectionForLinearOrganization: async () => ({ appUserId: "app-user" }),
+    });
+
+    assert.deepEqual(await matchedTriggerNames(provider, external(project.id, revision.id)), [
+      "in-app-thread",
+      "plain",
+    ]);
+    assert.deepEqual(client.threadReads, [
+      { linearOrganizationId: "linear-org", commentId: "trigger-comment" },
+    ]);
+
+    client.thread = { rootId: "root-comment", authorIds: ["operator", "reviewer"] };
+    assert.deepEqual(await matchedTriggerNames(provider, external(project.id, revision.id)), [
+      "plain",
+    ]);
+  });
+
+  it("does not read the thread unless a trigger asks for the app in it", async () => {
+    const { project, revision, store } = await activeConfiguration();
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+      connectionForLinearOrganization: () => Promise.reject(new Error("must not be consulted")),
+    });
+
+    assert.deepEqual(await matchedTriggerNames(provider, external(project.id, revision.id)), [
+      "comment",
+    ]);
+    assert.deepEqual(client.threadReads, []);
+  });
+
+  it("fails thread_with_app closed without holding back other triggers when reads fail", async () => {
+    const { project, revision, store } = await activeConfiguration(threadWithAppConfiguration());
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    client.threadError = new Error("Linear unavailable");
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+      connectionForLinearOrganization: async () => ({ appUserId: "app-user" }),
+    });
+
+    assert.deepEqual(await matchedTriggerNames(provider, external(project.id, revision.id)), [
+      "plain",
+    ]);
+
+    // Without a connection there is no app user to look for, so the thread is not even read.
+    const unconnected = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+      connectionForLinearOrganization: async () => undefined,
+    });
+    assert.deepEqual(await matchedTriggerNames(unconnected, external(project.id, revision.id)), [
+      "plain",
+    ]);
+    assert.equal(client.threadReads.length, 1);
+  });
+
+  it("stops the run a comment trigger started from the comment that opened an agent session", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      agentSessionConfiguration(),
+      { organizationId: "hub-org" },
+    );
+    const commentRun = (
+      await database.createAcceptedTriggerRun(
+        linearCommentRun(project.id, revision.id, "comment-1", "receipt-comment-run"),
+      )
+    ).run;
+    const otherCommentRun = (
+      await database.createAcceptedTriggerRun(
+        linearCommentRun(project.id, revision.id, "comment-2", "receipt-other-comment-run"),
+      )
+    ).run;
+    const stops: Parameters<TriggerProviderExecutionControl["stopActive"]>[0][] = [];
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client: new RecordingHistoryClient({ complete: true, comments: [] }),
+      database,
+      executions: {
+        stopActive: async (input) => {
+          stops.push(input);
+          return { stopped: 1 };
+        },
+      },
+    });
+
+    const created = agentSessionEvent({ action: "created" });
+    const matches = await provider.match(
+      externalAgentSession(project.id, revision.id, {
+        ...created,
+        agentSession: { ...created.agentSession, rootCommentId: "comment-1" },
+      }),
+    );
+
+    if (typeof matches === "string") throw new Error(`expected a match, got ${matches}`);
+    assert.equal(matches.length, 1);
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0]?.projectId, project.id);
+    assert.equal(stops[0]?.reason, "superseded_by_agent_session");
+    const supersedes = (triggerRunId: string | null) =>
+      stops[0]!.matches({ outputContext: commentRun.outputContext, triggerRunId });
+    assert.equal(supersedes(commentRun.id), true);
+    assert.equal(supersedes(otherCommentRun.id), false);
+    assert.equal(supersedes(null), false);
+  });
+
+  it("stops nothing when no comment run preceded the agent session", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      agentSessionConfiguration(),
+      { organizationId: "hub-org" },
+    );
+    await database.createAcceptedTriggerRun(
+      linearCommentRun(project.id, revision.id, "comment-2", "receipt-unrelated-comment-run"),
+    );
+    let stops = 0;
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client: new RecordingHistoryClient({ complete: true, comments: [] }),
+      database,
+      executions: {
+        stopActive: async () => {
+          stops += 1;
+          return { stopped: 0 };
+        },
+      },
+    });
+
+    const created = agentSessionEvent({ action: "created" });
+    for (const session of [
+      { ...created, agentSession: { ...created.agentSession, rootCommentId: "comment-1" } },
+      created,
+      agentSessionEvent(),
+    ]) {
+      const matches = await provider.match(externalAgentSession(project.id, revision.id, session));
+      if (typeof matches === "string") throw new Error(`expected a match, got ${matches}`);
+    }
+    assert.equal(stops, 0);
+  });
+
   it("stops the session's executions instead of starting a run on Linear's stop signal", async () => {
     const { project, revision, store } = await activeConfiguration(agentSessionConfiguration());
     const client = new RecordingHistoryClient({ complete: true, comments: [] });
@@ -581,34 +732,28 @@ describe("Linear trigger provider", () => {
     assert.equal(stops.length, 1);
     assert.equal(stops[0]?.projectId, project.id);
     assert.equal(stops[0]?.reason, "stopped_by_user");
-    const matches = stops[0].matches;
+    const matches = (outputContext: unknown) =>
+      stops[0]!.matches({ outputContext, triggerRunId: null });
     assert.equal(
       matches({
-        outputContext: {
-          provider: "linear",
-          linearOrganizationId: "linear-org",
-          issueId: "issue-1",
-          agentSessionId: "session-1",
-        },
+        provider: "linear",
+        linearOrganizationId: "linear-org",
+        issueId: "issue-1",
+        agentSessionId: "session-1",
       }),
       true,
     );
     assert.equal(
       matches({
-        outputContext: {
-          provider: "linear",
-          linearOrganizationId: "linear-org",
-          issueId: "issue-1",
-          agentSessionId: "session-2",
-        },
+        provider: "linear",
+        linearOrganizationId: "linear-org",
+        issueId: "issue-1",
+        agentSessionId: "session-2",
       }),
       false,
     );
-    assert.equal(
-      matches({ outputContext: { provider: "slack", agentSessionId: "session-1" } }),
-      false,
-    );
-    assert.equal(matches({ outputContext: null }), false);
+    assert.equal(matches({ provider: "slack", agentSessionId: "session-1" }), false);
+    assert.equal(matches(null), false);
     assert.deepEqual(client.createdActivities, [
       {
         linearOrganizationId: "linear-org",
@@ -730,13 +875,16 @@ describe("Linear trigger provider", () => {
 
 class RecordingHistoryClient implements Pick<
   LinearApiClient,
-  "readIssueComments" | "readAgentSessionActivities" | "createAgentActivity"
+  "readIssueComments" | "readAgentSessionActivities" | "readCommentThread" | "createAgentActivity"
 > {
   historyReads: Array<{
     linearOrganizationId: string;
     issueId: string;
     beforeCreatedAt: string;
   }> = [];
+  threadReads: Array<{ linearOrganizationId: string; commentId: string }> = [];
+  thread: LinearCommentThread | undefined = undefined;
+  threadError: Error | undefined = undefined;
   activityReads: Array<{
     linearOrganizationId: string;
     agentSessionId: string;
@@ -770,6 +918,14 @@ class RecordingHistoryClient implements Pick<
       return Promise.reject(new Error("activity history was not configured"));
     }
     return Promise.resolve(this.activityHistory);
+  }
+
+  readCommentThread(
+    input: (typeof this.threadReads)[number],
+  ): Promise<LinearCommentThread | undefined> {
+    this.threadReads.push(input);
+    if (this.threadError !== undefined) return Promise.reject(this.threadError);
+    return Promise.resolve(this.thread);
   }
 
   createAgentActivity(input: Parameters<LinearApiClient["createAgentActivity"]>[0]): Promise<void> {
@@ -849,6 +1005,63 @@ function inputShapedMarkerConfiguration(marker: { pattern?: string; contains?: s
         },
       },
     ],
+  };
+}
+
+function threadWithAppConfiguration() {
+  const configuration = linearCommentConfiguration();
+  const trigger = configuration.triggers[0]!;
+  return {
+    ...configuration,
+    triggers: [
+      {
+        ...trigger,
+        name: "in-app-thread",
+        filters: { ...trigger.filters, thread_with_app: true },
+      },
+      { ...trigger, name: "plain" },
+    ],
+  };
+}
+
+async function matchedTriggerNames(
+  provider: ReturnType<typeof createLinearTriggerProvider>,
+  trigger: ExternalTrigger,
+): Promise<string[]> {
+  const matches = await provider.match(trigger);
+  if (typeof matches === "string") throw new Error(`expected a match, got ${matches}`);
+  return matches.map((match) => match.triggerName);
+}
+
+/** An accepted run as the comment trigger records it, keyed by the comment it started from. */
+function linearCommentRun(
+  projectId: string,
+  configurationRevisionId: string,
+  commentId: string,
+  providerEventReceiptId: string,
+) {
+  return {
+    organizationId: "hub-org",
+    projectId,
+    configurationRevisionId,
+    providerEventReceiptId,
+    configuredTriggerName: "comment",
+    prompt: "@paseo please draft a fix",
+    inputs: {},
+    triggerContext: {
+      provider: "linear",
+      event: {
+        linear: { comment: { id: commentId, body: "@paseo please draft a fix", parent_id: null } },
+      },
+    },
+    outputContext: {
+      provider: "linear",
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      agentSessionId: null,
+    },
+    deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+    stepIds: ["work"],
   };
 }
 

@@ -47,6 +47,12 @@ export const NormalizedLinearCommentEventSchema = z.object({
     parentId: LinearIdSchema.nullable(),
   }),
   issue: LinearIssueSchema.nullable(),
+  /**
+   * Author IDs of the thread root and its replies (`user.id`, or `botActor.id` for integration
+   * comments). The webhook does not carry them: the trigger provider fills them when a filter
+   * needs them, and leaves them absent when the thread was not or could not be read.
+   */
+  threadAuthorIds: z.array(LinearIdSchema).optional(),
   occurredAt: z.string().datetime().optional(),
 });
 
@@ -62,6 +68,8 @@ export const NormalizedLinearAgentSessionEventSchema = z.object({
     issueId: LinearIdSchema,
     status: z.string().min(1),
     url: z.string().url().optional(),
+    /** The root comment of the thread the session is attached to, when it was opened from one. */
+    rootCommentId: LinearIdSchema.optional(),
   }),
   agentActivity: z
     .object({
@@ -252,6 +260,10 @@ function normalizeAgentSessionEvent(
   const turn = normalizeAgentSessionTurn({ action, payload, session, issue, promptContext });
   if (turn === undefined) return undefined;
   const url = readString(session["url"]);
+  const rootCommentId = firstDefined(
+    readString(asRecord(session["comment"])?.["id"]),
+    readString(session["commentId"]),
+  );
   return NormalizedLinearAgentSessionEventSchema.parse({
     type: "agent_session",
     action,
@@ -264,6 +276,7 @@ function normalizeAgentSessionEvent(
       issueId,
       status,
       ...(url === undefined ? {} : { url }),
+      ...(rootCommentId === undefined ? {} : { rootCommentId }),
     },
     agentActivity: turn.activity ?? null,
     prompt: turn.prompt,

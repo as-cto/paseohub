@@ -1153,6 +1153,11 @@ export interface Database {
     providerEventReceiptId: string,
   ): Promise<TriggerRunRecord[]>;
   listTriggerRunsForProject(projectId: string, limit: number): Promise<TriggerRunRecord[]>;
+  /** Runs whose Linear trigger context names `commentId` as the triggering comment, newest first. */
+  listTriggerRunsForLinearComment(
+    projectId: string,
+    commentId: string,
+  ): Promise<TriggerRunRecord[]>;
   listProjectActivityRuns(
     projectId: string,
     limit: number,
