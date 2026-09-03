@@ -7,6 +7,7 @@ import {
 } from "../agent-executions/completion-token.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import { completesAtIdleDeadline } from "../db/idle-completion.js";
 import { createDaemonDispatchLifecycle } from "./lifecycle.js";
 
 function conversationIntent(keepAlive: boolean): LaunchMachineIntent {
@@ -104,6 +105,18 @@ describe("conversational executions", () => {
       // message of a session would find the agent unable to answer.
       assert.deepEqual(execution?.outputEmissions, {});
     }
+  });
+
+  it("ends a finished conversation as a success, not an idle timeout", async () => {
+    const { database, executionId, token, lifecycle } = await liveExecution(true);
+    await emitReply(database, executionId);
+    await lifecycle.completeAgentExecutionFromCallback({ executionId, token });
+
+    const execution = await database.findAgentExecutionById(executionId);
+    assert.ok(execution);
+    // Its counters were reset by the turn, so only the acknowledged finish proves the agent
+    // answered. Without this, a conversation that simply ended posted an error into the session.
+    assert.equal(completesAtIdleDeadline(execution), true);
   });
 
   it("still completes an execution that does not carry a conversation", async () => {
