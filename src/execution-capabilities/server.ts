@@ -224,6 +224,11 @@ async function finishExecutionCall(
       token,
       ...(output === undefined ? {} : { output }),
     });
+    // A conversational execution stays `running` on purpose: the turn ended, the conversation did
+    // not. Treating that as a failure would tell the agent its answer did not land.
+    if (execution.launchIntent?.keepAliveBetweenTurns === true && completed.status === "running") {
+      return toolSuccess("Turn finished. This session stays open; the next message reaches you.");
+    }
     if (completed.status !== "succeeded") {
       reportFailure(
         new Error(`execution completion ended with status ${completed.status}`),

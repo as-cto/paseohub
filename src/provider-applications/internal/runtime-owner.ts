@@ -485,6 +485,10 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
         invoke((trigger) => trigger.materializeLaunch?.(input) ?? Promise.resolve({})),
       materializeContext: (input) =>
         invoke((trigger) => trigger.materializeContext?.(input) ?? Promise.resolve(undefined)),
+      // Synchronous by design: the lifecycle asks this on the completion path, where an await on
+      // a provider lease would sit between an agent's `finish_execution` and its answer.
+      keepsExecutionAliveBetweenTurns: (triggerContext) =>
+        current().trigger.keepsExecutionAliveBetweenTurns?.(triggerContext) === true,
       onDispatchAccepted: (triggerContext, outputContext, reactionState) =>
         invoke(
           (trigger) =>

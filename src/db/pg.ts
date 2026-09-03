@@ -2115,6 +2115,43 @@ class PgDatabase implements Database {
     }
   }
 
+  async beginAgentExecutionTurn(
+    executionId: string,
+    startedAt: Date,
+  ): Promise<AgentExecutionRecord | undefined> {
+    try {
+      return await this.pool.transaction(async (client) => {
+        const selected = await client.query<AgentExecutionRow>(
+          `select * from agent_executions where id = $1 for update`,
+          [executionId],
+        );
+        const row = selected.rows[0];
+        if (row === undefined) return undefined;
+        const execution = toAgentExecutionRecord(row);
+        if (execution.status !== "spawning" && execution.status !== "running") return undefined;
+        // Pending attempts belong to the turn that just ended; leaving them would count against
+        // the new turn's allowance and, if one had failed, condemn a turn that has not started.
+        const attempts = Object.fromEntries(
+          Object.entries(execution.outputDeliveryAttempts).filter(
+            ([, attempt]) => attempt.status === "pending" && attempt.leaseExpiresAt > startedAt,
+          ),
+        );
+        const updated = await client.query<AgentExecutionRow>(
+          `update agent_executions
+             set output_emissions = '{}'::jsonb,
+                 output_delivery_attempts = $2::jsonb
+           where id = $1
+           returning *`,
+          [executionId, JSON.stringify(attempts)],
+        );
+        const updatedRow = updated.rows[0];
+        return updatedRow === undefined ? undefined : toAgentExecutionRecord(updatedRow);
+      });
+    } catch (error) {
+      throw toDatabaseError(error);
+    }
+  }
+
   async completeAgentExecutionOutput(
     executionId: string,
     attemptId: string,

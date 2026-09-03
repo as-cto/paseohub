@@ -936,6 +936,9 @@ export class DaemonDispatchLifecycle {
     if (currentExecution.launchIntent?.outputSchema !== undefined) {
       validateStructuredOutput(currentExecution.launchIntent.outputSchema, input.output);
     }
+    if (currentExecution.launchIntent?.keepAliveBetweenTurns === true) {
+      return await this.endConversationTurn(currentExecution);
+    }
     this.clearExecutionDeadline(input.executionId);
     const execution = await this.completeAgentExecution(input.executionId, {
       completedByAgent: true,
@@ -952,6 +955,34 @@ export class DaemonDispatchLifecycle {
       throw new AgentExecutionCompletionFailure("expired");
     }
     return execution;
+  }
+
+  /**
+   * Ends a turn without ending the conversation.
+   *
+   * `finish_execution` normally completes the execution, which archives the agent — and with it
+   * everything it had read and worked out. For a conversational surface that is the wrong
+   * boundary: the user's next message belongs to the same exchange, so the agent stays alive and
+   * receives it through `promptExecution`, with its context intact.
+   *
+   * The execution still ends, on the deadlines it already had: idle (no message for the
+   * configured timeout) or hard (the step's `max_runtime`). Nothing here makes it immortal; it
+   * only stops treating one answer as the end of the conversation.
+   */
+  private async endConversationTurn(
+    execution: AgentExecutionRecord,
+  ): Promise<AgentExecutionRecord> {
+    const observedAt = new Date(this.now());
+    const opened = await this.options.database.beginAgentExecutionTurn(execution.id, observedAt);
+    await this.options.database.recordAgentExecutionHubAcknowledgement(execution.id, {
+      kind: "finish_execution",
+      status: "completed",
+      observedAt,
+    });
+    // The idle deadline now measures silence between turns, not within one: the agent has
+    // answered and is waiting for the user.
+    await this.refreshAgentIdleDeadline(execution.id, observedAt);
+    return opened ?? execution;
   }
 
   /**

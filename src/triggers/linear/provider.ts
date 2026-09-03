@@ -301,7 +301,11 @@ export function createLinearTriggerProvider(
       // `bypassPermissions` on a private repository, so it must clear exactly the checks a new run
       // clears — `from_users`, team, connection. The `stop` path above skips them; this one must
       // not, and the difference is on purpose.
-      const steered = await steerLiveLinearSession(options, externalTrigger, event);
+      const steered = await steerLiveLinearSession(
+        { ...options, resetMirror: (id) => mirrors.set(id, createLinearMirrorState()) },
+        externalTrigger,
+        event,
+      );
       if (steered) return "steered_into_live_session";
       const superseded = await settleLinearCommentSessionDuplicate(
         options,
@@ -391,6 +395,11 @@ export function createLinearTriggerProvider(
         );
         return linearThreadContext(linear, "unavailable", [root]);
       }
+    },
+    keepsExecutionAliveBetweenTurns(triggerContext) {
+      // Only agent sessions. A comment-triggered run answers once and is done; a session is a
+      // panel the user keeps writing into, and Linear treats it as one conversation.
+      return triggerContext.event.linear.agent_session !== null;
     },
     async onDispatchAccepted(triggerContext, _outputContext, reactionState) {
       const agentSession = triggerContext.event.linear.agent_session;
@@ -764,7 +773,10 @@ async function supersedeLinearCommentRuns(
  * behaviour that existed before this path.
  */
 async function steerLiveLinearSession(
-  options: { executions?: TriggerProviderExecutionControl },
+  options: {
+    executions?: TriggerProviderExecutionControl;
+    resetMirror?: (agentSessionId: string) => void;
+  },
   externalTrigger: ExternalTrigger,
   event: NormalizedLinearEvent,
 ): Promise<boolean> {
@@ -782,6 +794,10 @@ async function steerLiveLinearSession(
     matches: (work) => readLinearAgentSessionId(work.outputContext) === agentSessionId,
   });
   if (result.delivered) {
+    // A steered turn never passes through `onDispatchAccepted`, so the mirror's per-turn budget
+    // has to be reopened here — otherwise a long conversation would spend one turn's allowance of
+    // activities and go quiet for the rest of the session.
+    options.resetMirror?.(agentSessionId);
     logger.info(
       { agentSessionId, deliveryId: externalTrigger.deliveryId },
       "linear.session.prompt.steered",

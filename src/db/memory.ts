@@ -1862,6 +1862,28 @@ class MemoryDatabase implements Database {
     return attempt;
   }
 
+  async beginAgentExecutionTurn(
+    executionId: string,
+    startedAt: Date,
+  ): Promise<AgentExecutionRecord | undefined> {
+    const execution = this.agentExecutions.get(executionId);
+    if (execution === undefined) return undefined;
+    if (execution.status !== "spawning" && execution.status !== "running") return undefined;
+    const updated: AgentExecutionRecord = {
+      ...execution,
+      outputEmissions: {},
+      // Pending attempts belong to the turn that just ended; leaving them would count against the
+      // new turn's allowance and, if one had failed, condemn a turn that has not started.
+      outputDeliveryAttempts: Object.fromEntries(
+        Object.entries(execution.outputDeliveryAttempts).filter(
+          ([, attempt]) => attempt.status === "pending" && attempt.leaseExpiresAt > startedAt,
+        ),
+      ),
+    };
+    this.agentExecutions.set(executionId, updated);
+    return updated;
+  }
+
   async completeAgentExecutionOutput(
     executionId: string,
     attemptId: string,

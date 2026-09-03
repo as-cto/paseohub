@@ -150,6 +150,15 @@ export interface TriggerProvider<
   materializeContext?(
     launch: TriggerContextMaterialization<TriggerContext>,
   ): Promise<MaterializedContext>;
+  /**
+   * Whether an execution for this context should survive the end of a turn.
+   *
+   * True for a conversation the user keeps writing into (a Linear agent session), false for a
+   * surface that answers once (a Slack message, a GitHub comment). When true, `finish_execution`
+   * ends the turn and leaves the agent alive, so the next message reaches it with its context
+   * intact instead of starting a cold agent and replaying the thread as text.
+   */
+  keepsExecutionAliveBetweenTurns?(triggerContext: TriggerContext): boolean;
   onDispatchAccepted?(
     triggerContext: TriggerContext,
     outputContext: OutputContext,

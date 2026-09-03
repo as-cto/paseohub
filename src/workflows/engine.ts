@@ -513,6 +513,10 @@ export class DurableWorkflowEngine {
         stepRunId,
         deadlineAt,
         executionId,
+        providerForTriggerContext(
+          this.options.providers ?? [],
+          run.triggerContext,
+        )?.keepsExecutionAliveBetweenTurns?.(run.triggerContext) === true,
       );
     } catch (error) {
       if (!(error instanceof ExpressionEvaluationError)) throw error;
@@ -893,6 +897,7 @@ function buildStepIntent(
   stepRunId: string,
   deadlineAt: Date,
   executionId: string,
+  keepAliveBetweenTurns = false,
 ): LaunchMachineIntent {
   const environmentName = authorityString(
     renderExpressionTemplate(step.environment, context),
@@ -937,6 +942,7 @@ function buildStepIntent(
       timeoutMs: step.maxRuntimeMs,
       idleTimeoutMs: step.idleTimeoutMs,
       autoArchive: step.autoArchive,
+      ...(keepAliveBetweenTurns ? { keepAliveBetweenTurns: true } : {}),
       triggerContext: run.triggerContext,
       outputContext: run.outputContext,
       configurationRevisionId: run.configurationRevisionId,

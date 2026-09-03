@@ -1349,6 +1349,18 @@ export interface Database {
     attemptId: string,
     completedAt: Date,
   ): Promise<AgentExecutionRecord | undefined>;
+  /**
+   * Opens a new turn on a live execution: its output counters go back to zero.
+   *
+   * A conversational execution outlives its turns, so the per-turn allowances declared by
+   * `allow_outputs` (`max: 3` for a Linear reply) have to be per turn as well — otherwise the
+   * fourth message of a session would find the agent unable to answer, having spent a budget
+   * meant for one exchange over the whole conversation.
+   */
+  beginAgentExecutionTurn(
+    executionId: string,
+    startedAt: Date,
+  ): Promise<AgentExecutionRecord | undefined>;
   failAgentExecutionOutput(
     executionId: string,
     attemptId: string,
