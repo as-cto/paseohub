@@ -3,6 +3,7 @@ import type { JsonValue } from "../config/compiler.js";
 import type { WorktreeTarget } from "../config/index.js";
 import type { InvocationParseResult } from "./invocation.js";
 import type { ProviderEventDropReasonCode } from "./drop-reason.js";
+import type { HubExecutionAgentStreamEvent } from "../hub/protocol.js";
 
 export interface ExternalTrigger {
   providerEventReceiptId: string;
@@ -171,6 +172,24 @@ export interface TriggerProvider<
     reason: string,
     reactionState?: TriggerProviderReactionState,
   ): Promise<TriggerProviderReactionResult>;
+  /**
+   * Called for every agent stream event of a live execution: assistant text, reasoning, tool
+   * calls, turn boundaries.
+   *
+   * The daemon already streams these to Hub, which until now only used them to push back the idle
+   * deadline. A provider whose surface is a live session panel (Linear) can mirror them so the
+   * user watches the work instead of a spinner; providers whose surface is a single message
+   * (Slack, GitHub) simply do not implement this.
+   *
+   * Contract: called in stream order, one execution at a time, and never awaited by the dispatch
+   * path in a way that can fail it — an implementation that throws is reported and ignored. It
+   * must be cheap: an agent emits hundreds of events per turn.
+   */
+  onAgentStreamEvent?(
+    triggerContext: TriggerContext,
+    outputContext: OutputContext,
+    event: HubExecutionAgentStreamEvent,
+  ): Promise<void>;
   onAgentExecutionTerminal?(executionId: string, triggerContext: TriggerContext): Promise<void>;
   onMachineTerminated?(
     triggerContext: TriggerContext,

@@ -274,10 +274,22 @@ export interface LinearAgentActivityHistory {
   complete: boolean;
 }
 
-export interface LinearAgentActivityContent {
-  type: "thought" | "response" | "error" | "elicitation";
-  body: string;
-}
+export type LinearAgentActivityContent =
+  | {
+      type: "thought" | "response" | "error" | "elicitation";
+      body: string;
+    }
+  /**
+   * What the agent DID, as opposed to what it said. Linear renders it as a labelled step with
+   * its parameter, and folds it into the session timeline. `result` is optional because an
+   * action is posted when it starts, before its outcome is known.
+   */
+  | {
+      type: "action";
+      action: string;
+      parameter: string;
+      result?: string;
+    };
 
 /** Linear renders a `select` elicitation as a choice list built from `signalMetadata.options`. */
 export type LinearAgentActivitySignal = "select";

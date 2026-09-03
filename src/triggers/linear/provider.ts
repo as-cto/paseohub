@@ -33,6 +33,11 @@ import {
   readLinearCommentInvocationParserMessage,
 } from "./match.js";
 import { LINEAR_REPLY_OUTPUT_TYPE } from "./reply.js";
+import {
+  createLinearMirrorState,
+  planLinearMirrorActivities,
+  type LinearMirrorState,
+} from "./mirror.js";
 
 export interface LinearOutputContext {
   provider: "linear";
@@ -148,6 +153,63 @@ export interface LinearTriggerProviderOptions {
 export function createLinearTriggerProvider(
   options: LinearTriggerProviderOptions,
 ): TriggerProvider<"linear", LinearTriggerContext, LinearOutputContext, LinearMaterializedContext> {
+  /**
+   * Live mirror state, one entry per Linear agent session.
+   *
+   * Keyed by session rather than by execution because the panel is the session: what must not be
+   * posted twice, or out of order, is defined by the thread the user reads. Each turn resets its
+   * budget in `onDispatchAccepted`, and `onAgentExecutionTerminal` drops the entry.
+   */
+  const mirrors = new Map<string, LinearMirrorState>();
+  /**
+   * One in-flight post per session, chained.
+   *
+   * Stream events arrive faster than Linear answers. Without this chain the activities would race
+   * and land shuffled, which in a transcript is worse than being late.
+   */
+  const mirrorQueues = new Map<string, Promise<void>>();
+
+  const mirrorActivities = (
+    linearOrganizationId: string,
+    agentSessionId: string,
+    event: Parameters<NonNullable<TriggerProvider["onAgentStreamEvent"]>>[2],
+  ): Promise<void> => {
+    const client = options.client;
+    if (client === undefined) return Promise.resolve();
+    const state = mirrors.get(agentSessionId);
+    if (state === undefined) return Promise.resolve();
+    const planned = planLinearMirrorActivities(event, state);
+    if (planned.length === 0) return Promise.resolve();
+    const queued = (mirrorQueues.get(agentSessionId) ?? Promise.resolve())
+      .then(async () => {
+        for (const content of planned) {
+          await client.createAgentActivity({
+            linearOrganizationId,
+            agentSessionId,
+            content,
+            // Actions are ephemeral, thoughts are not. An action is a transient state — "running
+            // bun test" is worth showing while it runs and worth nothing next month — whereas the
+            // agent's reasoning is the part someone rereads when they ask why it did that. Making
+            // every step permanent would leave fifty rows of noise in the issue forever.
+            ephemeral: content.type === "action",
+          });
+        }
+        return undefined;
+      })
+      .catch((error: unknown) => {
+        reportFailure(
+          error,
+          { operation: "linear.session.mirror", component: "triggers", provider: "linear" },
+          { diagnostic: { linearOrganizationId, agentSessionId } },
+        );
+      })
+      .finally(() => {
+        if (mirrorQueues.get(agentSessionId) === queued) mirrorQueues.delete(agentSessionId);
+      });
+    mirrorQueues.set(agentSessionId, queued);
+    return queued;
+  };
+
   return {
     name: "linear",
     eventNames: ["linear.issue", "linear.comment", "linear.agent_session"],
@@ -329,6 +391,9 @@ export function createLinearTriggerProvider(
       const agentSession = triggerContext.event.linear.agent_session;
       if (agentSession === null || options.client === undefined) return reactionState;
       if (linearAgentReactionPhase(reactionState) !== undefined) return reactionState;
+      // A fresh budget per turn: the ceiling protects one turn from flooding the issue, it is not
+      // a lifetime quota on the conversation.
+      mirrors.set(agentSession.id, createLinearMirrorState());
       await options.client.createAgentActivity({
         linearOrganizationId: triggerContext.event.linear.organization.id,
         agentSessionId: agentSession.id,
@@ -367,6 +432,26 @@ export function createLinearTriggerProvider(
     },
     async onMachineTerminated(triggerContext, reason, reactionState) {
       return notifyLinearAgentFailure(options.client, triggerContext, reason, reactionState);
+    },
+    /**
+     * Mirrors the running agent into the session panel.
+     *
+     * Only sessions have a panel to mirror into: a comment-triggered run answers with a single
+     * comment, and posting its every step would turn one reply into fifty.
+     */
+    async onAgentStreamEvent(triggerContext, _outputContext, event) {
+      const agentSession = triggerContext.event.linear.agent_session;
+      if (agentSession === null) return;
+      await mirrorActivities(triggerContext.event.linear.organization.id, agentSession.id, event);
+    },
+    async onAgentExecutionTerminal(_executionId, triggerContext) {
+      const agentSession = triggerContext.event.linear.agent_session;
+      if (agentSession === null) return;
+      // Drains before dropping: the last activities of a turn are the ones that explain how it
+      // ended, and losing them to a cleanup would be the wrong trade.
+      await mirrorQueues.get(agentSession.id);
+      mirrors.delete(agentSession.id);
+      mirrorQueues.delete(agentSession.id);
     },
   };
 }

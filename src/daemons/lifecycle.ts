@@ -159,6 +159,12 @@ export class AgentExecutionOutputValidationFailure extends Error {
   }
 }
 
+interface StreamMirrorTarget {
+  provider: TriggerProvider;
+  triggerContext: unknown;
+  outputContext: unknown;
+}
+
 export class DaemonDispatchLifecycle {
   private readonly providersByName: Map<string, TriggerProvider>;
   private readonly executionCapabilities: OutputExecutorRegistry;
@@ -173,6 +179,14 @@ export class DaemonDispatchLifecycle {
   private readonly reconcilingHubActions = new Map<string, Promise<void>>();
   private readonly daemonRecoveries = new Set<Promise<void>>();
   private readonly recoveredSubscriptions = new Map<string, () => void>();
+  /**
+   * Provider mirror targets, resolved once per execution.
+   *
+   * `null` means "resolved, and this execution has nothing to mirror" — the common case, and the
+   * reason this is a cache and not a lookup: an agent emits hundreds of stream events per turn and
+   * none of them should cost a database read.
+   */
+  private readonly streamMirrorsByExecution = new Map<string, StreamMirrorTarget | null>();
   private stopping = false;
 
   constructor(private readonly options: DaemonDispatchLifecycleOptions) {
@@ -647,6 +661,7 @@ export class DaemonDispatchLifecycle {
     event: DaemonAgentStreamEvent,
     observedAt: Date,
   ): Promise<void> {
+    await this.mirrorAgentStreamEvent(executionId, event);
     switch (event.type) {
       case "thread_started":
         if (await this.refreshAgentIdleDeadline(executionId, observedAt)) {
@@ -1866,9 +1881,54 @@ export class DaemonDispatchLifecycle {
     }
   }
 
+  /**
+   * Hands a stream event to the provider that wants to mirror it.
+   *
+   * Deliberately never rethrows: a provider that cannot post a thought must not fail the agent
+   * execution that produced it. The failure is reported, the run continues, and the panel is
+   * merely less detailed.
+   */
+  private async mirrorAgentStreamEvent(
+    executionId: string,
+    event: DaemonAgentStreamEvent,
+  ): Promise<void> {
+    try {
+      const target = await this.streamMirrorTarget(executionId);
+      if (target === null) return;
+      await target.provider.onAgentStreamEvent?.(
+        target.triggerContext,
+        target.outputContext,
+        event,
+      );
+    } catch (error: unknown) {
+      this.report(error, "daemon.provider.stream-mirror", { executionId });
+    }
+  }
+
+  private async streamMirrorTarget(executionId: string): Promise<StreamMirrorTarget | null> {
+    const cached = this.streamMirrorsByExecution.get(executionId);
+    if (cached !== undefined) return cached;
+    const execution = await this.options.database.findAgentExecutionById(executionId);
+    const provider =
+      execution === undefined
+        ? undefined
+        : this.findProviderForTriggerContext(execution.triggerContext);
+    const target: StreamMirrorTarget | null =
+      execution === undefined || provider?.onAgentStreamEvent === undefined
+        ? null
+        : {
+            provider,
+            triggerContext: execution.triggerContext,
+            outputContext: execution.outputContext,
+          };
+    this.streamMirrorsByExecution.set(executionId, target);
+    return target;
+  }
+
   private releaseExecutionResources(executionId: string): void {
     this.recoveredSubscriptions.get(executionId)?.();
     this.recoveredSubscriptions.delete(executionId);
+    this.streamMirrorsByExecution.delete(executionId);
   }
 
   private async expireExecutionAtCurrentDeadline(
