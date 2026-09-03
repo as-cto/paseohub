@@ -503,6 +503,7 @@ export class DurableWorkflowEngine {
   ): Promise<LaunchMachineIntent | undefined> {
     const database = this.options.database;
     if (database === null) return undefined;
+    const provider = providerForTriggerContext(this.options.providers ?? [], run.triggerContext);
     try {
       return buildStepIntent(
         configuration,
@@ -513,10 +514,8 @@ export class DurableWorkflowEngine {
         stepRunId,
         deadlineAt,
         executionId,
-        providerForTriggerContext(
-          this.options.providers ?? [],
-          run.triggerContext,
-        )?.keepsExecutionAliveBetweenTurns?.(run.triggerContext) === true,
+        provider?.keepsExecutionAliveBetweenTurns?.(run.triggerContext) === true,
+        provider?.workKeyFor?.(run.triggerContext),
       );
     } catch (error) {
       if (!(error instanceof ExpressionEvaluationError)) throw error;
@@ -898,6 +897,7 @@ function buildStepIntent(
   deadlineAt: Date,
   executionId: string,
   keepAliveBetweenTurns = false,
+  workKey?: string,
 ): LaunchMachineIntent {
   const environmentName = authorityString(
     renderExpressionTemplate(step.environment, context),
@@ -928,7 +928,9 @@ function buildStepIntent(
         cwd: environment.cwd,
         ...(environment.worktree === undefined
           ? {}
-          : { worktree: materializeExecutionWorktree(environment.worktree, executionId) }),
+          : {
+              worktree: materializeExecutionWorktree(environment.worktree, executionId, workKey),
+            }),
       },
       ...(step.env === undefined ? {} : { env: step.env }),
       ...(step.github === undefined ? {} : { github: step.github }),
@@ -1047,9 +1049,16 @@ function authorityString(value: string, field: string): string {
   return value;
 }
 
-function materializeExecutionWorktree(worktree: WorktreeTarget, executionId: string) {
+function materializeExecutionWorktree(
+  worktree: WorktreeTarget,
+  executionId: string,
+  workKey?: string,
+) {
   if (worktree.mode !== "branch-off") return worktree;
-  return { ...worktree, newBranch: renderExecutionTemplate(worktree.newBranch, executionId) };
+  return {
+    ...worktree,
+    newBranch: renderExecutionTemplate(worktree.newBranch, executionId, workKey),
+  };
 }
 
 function inputContext(value: unknown): Readonly<Record<string, JsonPrimitive>> {

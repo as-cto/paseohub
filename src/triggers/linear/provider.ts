@@ -405,6 +405,14 @@ export function createLinearTriggerProvider(
         return linearThreadContext(linear, "unavailable", [root]);
       }
     },
+    workKeyFor(triggerContext) {
+      // The issue identifier, lowercased: `pos-33`. It is what a human calls this piece of work,
+      // it is what the branch convention already uses, and it is stable across sessions.
+      const identifier = triggerContext.event.linear.issue?.identifier;
+      return typeof identifier === "string" && identifier.length > 0
+        ? identifier.toLowerCase()
+        : undefined;
+    },
     keepsExecutionAliveBetweenTurns(triggerContext) {
       // Only agent sessions. A comment-triggered run answers once and is done; a session is a
       // panel the user keeps writing into, and Linear treats it as one conversation.

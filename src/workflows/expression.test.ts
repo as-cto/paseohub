@@ -37,3 +37,27 @@ describe("workflow expression context", () => {
     );
   });
 });
+
+describe("worktree templates", () => {
+  it("names a worktree after the work rather than the execution", () => {
+    assert.equal(
+      renderExecutionTemplate("${{ paseo.work.id }}", "execution-1", "pos-33"),
+      "pos-33",
+    );
+  });
+
+  it("refuses a work template on an event that names no work", () => {
+    // Better a configuration error at launch than a worktree silently named after nothing.
+    assert.throws(
+      () => renderExecutionTemplate("${{ paseo.work.id }}", "execution-1"),
+      /work key/u,
+    );
+  });
+
+  it("still supports the execution id", () => {
+    assert.equal(
+      renderExecutionTemplate("run-${{ paseo.execution.id }}", "execution-1", "pos-33"),
+      "run-execution-1",
+    );
+  });
+});

@@ -159,6 +159,14 @@ export interface TriggerProvider<
    * intact instead of starting a cold agent and replaying the thread as text.
    */
   keepsExecutionAliveBetweenTurns?(triggerContext: TriggerContext): boolean;
+  /**
+   * Stable name of the work this event is about — a Linear issue identifier, for instance.
+   *
+   * Used by worktree templates (`paseo.work.id`) so a worktree belongs to the issue rather than
+   * to one execution: every session and every message about that issue then iterates on the same
+   * branch, instead of each cutting a fresh copy of the default branch.
+   */
+  workKeyFor?(triggerContext: TriggerContext): string | undefined;
   onDispatchAccepted?(
     triggerContext: TriggerContext,
     outputContext: OutputContext,

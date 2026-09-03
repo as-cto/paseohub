@@ -3,7 +3,7 @@ import type { JsonPrimitive, JsonValue } from "../config/compiler.js";
 export type ExpressionPath =
   | {
       namespace: "paseo";
-      path: "prompt" | "context" | ["inputs", string] | ["execution", "id"];
+      path: "prompt" | "context" | ["inputs", string] | ["execution", "id"] | ["work", "id"];
     }
   | { namespace: "steps"; stepId: string; path: readonly string[] }
   | { namespace: "values"; name: string };
@@ -26,6 +26,14 @@ export interface ExpressionContext {
   steps: Readonly<Record<string, { status: string; output: unknown }>>;
   values: Readonly<Record<string, Expression>>;
   executionId?: string;
+  /**
+   * Stable name of the thing this event is about — a Linear issue identifier, for instance.
+   *
+   * It is what lets a worktree belong to an issue rather than to an execution: two sessions on
+   * the same issue then share one branch and keep iterating on the same code, instead of each
+   * cutting its own copy from the default branch.
+   */
+  workKey?: string;
 }
 
 export class ExpressionSyntaxError extends Error {
@@ -186,6 +194,9 @@ function parsePaseoPath(parts: readonly string[]): Expression {
   if (parts[1] === "execution" && parts[2] === "id" && parts.length === 3) {
     return { kind: "path", value: { namespace: "paseo", path: ["execution", "id"] } };
   }
+  if (parts[1] === "work" && parts[2] === "id" && parts.length === 3) {
+    return { kind: "path", value: { namespace: "paseo", path: ["work", "id"] } };
+  }
   throw new ExpressionSyntaxError(`unsupported path ${parts.join(".")}`);
 }
 
@@ -247,7 +258,11 @@ export function renderExpressionTemplate(template: string, context: ExpressionCo
   return result;
 }
 
-export function renderExecutionTemplate(template: string, executionId: string): string {
+export function renderExecutionTemplate(
+  template: string,
+  executionId: string,
+  workKey?: string,
+): string {
   validateExecutionTemplate(template);
   return renderExpressionTemplate(template, {
     prompt: "",
@@ -256,18 +271,21 @@ export function renderExecutionTemplate(template: string, executionId: string): 
     steps: {},
     values: {},
     executionId,
+    ...(workKey === undefined ? {} : { workKey }),
   });
 }
 
 export function validateExecutionTemplate(template: string): void {
   for (const path of expressionPathsInTemplate(template)) {
-    if (
-      path.namespace !== "paseo" ||
-      !Array.isArray(path.path) ||
-      path.path[0] !== "execution" ||
-      path.path[1] !== "id"
-    ) {
-      throw new ExpressionSyntaxError("execution templates support only paseo.execution.id paths");
+    const supported =
+      path.namespace === "paseo" &&
+      Array.isArray(path.path) &&
+      path.path[1] === "id" &&
+      (path.path[0] === "execution" || path.path[0] === "work");
+    if (!supported) {
+      throw new ExpressionSyntaxError(
+        "execution templates support only paseo.execution.id and paseo.work.id paths",
+      );
     }
   }
 }
@@ -385,6 +403,12 @@ function readPath(path: ExpressionPath, context: ExpressionContext): JsonValue {
         throw new ExpressionEvaluationError("execution ID is unavailable");
       }
       return context.executionId;
+    }
+    if (path.path[0] === "work") {
+      if (context.workKey === undefined) {
+        throw new ExpressionEvaluationError("work key is unavailable for this event");
+      }
+      return context.workKey;
     }
     return context.inputs[path.path[1]] ?? null;
   }

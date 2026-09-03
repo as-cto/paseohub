@@ -88,7 +88,7 @@ describe("workflow compiler", () => {
         ]);
         assert.match(
           error.message,
-          /unsupported path|execution templates support only paseo\.execution\.id paths/iu,
+          /unsupported path|execution templates support only paseo\.execution\.id and paseo\.work\.id paths/iu,
         );
         return true;
       },
