@@ -438,6 +438,46 @@ function issue(
   };
 }
 
+describe("Linear from_users wildcard", () => {
+  /** The same configuration, with `*` where the agent-session trigger lists actors. */
+  function wildcardConfiguration() {
+    const config = configuration();
+    return {
+      ...config,
+      triggers: config.triggers.map((trigger) =>
+        trigger.name === "agent-session"
+          ? Object.assign({}, trigger, {
+              filters: { project: "project-1", from_users: ["*"] },
+            })
+          : trigger,
+      ),
+    };
+  }
+
+  it("lets anyone in the workspace start an agent", () => {
+    const stranger = agentSessionEvent({ actor: { id: "someone-new", name: "Someone New" } });
+    assert.deepEqual(
+      matchLinearTriggers(wildcardConfiguration(), stranger, undefined, "app-user").map(
+        (match) => match.trigger.name,
+      ),
+      ["agent-session"],
+    );
+  });
+
+  it("never lets the app trigger itself, which would answer its own answer forever", () => {
+    const itself = agentSessionEvent({ actor: { id: "app-user", name: "P Agent" } });
+    assert.deepEqual(
+      matchLinearTriggers(wildcardConfiguration(), itself, undefined, "app-user"),
+      [],
+    );
+  });
+
+  it("still refuses an actor outside an explicit list", () => {
+    const stranger = agentSessionEvent({ actor: { id: "someone-new", name: "Someone New" } });
+    assert.deepEqual(matchLinearTriggers(configuration(), stranger, undefined, "app-user"), []);
+  });
+});
+
 function commentEvent(
   body = "@paseo please investigate",
   parentId: string | null = null,

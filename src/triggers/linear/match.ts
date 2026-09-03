@@ -147,12 +147,12 @@ function matchesTriggerFilter(
     return (
       event.type === "issue" &&
       enteredConfiguredScope(event, trigger.filters, connectionId) &&
-      matchesActorIfPresent(event, trigger.filters?.from_users)
+      matchesActorIfPresent(event, trigger.filters?.from_users, appUserId)
     );
   }
   const issue = event.type === "issue" ? event.issue : event.issue;
   if (issue === null || !matchesIssueScope(issue, trigger.filters, connectionId)) return false;
-  if (!matchesActor(event, trigger.filters?.from_users)) return false;
+  if (!matchesActor(event, trigger.filters?.from_users, appUserId)) return false;
   if (event.type === "comment" && !matchesComment(event, trigger.filters, appUserId)) {
     return false;
   }
@@ -195,16 +195,31 @@ function enteredConfiguredScope(
 function matchesActorIfPresent(
   event: NormalizedLinearEvent,
   allowed: readonly string[] | undefined,
+  appUserId?: string | null,
 ): boolean {
-  return allowed === undefined || allowed.length === 0 || matchesActor(event, allowed);
+  return allowed === undefined || allowed.length === 0 || matchesActor(event, allowed, appUserId);
 }
 
+/**
+ * Who may start an agent, `*` meaning everyone with access to the workspace.
+ *
+ * The wildcard already exists for GitHub triggers; Linear only ever matched explicit ids, so a
+ * team could not simply let its members ask the agent for something without naming each of them.
+ *
+ * It never covers the app itself. The agent's own comments are events like any other, and a
+ * comment trigger that accepted them would answer its own answer, forever. An explicit list makes
+ * that mistake visible; a wildcard would hide it, so the exclusion is enforced here rather than
+ * left to whoever writes the bundle.
+ */
 function matchesActor(
   event: NormalizedLinearEvent,
   allowed: readonly string[] | undefined,
+  appUserId?: string | null,
 ): boolean {
   if (allowed === undefined || allowed.length === 0 || event.actor === null) return false;
-  return allowed.includes(event.actor.id);
+  if (allowed.includes(event.actor.id)) return true;
+  if (!allowed.includes("*")) return false;
+  return typeof appUserId !== "string" || event.actor.id !== appUserId;
 }
 
 function matchesOptionalId(allowed: readonly string[], value: string | null): boolean {
