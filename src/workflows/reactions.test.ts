@@ -336,6 +336,7 @@ async function runTwoStepWorkflow<
       return { id: agentOptions.executionId };
     },
     controlExecution: async () => undefined,
+    promptExecution: () => Promise.resolve({ delivered: false as const, disposition: null }),
   };
   const lifecycle = createDaemonDispatchLifecycle({
     database,

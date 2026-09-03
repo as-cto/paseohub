@@ -225,6 +225,33 @@ export const HubExecutionAgentStreamSchema = z.object({
   }),
 });
 
+/**
+ * A message for an execution's agent, sent while that agent is alive.
+ *
+ * Mirrors `@getpaseo/protocol`. Hub could only create, interrupt or archive an agent; a
+ * conversational surface (a Linear agent session) had no way to reach the one it already started,
+ * so every message started a new agent with the thread replayed as text.
+ */
+export const HubExecutionAgentPromptRequestSchema = z.object({
+  type: z.literal("hub.execution.agent.prompt.request"),
+  requestId: z.string(),
+  executionId: z.string(),
+  prompt: z.string(),
+  activeTurnBehavior: z.enum(["interrupt", "steer"]).optional(),
+});
+
+export const HubExecutionAgentPromptResponseSchema = z.object({
+  type: z.literal("hub.execution.agent.prompt.response"),
+  payload: z.object({
+    requestId: z.string(),
+    executionId: z.string(),
+    /** False when the execution has no live agent left; the caller starts one instead. */
+    delivered: z.boolean(),
+    disposition: z.enum(["out_of_band", "steered", "turn_started"]).nullable(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const HubExecutionControlActionSchema = z.enum(["interrupt", "archive"]);
 
 export const HubExecutionControlRequestSchema = z.object({
@@ -263,6 +290,7 @@ export const HubExecutionOutboundSchema = z.object({
     HubExecutionAgentStreamSchema,
     HubExecutionControlResponseSchema,
     HubExecutionAgentValidateResponseSchema,
+    HubExecutionAgentPromptResponseSchema,
     RpcErrorSchema,
   ]),
 });

@@ -5,6 +5,7 @@ export const PROVIDER_EVENT_DROP_REASON_CODES = [
   "configuration_unavailable",
   "agent_session_stopped",
   "superseded_by_agent_session",
+  "steered_into_live_session",
 ] as const;
 
 export type ProviderEventDropReasonCode = (typeof PROVIDER_EVENT_DROP_REASON_CODES)[number];
@@ -17,6 +18,8 @@ const SUMMARIES: Readonly<Record<ProviderEventDropReasonCode, string>> = {
   agent_session_stopped: "The event stopped the active agent session instead of starting a run.",
   superseded_by_agent_session:
     "The comment behind the event already opened or prompted an agent session, which handles it.",
+  steered_into_live_session:
+    "The message was delivered to the agent already running for this session, which answers it.",
 };
 
 export function isProviderEventDropReasonCode(value: string): value is ProviderEventDropReasonCode {
@@ -25,9 +28,10 @@ export function isProviderEventDropReasonCode(value: string): value is ProviderE
 
 /**
  * Drop reasons that leave an event unhandled, i.e. worth surfacing as "unrouted" to the
- * organization. `agent_session_stopped` and `superseded_by_agent_session` are deliberately
- * absent: the receipt was handled (it stopped the session, or the session it opened answers
- * for it), it just never became a run. The Postgres query in
+ * organization. `agent_session_stopped`, `superseded_by_agent_session` and
+ * `steered_into_live_session` are deliberately absent: the receipt was handled (it stopped the
+ * session, the session it opened answers for it, or the running agent received it), it just
+ * never became a run. The Postgres query in
  * `listUnroutedProviderEventsForOrganization` lists these same codes as a SQL literal; the
  * `unrouted-provider-events.test.ts` freezes both sides to this list.
  */

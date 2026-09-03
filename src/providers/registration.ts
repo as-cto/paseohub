@@ -32,6 +32,20 @@ export interface TriggerProviderExecutionControl {
     reason: string;
     matches: (work: { outputContext: unknown; triggerRunId: string | null }) => boolean;
   }): Promise<{ stopped: number }>;
+  /**
+   * Delivers a message to the agent of a live execution selected by `matches`.
+   *
+   * The conversational counterpart of `stopActive`: a platform where the user keeps writing into
+   * the same panel (a Linear agent session) can continue the agent it already started instead of
+   * starting another one and replaying the thread as text. `delivered: false` means no live agent
+   * matched — the ordinary case once a turn has ended — and the caller starts a run as before.
+   */
+  promptActive(input: {
+    projectId: string;
+    prompt: string;
+    activeTurnBehavior?: "interrupt" | "steer";
+    matches: (work: { outputContext: unknown; triggerRunId: string | null }) => boolean;
+  }): Promise<{ delivered: boolean }>;
 }
 
 export type TriggerProviderFactory = (

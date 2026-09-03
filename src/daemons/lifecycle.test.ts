@@ -910,6 +910,10 @@ class ManualDeadlineClock implements ExecutionDeadlineClock {
 }
 
 class DispatchConnection implements DaemonConnection {
+  async promptExecution(): Promise<{ delivered: boolean; disposition: null }> {
+    return { delivered: false, disposition: null };
+  }
+
   private readonly handlers = new Set<DaemonEventHandler>();
 
   on(handler: DaemonEventHandler): () => void {
@@ -951,6 +955,10 @@ function createLifecycle(
 }
 
 class AcknowledgementConnection implements DaemonConnection {
+  async promptExecution(): Promise<{ delivered: boolean; disposition: null }> {
+    return { delivered: false, disposition: null };
+  }
+
   readonly actions: DaemonExecutionControlOptions["action"][] = [];
   private readonly handlers = new Set<DaemonEventHandler>();
 

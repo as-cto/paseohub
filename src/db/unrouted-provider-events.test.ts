@@ -12,11 +12,13 @@ import {
   type ProviderEventDropReasonCode,
 } from "../triggers/drop-reason.js";
 
-// A stop receipt was handled (it stopped the session), and so was a comment whose agent session
-// answers for it; neither ever was "unrouted".
+// A stop receipt was handled (it stopped the session), so was a comment whose agent session
+// answers for it, and so was a message steered into the agent already running for its session;
+// none of them ever was "unrouted".
 const HANDLED_DROP_REASON_CODES: readonly ProviderEventDropReasonCode[] = [
   "agent_session_stopped",
   "superseded_by_agent_session",
+  "steered_into_live_session",
 ];
 
 describe("unrouted provider events", () => {

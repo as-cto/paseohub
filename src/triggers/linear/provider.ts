@@ -298,6 +298,12 @@ export function createLinearTriggerProvider(
         }
       }
       if (matches.length === 0) return "trigger_filters_rejected";
+      // Deliberately after the filters. A steer injects text straight into an agent running with
+      // `bypassPermissions` on a private repository, so it must clear exactly the checks a new run
+      // clears — `from_users`, team, connection. The `stop` path above skips them; this one must
+      // not, and the difference is on purpose.
+      const steered = await steerLiveLinearSession(options, externalTrigger, event);
+      if (steered) return "steered_into_live_session";
       const superseded = await settleLinearCommentSessionDuplicate(
         options,
         externalTrigger,
@@ -742,6 +748,49 @@ async function supersedeLinearCommentRuns(
  * second. A session stops the comment runs that beat it; a comment yields to the session
  * receipts that beat its run. Returns the drop reason when the event yields.
  */
+/**
+ * Sends a session's new message to the agent already working on it.
+ *
+ * Linear's session panel is one conversation; Hub answered it with a new agent per message, each
+ * one cold-started and handed the thread replayed as text. Everything the previous agent had in
+ * context — the files it read, what it had already tried — was thrown away between two sentences
+ * of the same exchange.
+ *
+ * Only `prompted` qualifies: `created` is the first message of a session, so there is nothing live
+ * to continue. A delegation therefore keeps its single-turn shape until someone writes into its
+ * panel, which is exactly when it becomes a conversation.
+ *
+ * Returns false whenever no live agent took the message — turn already finished, daemon too old to
+ * support prompting, daemon offline. Every one of those falls back to starting a run, which is the
+ * behaviour that existed before this path.
+ */
+async function steerLiveLinearSession(
+  options: { executions?: TriggerProviderExecutionControl },
+  externalTrigger: ExternalTrigger,
+  event: NormalizedLinearEvent,
+): Promise<boolean> {
+  if (event.type !== "agent_session" || event.action !== "prompted") return false;
+  if (options.executions === undefined) return false;
+  const prompt = event.prompt.trim();
+  if (prompt.length === 0) return false;
+  const agentSessionId = event.agentSession.id;
+  const result = await options.executions.promptActive({
+    projectId: externalTrigger.projectId,
+    prompt,
+    // `steer` rather than `interrupt`: the user adding a precision mid-work expects it to be taken
+    // into account, not to cancel what they asked for a minute earlier.
+    activeTurnBehavior: "steer",
+    matches: (work) => readLinearAgentSessionId(work.outputContext) === agentSessionId,
+  });
+  if (result.delivered) {
+    logger.info(
+      { agentSessionId, deliveryId: externalTrigger.deliveryId },
+      "linear.session.prompt.steered",
+    );
+  }
+  return result.delivered;
+}
+
 async function settleLinearCommentSessionDuplicate(
   options: Pick<LinearTriggerProviderOptions, "database" | "executions">,
   externalTrigger: ExternalTrigger,

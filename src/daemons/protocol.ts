@@ -74,9 +74,29 @@ export type DaemonEvent = DaemonAgentStreamDaemonEvent | DaemonAgentUpdateEvent;
 
 export type DaemonEventHandler = (event: DaemonEvent) => void | Promise<void>;
 
+export interface DaemonExecutionPromptOptions {
+  executionId: string;
+  prompt: string;
+  /** What to do with a turn already in flight. `steer` folds the message into it. */
+  activeTurnBehavior?: "interrupt" | "steer";
+}
+
+export interface DaemonExecutionPromptResult {
+  /** False when the execution has no live agent left; the caller starts a fresh one. */
+  delivered: boolean;
+  disposition: "out_of_band" | "steered" | "turn_started" | null;
+}
+
 export interface DaemonConnection {
   createAgent(options: DaemonCreateAgentOptions): Promise<DaemonAgentSnapshot>;
   controlExecution(options: DaemonExecutionControlOptions): Promise<void>;
+  /**
+   * Sends a message to the agent an execution already owns.
+   *
+   * Rejects with `daemon_prompt_unsupported` against a daemon that predates the capability, so a
+   * caller can fall back rather than hang: the fleet is upgraded one machine at a time.
+   */
+  promptExecution(options: DaemonExecutionPromptOptions): Promise<DaemonExecutionPromptResult>;
   on(handler: DaemonEventHandler): () => void;
 }
 

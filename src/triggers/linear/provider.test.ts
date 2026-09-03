@@ -778,6 +778,7 @@ describe("Linear trigger provider", () => {
       client: new RecordingHistoryClient({ complete: true, comments: [] }),
       database,
       executions: {
+        promptActive: async () => ({ delivered: false }),
         stopActive: async (input) => {
           stops.push(input);
           return { stopped: 1 };
@@ -841,6 +842,7 @@ describe("Linear trigger provider", () => {
           database.listLinearAgentSessionReceiptsForComment(organizationId, commentId),
       },
       executions: {
+        promptActive: async () => ({ delivered: false }),
         stopActive: async (input) => {
           stops.push(input);
           return { stopped: 2 };
@@ -908,6 +910,7 @@ describe("Linear trigger provider", () => {
           database.listLinearAgentSessionReceiptsForComment(organizationId, commentId),
       },
       executions: {
+        promptActive: async () => ({ delivered: false }),
         stopActive: async (input) => {
           stops.push(input);
           return { stopped: 1 };
@@ -947,6 +950,137 @@ describe("Linear trigger provider", () => {
     assert.equal(stops.length, 1);
   });
 
+  it("delivers a session prompt to the agent already running, instead of starting another", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      agentSessionConfiguration(),
+      { organizationId: "hub-org" },
+    );
+    const prompts: Array<{ projectId: string; prompt: string; activeTurnBehavior?: string }> = [];
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client: new RecordingHistoryClient({ complete: true, comments: [] }),
+      database,
+      executions: {
+        promptActive: async (input) => {
+          prompts.push({
+            projectId: input.projectId,
+            prompt: input.prompt,
+            ...(input.activeTurnBehavior === undefined
+              ? {}
+              : { activeTurnBehavior: input.activeTurnBehavior }),
+          });
+          // The live agent matches its own session and nothing else.
+          const matched = input.matches({
+            outputContext: { provider: "linear", agentSessionId: "session-1" },
+            triggerRunId: null,
+          });
+          return { delivered: matched };
+        },
+        stopActive: async () => ({ stopped: 0 }),
+      },
+    });
+
+    const outcome = await provider.match(
+      externalAgentSession(project.id, revision.id, agentSessionEvent()),
+    );
+
+    assert.equal(outcome, "steered_into_live_session");
+    assert.deepEqual(prompts, [
+      { projectId: project.id, prompt: "Please also add tests", activeTurnBehavior: "steer" },
+    ]);
+  });
+
+  it("starts a run when no live agent takes the session prompt", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      agentSessionConfiguration(),
+      { organizationId: "hub-org" },
+    );
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client: new RecordingHistoryClient({ complete: true, comments: [] }),
+      database,
+      executions: {
+        promptActive: async () => ({ delivered: false }),
+        stopActive: async () => ({ stopped: 0 }),
+      },
+    });
+
+    const outcome = await provider.match(
+      externalAgentSession(project.id, revision.id, agentSessionEvent()),
+    );
+
+    if (typeof outcome === "string") throw new Error(`expected a match, got ${outcome}`);
+    assert.equal(outcome.length, 1);
+  });
+
+  it("never steers an event the trigger filters rejected", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      agentSessionConfiguration(),
+      { organizationId: "hub-org" },
+    );
+    let prompted = 0;
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client: new RecordingHistoryClient({ complete: true, comments: [] }),
+      database,
+      executions: {
+        promptActive: async () => {
+          prompted += 1;
+          return { delivered: true };
+        },
+        stopActive: async () => ({ stopped: 0 }),
+      },
+    });
+
+    // A steer injects text into an agent running with bypassPermissions on a private repository.
+    // An actor outside `from_users` must reach it no more than they can start a run.
+    const outcome = await provider.match(
+      externalAgentSession(
+        project.id,
+        revision.id,
+        agentSessionEvent({ actor: { id: "intruder", name: "Intruder" } }),
+      ),
+    );
+
+    assert.equal(outcome, "trigger_filters_rejected");
+    assert.equal(prompted, 0);
+  });
+
+  it("does not steer the message that opens a session, which has nothing live to continue", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      agentSessionConfiguration(),
+      { organizationId: "hub-org" },
+    );
+    let prompted = 0;
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client: new RecordingHistoryClient({ complete: true, comments: [] }),
+      database,
+      executions: {
+        promptActive: async () => {
+          prompted += 1;
+          return { delivered: true };
+        },
+        stopActive: async () => ({ stopped: 0 }),
+      },
+    });
+
+    const outcome = await provider.match(
+      externalAgentSession(project.id, revision.id, agentSessionEvent({ action: "created" })),
+    );
+
+    if (typeof outcome === "string") throw new Error(`expected a match, got ${outcome}`);
+    assert.equal(prompted, 0);
+  });
+
   it("stops nothing when no comment run preceded the agent session", async () => {
     const database = createMemoryDatabase();
     const { project, revision, store } = await createActiveProjectConfiguration(
@@ -963,6 +1097,7 @@ describe("Linear trigger provider", () => {
       client: new RecordingHistoryClient({ complete: true, comments: [] }),
       database,
       executions: {
+        promptActive: async () => ({ delivered: false }),
         stopActive: async () => {
           stops += 1;
           return { stopped: 0 };
@@ -1099,6 +1234,7 @@ describe("Linear trigger provider", () => {
       configurationStoreForProject: () => store,
       client,
       executions: {
+        promptActive: async () => ({ delivered: false }),
         stopActive: async (input) => {
           stops.push(input);
           return { stopped: 1 };
@@ -1162,6 +1298,7 @@ describe("Linear trigger provider", () => {
       configurationStoreForProject: () => store,
       client,
       executions: {
+        promptActive: async () => ({ delivered: false }),
         stopActive: async () => {
           stops += 1;
           return { stopped: 0 };
@@ -1186,6 +1323,7 @@ describe("Linear trigger provider", () => {
       configurationStoreForProject: () => store,
       client,
       executions: {
+        promptActive: async () => ({ delivered: false }),
         stopActive: () => Promise.reject(new Error("execution control unavailable")),
       },
     });

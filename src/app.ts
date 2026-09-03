@@ -440,6 +440,13 @@ function executionControlFor(
       const stopped = await current.stopAgentExecutions(input);
       return { stopped: stopped.executions.length + stopped.runs.length };
     },
+    promptActive: async (input) => {
+      const current = daemonModule()?.lifecycle;
+      if (current === undefined) {
+        throw new Error("execution control is unavailable before the daemon module");
+      }
+      return current.promptAgentExecutions(input);
+    },
   };
 }
 

@@ -14,6 +14,8 @@ import {
   HubExecutionAgentValidateResponseSchema,
   HubExecutionAgentStreamSchema,
   HubExecutionAgentUpdateSchema,
+  HubExecutionAgentPromptRequestSchema,
+  HubExecutionAgentPromptResponseSchema,
   HubExecutionControlRequestSchema,
   HubExecutionControlResponseSchema,
   HubExecutionOutboundSchema,
@@ -27,6 +29,8 @@ import {
   type DaemonAgentSnapshot,
   type DaemonCreateAgentOptions,
   type DaemonExecutionControlOptions,
+  type DaemonExecutionPromptOptions,
+  type DaemonExecutionPromptResult,
   type DaemonEventHandler,
 } from "./protocol.js";
 
@@ -45,6 +49,13 @@ interface PendingControlRequest {
   resolve(): void;
   reject(error: Error): void;
 }
+interface PendingPromptRequest {
+  kind: "prompt";
+  generation: number;
+  executionId: string;
+  resolve(value: DaemonExecutionPromptResult): void;
+  reject(error: Error): void;
+}
 interface PendingAgentValidationRequest {
   kind: "agent-validation";
   generation: number;
@@ -55,7 +66,11 @@ interface AgentValidationIssue {
   path: readonly (string | number)[];
   message: string;
 }
-type PendingRequest = PendingCreateRequest | PendingControlRequest | PendingAgentValidationRequest;
+type PendingRequest =
+  | PendingCreateRequest
+  | PendingControlRequest
+  | PendingPromptRequest
+  | PendingAgentValidationRequest;
 interface ActiveSocket {
   generation: number;
   socket: WebSocket;
@@ -68,6 +83,14 @@ export type DaemonSessionProtocol = "legacy" | "session-v1";
 
 const DAEMON_SESSION_PROTOCOL_HEADER = "x-paseo-session-protocol";
 const DAEMON_SESSION_PROTOCOL_VERSION = "1";
+
+/**
+ * How long Hub waits for a daemon to answer a prompt request.
+ *
+ * Short on purpose: the caller is a person's message in a Linear session, and falling back to a
+ * fresh agent after a few seconds beats waiting on a daemon that will never answer.
+ */
+const DAEMON_PROMPT_TIMEOUT_MS = 10_000;
 
 type DaemonConnectedHandler = (daemon: DaemonRecord) => void | Promise<void>;
 type DaemonRevokedHandler = (daemon: DaemonRecord) => void | Promise<void>;
@@ -152,6 +175,7 @@ export class ActiveDaemonRegistry {
     return {
       createAgent: (options) => this.createAgent(daemonId, options),
       controlExecution: (options) => this.controlExecution(daemonId, options),
+      promptExecution: (options) => this.promptExecution(daemonId, options),
       on: (handler) => {
         const subscribers = this.subscribersFor(daemonId);
         subscribers.add(handler);
@@ -289,6 +313,56 @@ export class ActiveDaemonRegistry {
     });
   }
 
+  /**
+   * Sends a message to the agent an execution already owns.
+   *
+   * The timeout is the point: a daemon that predates this message answers `rpc_error` and rejects
+   * the promise, but a daemon that silently ignores it would leave the caller waiting forever —
+   * and the caller here is a user's Linear message. Rejecting after a few seconds turns that into
+   * a fallback (start a fresh agent) instead of a message that never lands.
+   */
+  private promptExecution(
+    daemonId: string,
+    options: DaemonExecutionPromptOptions,
+  ): Promise<DaemonExecutionPromptResult> {
+    const active = this.active.get(daemonId);
+    if (!active?.ready) return Promise.reject(new Error("daemon_not_connected"));
+    const requestId = randomUUID();
+    const request = HubExecutionAgentPromptRequestSchema.parse({
+      type: "hub.execution.agent.prompt.request",
+      requestId,
+      executionId: options.executionId,
+      prompt: options.prompt,
+      ...(options.activeTurnBehavior === undefined
+        ? {}
+        : { activeTurnBehavior: options.activeTurnBehavior }),
+    });
+    return new Promise<DaemonExecutionPromptResult>((resolve, reject) => {
+      const pending = this.pendingFor(daemonId);
+      const timer = setTimeout(() => {
+        if (pending.get(requestId) !== entry) return;
+        pending.delete(requestId);
+        reject(new Error("daemon_prompt_timeout"));
+      }, DAEMON_PROMPT_TIMEOUT_MS);
+      timer.unref?.();
+      const entry: PendingPromptRequest = {
+        kind: "prompt",
+        generation: active.generation,
+        executionId: options.executionId,
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      };
+      pending.set(requestId, entry);
+      active.socket.send(JSON.stringify({ type: "session", message: request }));
+    });
+  }
+
   private receive(active: ActiveSocket, raw: string): void {
     if (this.active.get(active.daemon.id)?.generation !== active.generation) return;
     const receivedAt = this.clock.nowDate().toISOString();
@@ -315,6 +389,8 @@ export class ActiveDaemonRegistry {
     if (controlled.success) return this.receiveControl(active, controlled.data);
     const validated = HubExecutionAgentValidateResponseSchema.safeParse(message);
     if (validated.success) return this.receiveAgentValidation(active, validated.data);
+    const prompted = HubExecutionAgentPromptResponseSchema.safeParse(message);
+    if (prompted.success) return this.receivePrompt(active, prompted.data);
     const update = HubExecutionAgentUpdateSchema.safeParse(message);
     if (update.success) {
       const event = {
@@ -459,6 +535,31 @@ export class ActiveDaemonRegistry {
       return;
     }
     pending.resolve();
+  }
+
+  private receivePrompt(
+    active: ActiveSocket,
+    response: z.infer<typeof HubExecutionAgentPromptResponseSchema>,
+  ): void {
+    const requests = this.pendingFor(active.daemon.id);
+    const pending = requests.get(response.payload.requestId);
+    if (
+      !pending ||
+      pending.kind !== "prompt" ||
+      pending.generation !== active.generation ||
+      pending.executionId !== response.payload.executionId
+    ) {
+      return;
+    }
+    requests.delete(response.payload.requestId);
+    if (response.payload.error !== null) {
+      pending.reject(new Error(response.payload.error));
+      return;
+    }
+    pending.resolve({
+      delivered: response.payload.delivered,
+      disposition: response.payload.disposition,
+    });
   }
 
   private receiveCreate(

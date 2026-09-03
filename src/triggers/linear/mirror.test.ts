@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 
-import type { HubExecutionAgentStreamEvent } from "../../hub/protocol.js";
+import { HubExecutionAgentStreamEventSchema } from "../../hub/protocol.js";
 import {
   createLinearMirrorState,
   flushLinearMirror,
@@ -30,29 +30,25 @@ describe("Linear session mirror", () => {
 
   it("posts a tool call once, on completion, with a readable label", () => {
     const state = createLinearMirrorState();
-    assert.deepEqual(planLinearMirrorActivities(toolCall("c1", "running"), state), []);
-    assert.deepEqual(planLinearMirrorActivities(toolCall("c1", "completed"), state), [
+    assert.deepEqual(planLinearMirrorActivities(shellCall("c1", "running"), state), []);
+    assert.deepEqual(planLinearMirrorActivities(shellCall("c1", "completed"), state), [
       { type: "action", action: "Ran a command", parameter: "bun run test" },
     ]);
     // A re-emitted completion must not post the same action twice.
-    assert.deepEqual(planLinearMirrorActivities(toolCall("c1", "completed"), state), []);
+    assert.deepEqual(planLinearMirrorActivities(shellCall("c1", "completed"), state), []);
   });
 
   it("reports a failed tool call as a failed action", () => {
     const state = createLinearMirrorState();
     const [activity] = planLinearMirrorActivities(
-      {
-        type: "timeline",
-        provider: "claude",
-        item: {
-          type: "tool_call",
-          callId: "c2",
-          name: "Bash",
-          status: "failed",
-          error: "exit status 1",
-          detail: { type: "shell", command: "bun run build" },
-        },
-      } as unknown as HubExecutionAgentStreamEvent,
+      timeline({
+        type: "tool_call",
+        callId: "c2",
+        name: "Bash",
+        status: "failed",
+        error: "exit status 1",
+        detail: { type: "shell", command: "bun run build" },
+      }),
       state,
     );
     assert.deepEqual(activity, {
@@ -66,18 +62,14 @@ describe("Linear session mirror", () => {
   it("never mirrors the reply body, which Linear is about to render as the response", () => {
     const state = createLinearMirrorState();
     const [activity] = planLinearMirrorActivities(
-      {
-        type: "timeline",
-        provider: "claude",
-        item: {
-          type: "tool_call",
-          callId: "c3",
-          name: "mcp__hub__reply",
-          status: "completed",
-          error: null,
-          detail: { type: "unknown", text: "Voici toute ma réponse, en entier, deux fois." },
-        },
-      } as unknown as HubExecutionAgentStreamEvent,
+      timeline({
+        type: "tool_call",
+        callId: "c3",
+        name: "mcp__hub__reply",
+        status: "completed",
+        error: null,
+        detail: { type: "unknown", text: "Voici toute ma réponse, en entier, deux fois." },
+      }),
       state,
     );
     assert.deepEqual(activity, {
@@ -90,18 +82,14 @@ describe("Linear session mirror", () => {
   it("summarises a file read without publishing the file", () => {
     const state = createLinearMirrorState();
     const [activity] = planLinearMirrorActivities(
-      {
-        type: "timeline",
-        provider: "claude",
-        item: {
-          type: "tool_call",
-          callId: "c4",
-          name: "Read",
-          status: "completed",
-          error: null,
-          detail: { type: "read", filePath: "convex/auth.ts", text: "SECRET CONTENT" },
-        },
-      } as unknown as HubExecutionAgentStreamEvent,
+      timeline({
+        type: "tool_call",
+        callId: "c4",
+        name: "Read",
+        status: "completed",
+        error: null,
+        detail: { type: "read", filePath: "convex/auth.ts", text: "SECRET CONTENT" },
+      }),
       state,
     );
     assert.deepEqual(activity, {
@@ -124,7 +112,7 @@ describe("Linear session mirror", () => {
     const state = createLinearMirrorState();
     const posted: unknown[] = [];
     for (let index = 0; index < LINEAR_MIRROR_ACTIVITY_LIMIT + 20; index++) {
-      posted.push(...planLinearMirrorActivities(toolCall(`call-${index}`, "completed"), state));
+      posted.push(...planLinearMirrorActivities(shellCall(`call-${index}`, "completed"), state));
     }
     assert.equal(posted.length, LINEAR_MIRROR_ACTIVITY_LIMIT);
     assert.deepEqual(posted.at(-1), {
@@ -141,11 +129,11 @@ describe("Linear session mirror", () => {
     assert.deepEqual(planLinearMirrorActivities(turn("turn_started"), state), []);
     assert.deepEqual(
       planLinearMirrorActivities(
-        {
+        HubExecutionAgentStreamEventSchema.parse({
           type: "thread_started",
-          sessionId: "s",
+          sessionId: "session-1",
           provider: "claude",
-        } as HubExecutionAgentStreamEvent,
+        }),
         state,
       ),
       [],
@@ -155,29 +143,29 @@ describe("Linear session mirror", () => {
   });
 });
 
-function message(messageId: string, text: string): HubExecutionAgentStreamEvent {
-  return {
-    type: "timeline",
-    provider: "claude",
-    item: { type: "assistant_message", messageId, text },
-  } as unknown as HubExecutionAgentStreamEvent;
+/**
+ * Builds a stream event the way the daemon sends it: through the very schema Hub validates with,
+ * so a test can never assert on a shape the transport would have rejected.
+ */
+function timeline(item: Record<string, unknown>) {
+  return HubExecutionAgentStreamEventSchema.parse({ type: "timeline", provider: "claude", item });
 }
 
-function toolCall(callId: string, status: string): HubExecutionAgentStreamEvent {
-  return {
-    type: "timeline",
-    provider: "claude",
-    item: {
-      type: "tool_call",
-      callId,
-      name: "Bash",
-      status,
-      error: null,
-      detail: { type: "shell", command: "bun run test" },
-    },
-  } as unknown as HubExecutionAgentStreamEvent;
+function message(messageId: string, text: string) {
+  return timeline({ type: "assistant_message", messageId, text });
 }
 
-function turn(type: "turn_started" | "turn_completed"): HubExecutionAgentStreamEvent {
-  return { type, provider: "claude" } as HubExecutionAgentStreamEvent;
+function shellCall(callId: string, status: string) {
+  return timeline({
+    type: "tool_call",
+    callId,
+    name: "Bash",
+    status,
+    error: null,
+    detail: { type: "shell", command: "bun run test" },
+  });
+}
+
+function turn(type: "turn_started" | "turn_completed") {
+  return HubExecutionAgentStreamEventSchema.parse({ type, provider: "claude" });
 }

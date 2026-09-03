@@ -1256,6 +1256,52 @@ export class DaemonDispatchLifecycle {
     };
   }
 
+  /**
+   * Delivers a message to the live agent of a matching execution.
+   *
+   * The conversational counterpart of `stopAgentExecutions`, and it reuses its selection so both
+   * mean the same thing by "the work behind this session". Only pending executions that reached a
+   * daemon can receive anything; a run still waiting for dispatch has no agent to talk to, and one
+   * already terminal is a finished conversation.
+   *
+   * Never throws for the ordinary outcomes. A daemon that does not support prompting (older than
+   * the capability), one that is disconnected, or one that answers "no live agent" all resolve to
+   * `delivered: false`, because the caller's fallback — start a fresh agent — is correct for every
+   * one of them, and a Linear message must not be lost to a transport detail.
+   */
+  async promptAgentExecutions(input: {
+    projectId: string;
+    prompt: string;
+    activeTurnBehavior?: "interrupt" | "steer";
+    matches: (work: { outputContext: unknown; triggerRunId: string | null }) => boolean;
+  }): Promise<{ delivered: boolean }> {
+    const pending = (await this.options.database.findPendingAgentExecutions()).filter(
+      (execution) => execution.projectId === input.projectId && execution.daemonId !== null,
+    );
+    for (const execution of pending) {
+      const matched = input.matches({
+        outputContext: execution.outputContext,
+        triggerRunId: await this.triggerRunIdOf(execution),
+      });
+      if (!matched || execution.daemonId === null) continue;
+      const connection = this.options.connectionForDaemon(execution.daemonId);
+      if (connection === undefined) continue;
+      try {
+        const result = await connection.promptExecution({
+          executionId: execution.id,
+          prompt: input.prompt,
+          ...(input.activeTurnBehavior === undefined
+            ? {}
+            : { activeTurnBehavior: input.activeTurnBehavior }),
+        });
+        if (result.delivered) return { delivered: true };
+      } catch (error: unknown) {
+        this.report(error, "daemon.execution.prompt", { executionId: execution.id });
+      }
+    }
+    return { delivered: false };
+  }
+
   private async triggerRunIdOf(execution: AgentExecutionRecord): Promise<string | null> {
     if (execution.workflowStepRunId === null) return null;
     const step = await this.options.database.findWorkflowStepRunById(execution.workflowStepRunId);
