@@ -20,6 +20,17 @@ describe("Linear session mirror", () => {
     ]);
   });
 
+  it("assembles a message streamed as deltas", () => {
+    // Claude Code sends "I", then "'ll read the docs." — mirroring the last delta alone published
+    // a thought missing its first word, seen in production on POS-33.
+    const state = createLinearMirrorState();
+    planLinearMirrorActivities(message("m1", "I"), state);
+    planLinearMirrorActivities(message("m1", "'ll read the docs first."), state);
+    assert.deepEqual(flushLinearMirror(state), [
+      { type: "thought", body: "I'll read the docs first." },
+    ]);
+  });
+
   it("flushes the pending message when the agent starts a new one", () => {
     const state = createLinearMirrorState();
     planLinearMirrorActivities(message("m1", "D'abord ceci"), state);

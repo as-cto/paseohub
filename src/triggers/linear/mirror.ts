@@ -32,7 +32,7 @@ export const LINEAR_MIRROR_ACTIVITY_LIMIT = 150;
 const MAX_BODY_LENGTH = 1_500;
 
 /** Longest action parameter (a command, a path, a query). */
-const MAX_PARAMETER_LENGTH = 300;
+const MAX_PARAMETER_LENGTH = 180;
 
 /** Longest action result. Results are outcomes here, never payloads. */
 const MAX_RESULT_LENGTH = 200;
@@ -169,10 +169,8 @@ function planAgentText(
   state: LinearMirrorState,
 ): void {
   const messageId = item.messageId ?? null;
-  // Providers re-emit a growing message under the same id. Replacing rather than appending is
-  // what keeps a streamed message from being posted three times, half-finished each time.
   if (messageId !== null && messageId === state.pendingMessageId) {
-    state.pendingText = item.text ?? "";
+    state.pendingText = extendStreamedText(state.pendingText, item.text ?? "");
     return;
   }
   pushFlush(planned, state);
@@ -198,6 +196,20 @@ function planToolCall(
   // Text before the action: the agent usually narrates, then acts.
   pushFlush(planned, state);
   planned.push(toolCallActivity(item));
+}
+
+/**
+ * Grows a streamed message, whichever way its provider streams it.
+ *
+ * Both shapes exist behind the same `messageId`, and picking one broke the other in production:
+ * Claude Code sends deltas (`"I"`, then `"'ll read the docs"`), so replacing published a thought
+ * missing its first word, while other providers re-send the whole message each time, so appending
+ * would publish it as a staircase. The prefix test tells them apart with no provider knowledge.
+ */
+function extendStreamedText(accumulated: string, incoming: string): string {
+  if (incoming.startsWith(accumulated)) return incoming;
+  if (accumulated.startsWith(incoming)) return accumulated;
+  return accumulated + incoming;
 }
 
 /** Flushes the buffered assistant text as a `thought`, if there is anything worth posting. */
@@ -297,7 +309,7 @@ function describeToolCall(
   detail: z.infer<typeof MirrorToolDetailSchema>,
   name: string,
 ): { action: string; parameter: string } {
-  const action = TOOL_ACTION_LABELS[detail.type ?? ""] ?? describeToolName(name);
+  const known = TOOL_ACTION_LABELS[detail.type ?? ""];
   const parameter =
     detail.command ??
     detail.filePath ??
@@ -306,9 +318,11 @@ function describeToolCall(
     detail.description ??
     detail.subAgentType ??
     detail.label ??
-    detail.text ??
-    name;
-  return { action, parameter };
+    detail.text;
+  // With nothing but the tool's name, "Used a tool | ToolSearch" beats "Used ToolSearch |
+  // ToolSearch": the name belongs on one side or the other, not on both.
+  if (known === undefined) return { action: "Used a tool", parameter: parameter ?? name };
+  return { action: known, parameter: parameter ?? name };
 }
 
 function toolCallResult(
@@ -318,11 +332,6 @@ function toolCallResult(
   if (item.status === "canceled") return "canceled";
   if (item.status === "failed") return failureText(item.error);
   return successText(detail);
-}
-
-/** A raw tool name is the least useful label available, so it is the last resort. */
-function describeToolName(name: string): string {
-  return `Used ${name}`;
 }
 
 function successText(detail: z.infer<typeof MirrorToolDetailSchema>): string | undefined {
