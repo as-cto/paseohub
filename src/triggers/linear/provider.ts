@@ -128,6 +128,15 @@ export const LINEAR_STOPPED_BY_USER_REASON = "stopped_by_user";
 /** Failure reason of a comment-triggered run replaced by the agent session opened for its comment. */
 export const LINEAR_SUPERSEDED_BY_AGENT_SESSION_REASON = "superseded_by_agent_session";
 
+/**
+ * Failure reason of a conversation's execution ended because its next turn had to start fresh.
+ *
+ * Happens against a daemon too old to receive a prompt: the execution is alive but unreachable,
+ * so leaving it running would leave two agents on one session — the one that cannot be reached
+ * and the one about to start. Not an error for the user, so no error activity is posted.
+ */
+export const LINEAR_SUPERSEDED_BY_NEW_TURN_REASON = "superseded_by_new_turn";
+
 export interface LinearTriggerProviderOptions {
   configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
   client?: Pick<
@@ -793,6 +802,16 @@ async function steerLiveLinearSession(
     activeTurnBehavior: "steer",
     matches: (work) => readLinearAgentSessionId(work.outputContext) === agentSessionId,
   });
+  if (!result.delivered && result.live) {
+    // Alive but out of reach: a daemon that predates prompting. A new run is about to start for
+    // this session, and leaving the stranded one running would put two agents on one panel.
+    await options.executions.stopActive({
+      projectId: externalTrigger.projectId,
+      reason: LINEAR_SUPERSEDED_BY_NEW_TURN_REASON,
+      matches: (work) => readLinearAgentSessionId(work.outputContext) === agentSessionId,
+    });
+    return false;
+  }
   if (result.delivered) {
     // A steered turn never passes through `onDispatchAccepted`, so the mirror's per-turn budget
     // has to be reopened here — otherwise a long conversation would spend one turn's allowance of
@@ -942,8 +961,11 @@ async function notifyLinearAgentFailure(
   const agentSession = triggerContext.event.linear.agent_session;
   if (agentSession === null || client === undefined) return reactionState;
   if (linearAgentReactionPhase(reactionState) === "failed") return reactionState;
-  // The stop handler already confirmed the stop; an error would contradict it.
-  if (reason === LINEAR_STOPPED_BY_USER_REASON) return { phase: "failed" };
+  // The stop handler already confirmed the stop; an error would contradict it. A conversation
+  // whose turn restarted elsewhere is not a failure the user should read about either.
+  if (reason === LINEAR_STOPPED_BY_USER_REASON || reason === LINEAR_SUPERSEDED_BY_NEW_TURN_REASON) {
+    return { phase: "failed" };
+  }
   await client.createAgentActivity({
     linearOrganizationId: triggerContext.event.linear.organization.id,
     agentSessionId: agentSession.id,

@@ -778,7 +778,7 @@ describe("Linear trigger provider", () => {
       client: new RecordingHistoryClient({ complete: true, comments: [] }),
       database,
       executions: {
-        promptActive: async () => ({ delivered: false }),
+        promptActive: async () => ({ delivered: false, live: false }),
         stopActive: async (input) => {
           stops.push(input);
           return { stopped: 1 };
@@ -842,7 +842,7 @@ describe("Linear trigger provider", () => {
           database.listLinearAgentSessionReceiptsForComment(organizationId, commentId),
       },
       executions: {
-        promptActive: async () => ({ delivered: false }),
+        promptActive: async () => ({ delivered: false, live: false }),
         stopActive: async (input) => {
           stops.push(input);
           return { stopped: 2 };
@@ -910,7 +910,7 @@ describe("Linear trigger provider", () => {
           database.listLinearAgentSessionReceiptsForComment(organizationId, commentId),
       },
       executions: {
-        promptActive: async () => ({ delivered: false }),
+        promptActive: async () => ({ delivered: false, live: false }),
         stopActive: async (input) => {
           stops.push(input);
           return { stopped: 1 };
@@ -976,7 +976,7 @@ describe("Linear trigger provider", () => {
             outputContext: { provider: "linear", agentSessionId: "session-1" },
             triggerRunId: null,
           });
-          return { delivered: matched };
+          return { delivered: matched, live: matched };
         },
         stopActive: async () => ({ stopped: 0 }),
       },
@@ -992,6 +992,44 @@ describe("Linear trigger provider", () => {
     ]);
   });
 
+  it("ends an unreachable conversation before starting the turn that replaces it", async () => {
+    const database = createMemoryDatabase();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      agentSessionConfiguration(),
+      { organizationId: "hub-org" },
+    );
+    const stops: Array<{ reason: string; matched: boolean }> = [];
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client: new RecordingHistoryClient({ complete: true, comments: [] }),
+      database,
+      executions: {
+        // A daemon that predates prompting: alive, but out of reach.
+        promptActive: async () => ({ delivered: false, live: true }),
+        stopActive: async (input) => {
+          stops.push({
+            reason: input.reason,
+            matched: input.matches({
+              outputContext: { provider: "linear", agentSessionId: "session-1" },
+              triggerRunId: null,
+            }),
+          });
+          return { stopped: 1 };
+        },
+      },
+    });
+
+    const outcome = await provider.match(
+      externalAgentSession(project.id, revision.id, agentSessionEvent()),
+    );
+
+    // Two agents on one session is the failure mode this prevents.
+    assert.deepEqual(stops, [{ reason: "superseded_by_new_turn", matched: true }]);
+    if (typeof outcome === "string") throw new Error(`expected a match, got ${outcome}`);
+    assert.equal(outcome.length, 1);
+  });
+
   it("starts a run when no live agent takes the session prompt", async () => {
     const database = createMemoryDatabase();
     const { project, revision, store } = await createActiveProjectConfiguration(
@@ -1004,7 +1042,7 @@ describe("Linear trigger provider", () => {
       client: new RecordingHistoryClient({ complete: true, comments: [] }),
       database,
       executions: {
-        promptActive: async () => ({ delivered: false }),
+        promptActive: async () => ({ delivered: false, live: false }),
         stopActive: async () => ({ stopped: 0 }),
       },
     });
@@ -1032,7 +1070,7 @@ describe("Linear trigger provider", () => {
       executions: {
         promptActive: async () => {
           prompted += 1;
-          return { delivered: true };
+          return { delivered: true, live: true };
         },
         stopActive: async () => ({ stopped: 0 }),
       },
@@ -1067,7 +1105,7 @@ describe("Linear trigger provider", () => {
       executions: {
         promptActive: async () => {
           prompted += 1;
-          return { delivered: true };
+          return { delivered: true, live: true };
         },
         stopActive: async () => ({ stopped: 0 }),
       },
@@ -1097,7 +1135,7 @@ describe("Linear trigger provider", () => {
       client: new RecordingHistoryClient({ complete: true, comments: [] }),
       database,
       executions: {
-        promptActive: async () => ({ delivered: false }),
+        promptActive: async () => ({ delivered: false, live: false }),
         stopActive: async () => {
           stops += 1;
           return { stopped: 0 };
@@ -1234,7 +1272,7 @@ describe("Linear trigger provider", () => {
       configurationStoreForProject: () => store,
       client,
       executions: {
-        promptActive: async () => ({ delivered: false }),
+        promptActive: async () => ({ delivered: false, live: false }),
         stopActive: async (input) => {
           stops.push(input);
           return { stopped: 1 };
@@ -1298,7 +1336,7 @@ describe("Linear trigger provider", () => {
       configurationStoreForProject: () => store,
       client,
       executions: {
-        promptActive: async () => ({ delivered: false }),
+        promptActive: async () => ({ delivered: false, live: false }),
         stopActive: async () => {
           stops += 1;
           return { stopped: 0 };
@@ -1323,7 +1361,7 @@ describe("Linear trigger provider", () => {
       configurationStoreForProject: () => store,
       client,
       executions: {
-        promptActive: async () => ({ delivered: false }),
+        promptActive: async () => ({ delivered: false, live: false }),
         stopActive: () => Promise.reject(new Error("execution control unavailable")),
       },
     });

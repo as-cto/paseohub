@@ -45,7 +45,17 @@ export interface TriggerProviderExecutionControl {
     prompt: string;
     activeTurnBehavior?: "interrupt" | "steer";
     matches: (work: { outputContext: unknown; triggerRunId: string | null }) => boolean;
-  }): Promise<{ delivered: boolean }>;
+  }): Promise<{
+    delivered: boolean;
+    /**
+     * Whether a live execution matched at all, delivered or not.
+     *
+     * The two failures need opposite handling: nothing live means the previous turn simply ended
+     * (start a run, as always), while something live that refused the message means an agent is
+     * running out of reach — leaving it there would put two agents on one conversation.
+     */
+    live: boolean;
+  }>;
 }
 
 export type TriggerProviderFactory = (

@@ -1305,16 +1305,18 @@ export class DaemonDispatchLifecycle {
     prompt: string;
     activeTurnBehavior?: "interrupt" | "steer";
     matches: (work: { outputContext: unknown; triggerRunId: string | null }) => boolean;
-  }): Promise<{ delivered: boolean }> {
+  }): Promise<{ delivered: boolean; live: boolean }> {
     const pending = (await this.options.database.findPendingAgentExecutions()).filter(
       (execution) => execution.projectId === input.projectId && execution.daemonId !== null,
     );
+    let live = false;
     for (const execution of pending) {
       const matched = input.matches({
         outputContext: execution.outputContext,
         triggerRunId: await this.triggerRunIdOf(execution),
       });
       if (!matched || execution.daemonId === null) continue;
+      live = true;
       const connection = this.options.connectionForDaemon(execution.daemonId);
       if (connection === undefined) continue;
       try {
@@ -1325,12 +1327,12 @@ export class DaemonDispatchLifecycle {
             ? {}
             : { activeTurnBehavior: input.activeTurnBehavior }),
         });
-        if (result.delivered) return { delivered: true };
+        if (result.delivered) return { delivered: true, live: true };
       } catch (error: unknown) {
         this.report(error, "daemon.execution.prompt", { executionId: execution.id });
       }
     }
-    return { delivered: false };
+    return { delivered: false, live };
   }
 
   private async triggerRunIdOf(execution: AgentExecutionRecord): Promise<string | null> {
