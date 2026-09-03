@@ -100,6 +100,14 @@ export interface LinearMirrorState {
   posted: number;
   /** True once the ceiling notice was posted; stops the mirror for good. */
   exhausted: boolean;
+  /**
+   * True once the agent called `finish_execution`.
+   *
+   * Agents narrate what they just did after finishing ("Replied in the thread: …"), which the
+   * mirror published as a thought right under the answer it repeated. After the turn is closed
+   * the agent has nothing left to say to the panel.
+   */
+  turnClosed: boolean;
 }
 
 export function createLinearMirrorState(): LinearMirrorState {
@@ -110,6 +118,7 @@ export function createLinearMirrorState(): LinearMirrorState {
     postedBodies: new Set(),
     posted: 0,
     exhausted: false,
+    turnClosed: false,
   };
 }
 
@@ -149,6 +158,7 @@ function planTimelineItem(
   state: LinearMirrorState,
 ): void {
   if (item.type === "assistant_message" || item.type === "reasoning") {
+    if (state.turnClosed) return;
     planAgentText(item, planned, state);
     return;
   }
@@ -196,6 +206,7 @@ function planToolCall(
   // Text before the action: the agent usually narrates, then acts.
   pushFlush(planned, state);
   planned.push(toolCallActivity(item));
+  if ((item.name ?? "").includes("finish_execution")) state.turnClosed = true;
 }
 
 /**

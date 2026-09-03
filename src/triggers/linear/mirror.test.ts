@@ -135,6 +135,27 @@ describe("Linear session mirror", () => {
     assert.deepEqual(flushLinearMirror(state), []);
   });
 
+  it("stays quiet once the agent has finished its turn", () => {
+    const state = createLinearMirrorState();
+    planLinearMirrorActivities(
+      timeline({
+        type: "tool_call",
+        callId: "finish-1",
+        name: "mcp__hub__finish_execution",
+        status: "completed",
+        error: null,
+        detail: { type: "unknown" },
+      }),
+      state,
+    );
+    // Agents narrate what they just did after finishing; the panel already shows the answer.
+    assert.deepEqual(
+      planLinearMirrorActivities(message("m5", "Réponse postée dans le fil."), state),
+      [],
+    );
+    assert.deepEqual(flushLinearMirror(state), []);
+  });
+
   it("ignores events that carry nothing to show", () => {
     const state = createLinearMirrorState();
     assert.deepEqual(planLinearMirrorActivities(turn("turn_started"), state), []);
