@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { OutputExecutor, OutputToolDefinition } from "../../execution-capabilities/outputs.js";
 import type { LinearApiClient } from "../../providers/linear/client.js";
+import { reportFailure } from "../../failures/index.js";
 
 /**
  * Output type of the Linear reply tool. Shared by the provider registration
@@ -65,6 +66,7 @@ export function createLinearReplyExecutor(options: { client: LinearApiClient }):
     const context = LinearReplyOutputContextSchema.parse(input.outputContext);
     if (context.agentSessionId !== null) {
       const choices = questionChoices(args);
+      const sessionId = context.agentSessionId;
       await options.client.createAgentActivity({
         linearOrganizationId: context.linearOrganizationId,
         agentSessionId: context.agentSessionId,
@@ -84,6 +86,30 @@ export function createLinearReplyExecutor(options: { client: LinearApiClient }):
               },
             }),
       });
+      // Linear renders a pull request attached to the session, uses it for its PR features, and
+      // treats the link as proof the session is alive. The URL is in the reply either way; this
+      // makes it a field rather than a sentence. A failure here is not the agent's problem: the
+      // answer was delivered, so it is reported and swallowed.
+      const links = pullRequestLinks(args.content);
+      if (links.length > 0) {
+        try {
+          await options.client.updateAgentSessionExternalUrls({
+            linearOrganizationId: context.linearOrganizationId,
+            agentSessionId: sessionId,
+            externalUrls: links,
+          });
+        } catch (error: unknown) {
+          reportFailure(
+            error,
+            {
+              operation: "linear.session.external-urls",
+              component: "triggers",
+              provider: "linear",
+            },
+            { diagnostic: { agentSessionId: sessionId } },
+          );
+        }
+      }
       return;
     }
     await options.client.createComment({
@@ -95,6 +121,25 @@ export function createLinearReplyExecutor(options: { client: LinearApiClient }):
         : {}),
     });
   };
+}
+
+/**
+ * GitHub pull requests named in a reply, in order and without duplicates.
+ *
+ * Deliberately narrow: only `/pull/<number>` URLs, because `externalUrls` is what Linear reads to
+ * show "this session opened this PR". Any other link the agent mentions belongs in the text.
+ */
+function pullRequestLinks(content: string): Array<{ label: string; url: string }> {
+  const matches = content.matchAll(/https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/gu);
+  const seen = new Set<string>();
+  const links: Array<{ label: string; url: string }> = [];
+  for (const match of matches) {
+    const url = match[0];
+    if (seen.has(url)) continue;
+    seen.add(url);
+    links.push({ label: `${match[1]}/${match[2]}#${match[3]}`, url });
+  }
+  return links;
 }
 
 /** Issue comments have no elicitation: a question with choices lists them in Markdown instead. */

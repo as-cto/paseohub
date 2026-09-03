@@ -191,6 +191,10 @@ const AgentActivityResponseSchema = z.object({
   }),
 });
 
+const AgentSessionUpdateResponseSchema = z.object({
+  data: z.object({ agentSessionUpdate: z.object({ success: z.boolean() }) }),
+});
+
 export interface LinearInstallation {
   linearOrganizationId: string;
   linearOrganizationName: string;
@@ -332,6 +336,17 @@ export interface LinearApiClient {
     ephemeral?: boolean;
     signal?: LinearAgentActivitySignal;
     signalMetadata?: LinearAgentActivitySignalMetadata;
+  }): Promise<void>;
+  /**
+   * Attaches links to a session — Linear's own way of surfacing an agent's pull request.
+   *
+   * The URL in a reply is text; here it becomes a first-class field Linear renders, uses for its
+   * pull-request features, and treats as proof the session is alive rather than unresponsive.
+   */
+  updateAgentSessionExternalUrls(input: {
+    linearOrganizationId: string;
+    agentSessionId: string;
+    externalUrls: ReadonlyArray<{ label: string; url: string }>;
   }): Promise<void>;
 }
 
@@ -717,6 +732,25 @@ export function createLinearApiClient(options: {
       );
       if (!result.data.agentActivityCreate.success) {
         throw new Error("Linear agent activity was not accepted");
+      }
+    },
+    async updateAgentSessionExternalUrls(input) {
+      const result = AgentSessionUpdateResponseSchema.parse(
+        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
+          query: `mutation PaseoAgentSessionUrls($id: String!, $externalUrls: [AgentSessionExternalUrlInput!]) {
+            agentSessionUpdate(id: $id, input: { externalUrls: $externalUrls }) { success }
+          }`,
+          variables: {
+            id: input.agentSessionId,
+            externalUrls: input.externalUrls.map((entry) => ({
+              label: entry.label,
+              url: entry.url,
+            })),
+          },
+        }),
+      );
+      if (!result.data.agentSessionUpdate.success) {
+        throw new Error("Linear agent session update was not accepted");
       }
     },
   };

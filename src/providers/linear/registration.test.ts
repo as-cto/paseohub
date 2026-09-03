@@ -319,6 +319,7 @@ describe("Linear registration", () => {
       readCommentThread: async () => undefined,
       createComment: async () => {},
       createAgentActivity: async () => {},
+      updateAgentSessionExternalUrls: async () => undefined,
     };
     const registration = createLinearRegistration({
       database,

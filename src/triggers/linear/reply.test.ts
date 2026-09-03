@@ -279,6 +279,7 @@ class RecordingLinearClient implements LinearApiClient {
     parentId?: string;
   }> = [];
   activities: Parameters<LinearApiClient["createAgentActivity"]>[0][] = [];
+  externalUrls: Parameters<LinearApiClient["updateAgentSessionExternalUrls"]>[0][] = [];
 
   async readIssue(): Promise<undefined> {
     return undefined;
@@ -305,4 +306,58 @@ class RecordingLinearClient implements LinearApiClient {
   ): Promise<void> {
     this.activities.push(input);
   }
+
+  async updateAgentSessionExternalUrls(
+    input: Parameters<LinearApiClient["updateAgentSessionExternalUrls"]>[0],
+  ): Promise<void> {
+    this.externalUrls.push(input);
+  }
 }
+
+describe("Linear session external URLs", () => {
+  it("attaches a pull request named in a reply to the session", async () => {
+    const client = new RecordingLinearClient();
+    const execute = createLinearReplyExecutor({ client });
+
+    await execute({
+      agentExecutionId: "execution-1",
+      toolType: "linear.reply",
+      args: { content: "Fait : https://github.com/pstudi0/P-OS/pull/128 (ne pas fusionner)." },
+      outputContext: {
+        provider: "linear",
+        linearOrganizationId: "linear-org",
+        issueId: "issue-1",
+        agentSessionId: "session-1",
+      },
+    });
+
+    assert.deepEqual(client.externalUrls, [
+      {
+        linearOrganizationId: "linear-org",
+        agentSessionId: "session-1",
+        externalUrls: [
+          { label: "pstudi0/P-OS#128", url: "https://github.com/pstudi0/P-OS/pull/128" },
+        ],
+      },
+    ]);
+  });
+
+  it("attaches nothing when the reply names no pull request", async () => {
+    const client = new RecordingLinearClient();
+    const execute = createLinearReplyExecutor({ client });
+
+    await execute({
+      agentExecutionId: "execution-1",
+      toolType: "linear.reply",
+      args: { content: "Voir https://linear.app/pstudio/issue/POS-33 pour le detail." },
+      outputContext: {
+        provider: "linear",
+        linearOrganizationId: "linear-org",
+        issueId: "issue-1",
+        agentSessionId: "session-1",
+      },
+    });
+
+    assert.deepEqual(client.externalUrls, []);
+  });
+});

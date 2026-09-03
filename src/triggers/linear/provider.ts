@@ -187,11 +187,10 @@ export function createLinearTriggerProvider(
             linearOrganizationId,
             agentSessionId,
             content,
-            // Actions are ephemeral, thoughts are not. An action is a transient state — "running
-            // bun test" is worth showing while it runs and worth nothing next month — whereas the
-            // agent's reasoning is the part someone rereads when they ask why it did that. Making
-            // every step permanent would leave fifty rows of noise in the issue forever.
-            ephemeral: content.type === "action",
+            // Never ephemeral. Linear replaces an ephemeral activity with the next one, which
+            // turns a transcript into a single "currently doing X" line — the opposite of what a
+            // mirror is for. The acceptance thought stays ephemeral (below) because being
+            // replaced is exactly its job.
           });
         }
         return undefined;
