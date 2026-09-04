@@ -939,16 +939,29 @@ export class DaemonDispatchLifecycle {
     if (currentExecution.launchIntent?.keepAliveBetweenTurns === true) {
       return await this.endConversationTurn(currentExecution);
     }
+    return await this.settleCompletedExecution(input, options);
+  }
+
+  /**
+   * Closes an execution the agent has finished: completion, hub action, watchers.
+   *
+   * Split out of `completeAgentExecutionFromCallback` only to keep that method under the
+   * complexity ceiling once turn keep-alive was added to it; the sequence is unchanged.
+   */
+  private async settleCompletedExecution(
+    input: { executionId: string; token: string; output?: unknown },
+    options: { deferHubAction?: boolean },
+  ): Promise<AgentExecutionRecord> {
     this.clearExecutionDeadline(input.executionId);
     const execution = await this.completeAgentExecution(input.executionId, {
       completedByAgent: true,
       ...(options.deferHubAction === undefined ? {} : { deferHubAction: options.deferHubAction }),
       ...(input.output === undefined ? {} : { output: input.output }),
     });
-    if (options.deferHubAction === true && execution.hubAction === "archive") {
+    const archivingLater = options.deferHubAction === true && execution.hubAction === "archive";
+    if (archivingLater) {
       await this.reconcileHubActionSafely(execution);
-    }
-    if (!(options.deferHubAction === true && execution.hubAction === "archive")) {
+    } else {
       this.completionWatchersByExecution.get(input.executionId)?.();
     }
     if (execution.status !== "succeeded") {

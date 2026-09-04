@@ -203,10 +203,20 @@ function planToolCall(
     if (state.postedCallIds.has(callId)) return;
     state.postedCallIds.add(callId);
   }
+  const name = item.name ?? "";
+  const closesTurn = name.includes("finish_execution");
+  // Hub's own tools are the turn's plumbing, and publishing them REOPENS the panel: Linear ends
+  // the turn on the `response`, so any activity after it starts a new "Working" block that never
+  // closes — the session looks busy while the agent is only waiting for the next message.
+  // Observed on SEN-98: "Posted a reply" and "Finished the turn" landed after the answer and left
+  // the panel spinning. They say nothing a reader needs; the answer above them says it all.
+  if (closesTurn || name.includes("hub__reply") || name === "hub.reply") {
+    if (closesTurn) state.turnClosed = true;
+    return;
+  }
   // Text before the action: the agent usually narrates, then acts.
   pushFlush(planned, state);
   planned.push(toolCallActivity(item));
-  if ((item.name ?? "").includes("finish_execution")) state.turnClosed = true;
 }
 
 /**
@@ -284,16 +294,6 @@ function toolCallActivity(
 ): LinearAgentActivityContent {
   const detail = item.detail ?? {};
   const name = item.name ?? detail.type ?? "tool";
-
-  // Hub's own tools are the turn's plumbing. `hub.reply` in particular carries the whole answer as
-  // its parameter, and Linear is about to render that answer as a `response` — mirroring it here
-  // would print it twice, the second time badly.
-  if (name.includes("hub__reply") || name === "hub.reply") {
-    return { type: "action", action: "Posted a reply", parameter: "to this session" };
-  }
-  if (name.includes("finish_execution")) {
-    return { type: "action", action: "Finished the turn", parameter: "this session" };
-  }
 
   const { action, parameter } = describeToolCall(detail, name);
   const result = toolCallResult(item, detail);

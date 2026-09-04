@@ -70,24 +70,26 @@ describe("Linear session mirror", () => {
     });
   });
 
-  it("never mirrors the reply body, which Linear is about to render as the response", () => {
+  it("publishes nothing for the hub's own tools, which would reopen a closed turn", () => {
+    // Linear ends the turn on the `response`; anything published after it starts a new "Working"
+    // block that never closes, so the session looks busy while the agent only waits. Seen on
+    // SEN-98. The reply body would also be printed twice — the second time badly.
     const state = createLinearMirrorState();
-    const [activity] = planLinearMirrorActivities(
-      timeline({
-        type: "tool_call",
-        callId: "c3",
-        name: "mcp__hub__reply",
-        status: "completed",
-        error: null,
-        detail: { type: "unknown", text: "Voici toute ma réponse, en entier, deux fois." },
-      }),
-      state,
-    );
-    assert.deepEqual(activity, {
-      type: "action",
-      action: "Posted a reply",
-      parameter: "to this session",
-    });
+    for (const name of ["mcp__hub__reply", "mcp__hub__finish_execution"]) {
+      const planned = planLinearMirrorActivities(
+        timeline({
+          type: "tool_call",
+          callId: `c3-${name}`,
+          name,
+          status: "completed",
+          error: null,
+          detail: { type: "unknown", text: "Voici toute ma réponse, en entier, deux fois." },
+        }),
+        state,
+      );
+      assert.deepEqual(planned, [], `${name} must publish nothing`);
+    }
+    assert.equal(state.turnClosed, true, "finish_execution still closes the turn");
   });
 
   it("summarises a file read without publishing the file", () => {
