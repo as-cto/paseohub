@@ -331,6 +331,40 @@ describe("workflow compiler", () => {
         }),
       /filters\.from_users/iu,
     );
+    // An assignment made by a triage rule carries no actor, so it may stand on the assignment
+    // itself — but only when the bundle says both where it listens and who the issue lands on.
+    assert.ok(
+      compileHubConfig({
+        ...raw,
+        triggers: [
+          {
+            ...trigger,
+            on: "linear.issue_assigned",
+            filters: { team: "linear-team-id", assignees: ["agent-user-id"] },
+          },
+        ],
+      }),
+    );
+    assert.throws(
+      () =>
+        compileHubConfig({
+          ...raw,
+          triggers: [
+            { ...trigger, on: "linear.issue_assigned", filters: { team: "linear-team-id" } },
+          ],
+        }),
+      /filters\.assignees/iu,
+    );
+    assert.throws(
+      () =>
+        compileHubConfig({
+          ...raw,
+          triggers: [
+            { ...trigger, on: "linear.issue_assigned", filters: { assignees: ["agent-user-id"] } },
+          ],
+        }),
+      /filters\.project or filters\.team/iu,
+    );
   });
   it("requires explicit repositories for non-GitHub authority", () => {
     const raw = configuration();

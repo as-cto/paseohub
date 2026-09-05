@@ -152,7 +152,19 @@ function matchesTriggerFilter(
   }
   const issue = event.type === "issue" ? event.issue : event.issue;
   if (issue === null || !matchesIssueScope(issue, trigger.filters, connectionId)) return false;
-  if (!matchesActor(event, trigger.filters?.from_users, appUserId)) return false;
+  // `linear.issue_assigned` asks WHO THE ISSUE WENT TO, not who moved it. A triage rule assigns
+  // with no actor at all (`actor: null`), so requiring one drops every automated assignment —
+  // silently, and forever. Observed on SEN-106: the rule delegated and assigned, Linear showed
+  // "started work", and nothing ever reached the agent.
+  //
+  // The scope is carried by the filters that do apply here: the team, the labels, and the
+  // assignee. `from_users`, when a bundle sets it, still narrows further — this only stops an
+  // ABSENT actor from being a rejection, exactly as `linear.issue_entered_scope` already does.
+  const actorMatches =
+    trigger.on === "linear.issue_assigned"
+      ? matchesActorIfPresent(event, trigger.filters?.from_users, appUserId)
+      : matchesActor(event, trigger.filters?.from_users, appUserId);
+  if (!actorMatches) return false;
   if (event.type === "comment" && !matchesComment(event, trigger.filters, appUserId)) {
     return false;
   }

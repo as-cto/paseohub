@@ -65,6 +65,39 @@ describe("Linear trigger matching", () => {
     );
   });
 
+  it("lets an assignment trigger stand on the assignment when it names no actor", () => {
+    // A triage rule assigns with `actor: null`. An actor allowlist rejects that by construction,
+    // which is how SEN-106 was delegated, shown as "started work", and never reached the agent.
+    const config = configuration();
+    const byRule = { ...issue({ action: "update", updatedFrom: { assigneeId: null } }), actor: null };
+
+    assert.equal(matchLinearTriggers(config, byRule).length, 0, "allowlisted trigger still refuses");
+
+    const source = configuration();
+    const opened = source.triggers.find((trigger) => trigger.name === "assignment");
+    assert.ok(opened);
+    const open = {
+      ...source,
+      triggers: [
+        { ...opened, filters: { project: "project-1", assignees: ["user-1"] } },
+        ...source.triggers.filter((trigger) => trigger.name !== "assignment"),
+      ],
+    };
+    assert.deepEqual(
+      matchLinearTriggers(open, byRule).map((match) => match.trigger.name),
+      ["assignment"],
+      "an actorless assignment matches once the bundle drops from_users",
+    );
+    assert.equal(
+      matchLinearTriggers(open, {
+        ...byRule,
+        issue: { ...byRule.issue, assigneeId: "someone-else" },
+      }).length,
+      0,
+      "the assignees filter still bounds it",
+    );
+  });
+
   it("routes projectless issues by team and can select comment replies", () => {
     const config = configuration();
     const teamScout = {

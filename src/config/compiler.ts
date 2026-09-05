@@ -1351,9 +1351,36 @@ function validateTriggerLaunchSecurity(trigger: CompiledTrigger): void {
     }
     return;
   }
+  // An assignment made by a triage rule has NO actor, so an actor allowlist rejects it by
+  // construction. `linear.issue_assigned` may therefore stand on the assignment itself — but only
+  // when it says both WHERE it listens and WHO the issue must land on, which is a narrower gate
+  // than the one `linear.issue_entered_scope` gets above.
+  if (trigger.on === "linear.issue_assigned" && (trigger.filters?.from_users?.length ?? 0) === 0) {
+    validateActorlessAssignment(trigger);
+    return;
+  }
   if ((trigger.filters?.from_users?.length ?? 0) === 0) {
     throw new Error(
       `trigger ${trigger.name} requires a non-empty filters.from_users allowlist for externally sourced events`,
+    );
+  }
+}
+
+/**
+ * The gate an assignment trigger stands on when it names no actor.
+ *
+ * Narrower than the one `linear.issue_entered_scope` gets: it must say both WHERE it listens and
+ * WHO the issue has to land on, so an actorless event is bounded by the assignment itself.
+ */
+function validateActorlessAssignment(trigger: CompiledTrigger): void {
+  if (trigger.filters?.project === undefined && trigger.filters?.team === undefined) {
+    throw new Error(
+      `trigger ${trigger.name} requires filters.project or filters.team when linear.issue_assigned has no from_users allowlist`,
+    );
+  }
+  if ((trigger.filters?.assignees?.length ?? 0) === 0) {
+    throw new Error(
+      `trigger ${trigger.name} requires a non-empty filters.assignees when linear.issue_assigned has no from_users allowlist`,
     );
   }
 }
