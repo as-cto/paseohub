@@ -2,7 +2,9 @@ import type { AuthServer } from "../../auth/server.js";
 import { createHash } from "node:crypto";
 import type { GitHubConfigurationProvider } from "../../configuration/github-sync.js";
 import type { Database } from "../../db/types.js";
+import type { OutputToolDefinition } from "../../execution-capabilities/outputs.js";
 import { outputContextProvider, replyOutputTool } from "../../execution-capabilities/outputs.js";
+import { linearReplyOutputTool } from "../../triggers/linear/reply.js";
 import { logger } from "../../logger.js";
 import { reportFailure } from "../../failures/index.js";
 import { createDiscordRegistration } from "../../providers/discord/index.js";
@@ -405,7 +407,7 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
           : [
               {
                 type: `${provider}.reply`,
-                tool: replyOutputTool,
+                tool: replyOutputToolFor(provider),
                 available: outputContextProvider(provider),
                 execute: (input) => {
                   const active = slot.active;
@@ -645,6 +647,16 @@ function emptySlot(): Slot {
 function actionNames(provider: Provider): readonly string[] {
   if (provider === "github") return ["start", "disconnect", "setup", "callback"];
   return ["start", "disconnect", "callback"];
+}
+
+/**
+ * The stable registration is built before any downstream registration exists, so the reply tool
+ * has to be named statically. A provider whose reply tool carries more than `content` must be
+ * listed here: exposing the generic tool instead silently drops those arguments from the schema
+ * the agent reads, and the agent cannot pass what it cannot see.
+ */
+function replyOutputToolFor(provider: Provider): OutputToolDefinition {
+  return provider === "linear" ? linearReplyOutputTool : replyOutputTool;
 }
 
 function eventNames(provider: Provider): TriggerProvider["eventNames"] {
