@@ -613,7 +613,33 @@ describe("dynamic provider runtime", () => {
 
     assert.deepEqual(accepted, ["first-active", "second-active"]);
   });
+
+  // The stable registration names the reply tool without an active downstream registration. When
+  // it named the generic one for every provider, Linear agents received a schema with `content`
+  // only: `kind: "question"` was rejected as an unknown argument, so no session could ever ask a
+  // question — it posted a plain answer instead, which closes the session.
+  it("exposes each provider's own reply tool", () => {
+    const runtime = new DynamicProviderRuntime({
+      database: createMemoryDatabase(),
+      auth: testAuth(),
+      applicationBaseUrl: "https://hub.test",
+      registrationFactory: ({ configuration }) =>
+        connectionRegistration(configuration.provider, providerConfigurationId(configuration)),
+    });
+
+    assert.deepEqual(replyToolProperties(runtime, "linear"), ["content", "kind", "options"]);
+    assert.deepEqual(replyToolProperties(runtime, "slack"), ["content"]);
+  });
 });
+
+/** Argument names the agent can actually pass, in the schema the hub advertises for `<provider>.reply`. */
+function replyToolProperties(runtime: DynamicProviderRuntime, provider: Provider): string[] {
+  const output = runtime
+    .registrations()
+    .find((registration) => registration.connection.name === provider)!
+    .outputs.find((candidate) => candidate.type === `${provider}.reply`)!;
+  return Object.keys(output.tool.inputSchema.properties ?? {}).sort();
+}
 
 function providerConfiguration(provider: Provider, id: string): ProviderApplicationConfiguration {
   if (provider === "github") {
