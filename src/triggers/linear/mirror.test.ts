@@ -43,29 +43,46 @@ describe("Linear session mirror", () => {
     const state = createLinearMirrorState();
     assert.deepEqual(planLinearMirrorActivities(shellCall("c1", "running"), state), []);
     assert.deepEqual(planLinearMirrorActivities(shellCall("c1", "completed"), state), [
-      { type: "action", action: "Ran a command", parameter: "bun run test" },
+      { type: "action", action: "Ran the tests", parameter: "bun run test" },
     ]);
     // A re-emitted completion must not post the same action twice.
     assert.deepEqual(planLinearMirrorActivities(shellCall("c1", "completed"), state), []);
   });
 
-  it("publishes the agent's stated intent rather than the shell line", () => {
-    // POS-38: the panel showed "Ran a command cd /home/agent/Projets/… && sed -n '318,400p' …".
-    // A teammate who does not write code learns nothing from that, and the command is also the
-    // field most likely to carry a credential.
+  it("reads a verb off the command instead of labelling everything the same", () => {
+    // POS-38: the panel showed "Ran a command cd /home/agent/Projets/… && sed -n '318,400p'
+    // src/…". A teammate who does not write code learned nothing from it, and the directory
+    // prefix — pure machinery — was the first thing they read.
     const state = createLinearMirrorState();
-    planLinearMirrorActivities(describedShell("d1", "running"), state);
-    assert.deepEqual(planLinearMirrorActivities(describedShell("d1", "completed"), state), [
-      { type: "action", action: "Ran a command", parameter: "Read the running hub image tag" },
-    ]);
+    const post = (command: string, callId: string) => {
+      planLinearMirrorActivities(shell(callId, "running", command), state);
+      return planLinearMirrorActivities(shell(callId, "completed", command), state)[0];
+    };
+
+    assert.deepEqual(post("cd /home/agent/Projets/pos && sed -n '1,40p' src/app.ts", "c10"), {
+      type: "action",
+      action: "Read a file",
+      parameter: "sed -n '1,40p' src/app.ts",
+    });
+    assert.deepEqual(post("gh pr create --title x", "c11"), {
+      type: "action",
+      action: "Opened a pull request",
+      parameter: "gh pr create --title x",
+    });
+    assert.deepEqual(post("TOKEN=abc timeout 60 grep -rn foo src", "c12"), {
+      type: "action",
+      action: "Searched the code",
+      parameter: "grep -rn foo src",
+    });
   });
 
-  it("falls back to the command when the call states no intent", () => {
+  it("keeps the neutral label for a command it does not recognise", () => {
     const state = createLinearMirrorState();
-    planLinearMirrorActivities(shellCall("c9", "running"), state);
-    assert.deepEqual(planLinearMirrorActivities(shellCall("c9", "completed"), state), [
-      { type: "action", action: "Ran a command", parameter: "bun run test" },
-    ]);
+    planLinearMirrorActivities(shell("c13", "running", "hetznerctl resize cs3"), state);
+    assert.deepEqual(
+      planLinearMirrorActivities(shell("c13", "completed", "hetznerctl resize cs3"), state),
+      [{ type: "action", action: "Ran a command", parameter: "hetznerctl resize cs3" }],
+    );
   });
 
   it("reports a failed tool call as a failed action", () => {
@@ -83,7 +100,7 @@ describe("Linear session mirror", () => {
     );
     assert.deepEqual(activity, {
       type: "action",
-      action: "Ran a command",
+      action: "Built the project",
       parameter: "bun run build",
       result: "failed: exit status 1",
     });
@@ -219,18 +236,14 @@ function shellCall(callId: string, status: string) {
   });
 }
 
-function describedShell(callId: string, status: string) {
+function shell(callId: string, status: string, command: string) {
   return timeline({
     type: "tool_call",
     callId,
     name: "Bash",
     status,
     error: null,
-    detail: {
-      type: "shell",
-      command: "ssh root@m0 'docker compose ps'",
-      description: "Read the running hub image tag",
-    },
+    detail: { type: "shell", command },
   });
 }
 

@@ -320,26 +320,91 @@ function describeToolCall(
   detail: z.infer<typeof MirrorToolDetailSchema>,
   name: string,
 ): { action: string; parameter: string } {
-  const known = TOOL_ACTION_LABELS[detail.type ?? ""];
-  // `description` first, and it is the whole point: the agent writes one sentence of intent per
-  // call ("Read the running hub image tag on m0"), while `command` is the shell line that
-  // produced it. Publishing the command told a reader who does not write code nothing at all —
-  // a session read as forty identical "Ran a command" rows followed by unreadable shell. When
-  // the intent is there, the command is not just redundant, it is the noisiest field we have and
-  // the only one that regularly carries a credential.
+  // A shell call carries only its command line — the daemon's `ToolCallDetail` has no intent
+  // field for it — so the verb has to be read off the command itself. Linear's model wants a
+  // verb in `action` and its object in `parameter` ("Searched" / "San Francisco Weather"); this
+  // keeps that shape instead of collapsing every call into "Ran a command" plus raw shell.
+  const known = detail.command === undefined ? TOOL_ACTION_LABELS[detail.type ?? ""] : undefined;
   const parameter =
+    (detail.command === undefined ? undefined : shellObject(detail.command)) ??
     detail.description ??
-    detail.command ??
     detail.filePath ??
     detail.query ??
     detail.url ??
     detail.subAgentType ??
     detail.label ??
     detail.text;
+  if (detail.command !== undefined) {
+    return { action: shellVerb(detail.command), parameter: parameter ?? detail.command };
+  }
   // With nothing but the tool's name, "Used a tool | ToolSearch" beats "Used ToolSearch |
   // ToolSearch": the name belongs on one side or the other, not on both.
   if (known === undefined) return { action: "Used a tool", parameter: parameter ?? name };
   return { action: known, parameter: parameter ?? name };
+}
+
+/**
+ * Strips the scaffolding a command carries before the part that says what it does.
+ *
+ * A shell line starts with the machinery of running it — the directory to be in, environment to
+ * load, a timeout, a nice level — and that prefix dominated the panel: "Ran a command cd
+ * /home/agent/Projets/paseohub-wt-mirror && sed -n '318,400p' src/…". None of it describes the
+ * work.
+ */
+function shellObject(command: string): string {
+  let text = command.trim();
+  let previous = "";
+  while (text !== previous) {
+    previous = text;
+    text = text
+      .replace(/^cd\s+\S+\s*&&\s*/u, "")
+      .replace(/^(?:sudo|nice)(?:\s+-[A-Za-z]+(?:\s+\d+)?)*\s+/u, "")
+      .replace(/^timeout\s+\d+\s+/u, "")
+      .replace(/^set\s+[+-]a;.*?set\s+[+-]a\s*/su, "")
+      .replace(/^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/u, "")
+      .trim();
+  }
+  return text.length === 0 ? command.trim() : text;
+}
+
+/**
+ * Reads a verb off a command, for a reader who does not write code.
+ *
+ * Deliberately a small table of what this repository actually runs, not a shell parser: an
+ * unrecognised command falls back to "Ran a command", which is exactly as informative as before
+ * and never wrong. The object stays next to it, so nothing is hidden from a reader who does.
+ */
+const SHELL_VERBS: readonly (readonly [RegExp, string])[] = [
+  [/^git\s+(?:push|pull|fetch)/u, "Synced the repository"],
+  [/^git\s+commit/u, "Committed a change"],
+  [/^git\s+(?:checkout|switch|worktree|branch)/u, "Switched branch"],
+  [/^git\b/u, "Inspected the repository"],
+  [/^gh\s+pr\s+create/u, "Opened a pull request"],
+  [/^gh\s+pr\s+merge/u, "Merged the pull request"],
+  [/^gh\s+(?:pr|run)\b/u, "Checked the pull request"],
+  [/^gh\b/u, "Used GitHub"],
+  [/\b(?:vitest|jest|playwright|test)\b/u, "Ran the tests"],
+  [/\b(?:oxlint|eslint|lint)\b/u, "Ran the linter"],
+  [/\b(?:tsgo|tsc|typecheck)\b/u, "Checked types"],
+  [/\b(?:oxfmt|prettier|fmt|format)\b/u, "Checked formatting"],
+  [/\bbuild\b/u, "Built the project"],
+  [/^(?:grep|rg|ug|ugrep|ag)\b/u, "Searched the code"],
+  [/^(?:ls|find|tree)\b/u, "Listed files"],
+  [/^(?:cat|sed|head|tail|less|wc|od)\b/u, "Read a file"],
+  [/^(?:curl|wget)\b/u, "Called an API"],
+  [/^ssh\b/u, "Ran a command on a server"],
+  [/^docker\b/u, "Inspected containers"],
+  [/^(?:psql|sqlite3)\b/u, "Queried the database"],
+  [/^(?:python3?|node|bun|npx)\b/u, "Ran a script"],
+  [/^(?:printenv|env|echo)\b/u, "Checked the environment"],
+];
+
+function shellVerb(command: string): string {
+  const text = shellObject(command);
+  for (const [pattern, verb] of SHELL_VERBS) {
+    if (pattern.test(text)) return verb;
+  }
+  return "Ran a command";
 }
 
 function toolCallResult(
