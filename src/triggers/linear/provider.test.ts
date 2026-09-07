@@ -12,6 +12,7 @@ import { createActiveProjectConfiguration } from "../../test-utils/project-confi
 import { isAcceptedTriggerProviderMatch, type ExternalTrigger } from "../index.js";
 import type { NormalizedLinearAgentSessionEvent, NormalizedLinearCommentEvent } from "./events.js";
 import { createLinearTriggerProvider } from "./provider.js";
+import { HubExecutionAgentStreamEventSchema } from "../../hub/protocol.js";
 
 describe("Linear trigger provider", () => {
   it.each([
@@ -312,6 +313,63 @@ describe("Linear trigger provider", () => {
     assert.deepEqual(client.historyReads, []);
     assert.equal(context.linear.thread.status, "unavailable");
     assert.equal(context.linear.thread.messages.length, 1);
+  });
+
+  it("mirrors what the agent says as a lasting thought and what it runs as an ephemeral action", async () => {
+    // POS-38: a session accumulated 50 activities, about forty of them "Ran a command …". The
+    // issue page collapses a session to its LAST activity, so the agent's answer was buried in a
+    // log — read from the outside as "you still have not replied" while the response was there.
+    // Marking only actions ephemeral keeps the narration and reduces the log to a current step.
+    const { project, revision, store } = await activeConfiguration(agentSessionConfiguration());
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+    });
+    const match = (
+      await provider.match(
+        externalAgentSession(project.id, revision.id, agentSessionEvent({ action: "created" })),
+      )
+    )[0];
+    if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+    await provider.onDispatchAccepted?.(match.triggerContext, match.outputContext);
+
+    const stream = (item: Record<string, unknown>) =>
+      HubExecutionAgentStreamEventSchema.parse({ type: "timeline", provider: "claude", item });
+    const shell = (status: string) =>
+      stream({
+        type: "tool_call",
+        callId: "c1",
+        name: "Bash",
+        status,
+        error: null,
+        detail: { type: "shell", command: "bun run test" },
+      });
+
+    await provider.onAgentStreamEvent?.(
+      match.triggerContext,
+      match.outputContext,
+      stream({ type: "assistant_message", messageId: "m1", text: "Je lance les tests." }),
+    );
+    await provider.onAgentStreamEvent?.(
+      match.triggerContext,
+      match.outputContext,
+      shell("running"),
+    );
+    await provider.onAgentStreamEvent?.(
+      match.triggerContext,
+      match.outputContext,
+      shell("completed"),
+    );
+
+    const mirrored = client.createdActivities.slice(1);
+    assert.deepEqual(
+      mirrored.map((activity) => [activity.content.type, activity.ephemeral]),
+      [
+        ["thought", false],
+        ["action", true],
+      ],
+    );
   });
 
   it("uses promptContext for a new native agent session and acknowledges it promptly", async () => {

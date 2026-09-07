@@ -196,10 +196,15 @@ export function createLinearTriggerProvider(
             linearOrganizationId,
             agentSessionId,
             content,
-            // Never ephemeral. Linear replaces an ephemeral activity with the next one, which
-            // turns a transcript into a single "currently doing X" line — the opposite of what a
-            // mirror is for. The acceptance thought stays ephemeral (below) because being
-            // replaced is exactly its job.
+            // What the agent SAYS is the transcript and stays; what it RUNS is a live state and
+            // does not. Linear replaces an ephemeral activity with the next one, so the panel
+            // keeps every `thought` and shows a single current step instead of a command log.
+            //
+            // Measured on POS-38 before this split: 50 activities in one session, about forty of
+            // them "Ran a command …". The issue page collapses a session to its LAST activity, so
+            // the agent's answer was the 41st line of a log nobody expands — reported as "you
+            // still have not replied" while the `response` was there all along.
+            ephemeral: content.type === "action",
           });
         }
         return undefined;
