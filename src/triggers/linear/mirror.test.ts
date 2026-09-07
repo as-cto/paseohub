@@ -49,6 +49,25 @@ describe("Linear session mirror", () => {
     assert.deepEqual(planLinearMirrorActivities(shellCall("c1", "completed"), state), []);
   });
 
+  it("publishes the agent's stated intent rather than the shell line", () => {
+    // POS-38: the panel showed "Ran a command cd /home/agent/Projets/… && sed -n '318,400p' …".
+    // A teammate who does not write code learns nothing from that, and the command is also the
+    // field most likely to carry a credential.
+    const state = createLinearMirrorState();
+    planLinearMirrorActivities(describedShell("d1", "running"), state);
+    assert.deepEqual(planLinearMirrorActivities(describedShell("d1", "completed"), state), [
+      { type: "action", action: "Ran a command", parameter: "Read the running hub image tag" },
+    ]);
+  });
+
+  it("falls back to the command when the call states no intent", () => {
+    const state = createLinearMirrorState();
+    planLinearMirrorActivities(shellCall("c9", "running"), state);
+    assert.deepEqual(planLinearMirrorActivities(shellCall("c9", "completed"), state), [
+      { type: "action", action: "Ran a command", parameter: "bun run test" },
+    ]);
+  });
+
   it("reports a failed tool call as a failed action", () => {
     const state = createLinearMirrorState();
     const [activity] = planLinearMirrorActivities(
@@ -197,6 +216,21 @@ function shellCall(callId: string, status: string) {
     status,
     error: null,
     detail: { type: "shell", command: "bun run test" },
+  });
+}
+
+function describedShell(callId: string, status: string) {
+  return timeline({
+    type: "tool_call",
+    callId,
+    name: "Bash",
+    status,
+    error: null,
+    detail: {
+      type: "shell",
+      command: "ssh root@m0 'docker compose ps'",
+      description: "Read the running hub image tag",
+    },
   });
 }
 

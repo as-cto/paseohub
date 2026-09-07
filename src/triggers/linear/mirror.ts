@@ -321,12 +321,18 @@ function describeToolCall(
   name: string,
 ): { action: string; parameter: string } {
   const known = TOOL_ACTION_LABELS[detail.type ?? ""];
+  // `description` first, and it is the whole point: the agent writes one sentence of intent per
+  // call ("Read the running hub image tag on m0"), while `command` is the shell line that
+  // produced it. Publishing the command told a reader who does not write code nothing at all —
+  // a session read as forty identical "Ran a command" rows followed by unreadable shell. When
+  // the intent is there, the command is not just redundant, it is the noisiest field we have and
+  // the only one that regularly carries a credential.
   const parameter =
+    detail.description ??
     detail.command ??
     detail.filePath ??
     detail.query ??
     detail.url ??
-    detail.description ??
     detail.subAgentType ??
     detail.label ??
     detail.text;
