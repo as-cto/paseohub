@@ -74,7 +74,12 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
     const config = loadRuntimeConfig();
     const { database, runtime, locks } = await createDatabaseHandle();
     resources.own(() => database.close());
-    const migration = await migrateLegacyProjectTriggers(database);
+    // Operators retaining project bundles can defer the organization-trigger migration.
+    // Keep this guard in source as well as derived images so rebuilding preserves that choice.
+    const migration =
+      process.env["PASEO_HUB_MIGRATE_PROJECT_TRIGGERS"] === "0"
+        ? { projects: 0, triggers: 0, legacyMultistepTriggers: 0 }
+        : await migrateLegacyProjectTriggers(database);
     if (migration.projects > 0) {
       logger.info(migration, "migrated project configurations to organization triggers");
     }

@@ -40,7 +40,10 @@ export function TriggerActivityPanel() {
   const activity = snapshot.data.data.activity;
   return (
     <>
-      <PageHeader title="Activity" description="Agent runs launched by organization triggers." />
+      <PageHeader
+        title="Activity"
+        description="Agent runs from published project routes and organization triggers."
+      />
       <DataTable
         label="Trigger activity"
         columns={ACTIVITY_COLUMNS}

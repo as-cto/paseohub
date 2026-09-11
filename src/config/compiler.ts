@@ -1,3 +1,4 @@
+import { LinearFinalizationPolicySchema } from "./linear-policy.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
@@ -108,6 +109,15 @@ const AuthoredTriggerFilterSchema = z
      * prompt, so this selects the threads a comment trigger alone answers.
      */
     thread_with_app: z.boolean().optional(),
+    /** Opt in to Linear-created sessions without a responsible human actor. */
+    allow_automated_sessions: z.boolean().optional(),
+    /** Publish the final native-session reply as an ordinary root issue comment too. */
+    publish_issue_comment: z.boolean().optional(),
+    /** Require the issue to remain delegated to this connection's app user. */
+    require_delegate: z.boolean().optional(),
+    continue_issue: z.boolean().optional(),
+    intake_triage_state_id: z.string().min(1).optional(),
+    finalize_issue: LinearFinalizationPolicySchema.optional(),
     channels: z.array(z.string().min(1)).optional(),
     from_users: z.array(z.string().min(1)).optional(),
     inputs: z.record(z.string(), InputValueSchema).optional(),
@@ -135,6 +145,8 @@ export const WorktreeTargetSchema = z.discriminatedUnion("mode", [
   z.object({
     mode: z.literal("branch-off"),
     newBranch: z.string().min(1),
+    reuseWorkspace: z.boolean().optional(),
+    workspaceKey: z.string().min(1).max(2048).optional(),
     base: z.string().min(1).optional(),
   }),
   z.object({ mode: z.literal("checkout-branch"), branch: z.string().min(1) }),
@@ -1340,6 +1352,10 @@ function validateAuthoredIds(config: AuthoredHubConfig): void {
 }
 
 function validateTriggerLaunchSecurity(trigger: CompiledTrigger): void {
+  validateLinearFinalizationPolicy(trigger);
+  validateLinearTriageIntakePolicy(trigger);
+  validateDelegatedLinearCommentSecurity(trigger);
+  validateAutomatedLinearSessionSecurity(trigger);
   if (trigger.on === "manual.run") return;
   // A project scout is an intentionally autonomous, project-scoped policy. Every other
   // externally-originated Linear action remains actor-allowlisted below.
@@ -1363,6 +1379,62 @@ function validateTriggerLaunchSecurity(trigger: CompiledTrigger): void {
     throw new Error(
       `trigger ${trigger.name} requires a non-empty filters.from_users allowlist for externally sourced events`,
     );
+  }
+}
+
+function validateDelegatedLinearCommentSecurity(trigger: CompiledTrigger): void {
+  if (
+    trigger.filters?.continue_issue === true &&
+    (!trigger.on.startsWith("linear.") ||
+      trigger.filters.require_delegate !== true ||
+      !trigger.filters.team ||
+      !(trigger.filters.connection ?? trigger.filters.connectionId) ||
+      !trigger.filters.from_users?.length ||
+      trigger.steps.length !== 1)
+  ) {
+    throw new Error(
+      `trigger ${trigger.name} continue_issue requires one step, Linear team, connection, from_users and require_delegate`,
+    );
+  }
+  if (
+    (trigger.on === "linear.delegated_comment" ||
+      trigger.on === "linear.delegated_issue_updated") &&
+    (trigger.filters?.team === undefined ||
+      (trigger.filters.connection === undefined && trigger.filters.connectionId === undefined) ||
+      (trigger.filters.from_users?.length ?? 0) === 0)
+  ) {
+    throw new Error(
+      `trigger ${trigger.name} requires team, connection and from_users for ${trigger.on}`,
+    );
+  }
+}
+
+function validateAutomatedLinearSessionSecurity(trigger: CompiledTrigger): void {
+  if (trigger.filters?.publish_issue_comment !== undefined && !trigger.on.startsWith("linear.")) {
+    throw new Error(
+      `trigger ${trigger.name} filters.publish_issue_comment is only supported for Linear`,
+    );
+  }
+  if (trigger.filters?.require_delegate !== undefined && !trigger.on.startsWith("linear.")) {
+    throw new Error(
+      `trigger ${trigger.name} filters.require_delegate is only supported for Linear`,
+    );
+  }
+  if (trigger.filters?.allow_automated_sessions !== undefined) {
+    if (trigger.on !== "linear.agent_session") {
+      throw new Error(
+        `trigger ${trigger.name} filters.allow_automated_sessions is only supported for linear.agent_session`,
+      );
+    }
+    if (
+      trigger.filters.allow_automated_sessions &&
+      (trigger.filters.team === undefined ||
+        (trigger.filters.connection === undefined && trigger.filters.connectionId === undefined))
+    ) {
+      throw new Error(
+        `trigger ${trigger.name} requires filters.team and filters.connection when filters.allow_automated_sessions is enabled`,
+      );
+    }
   }
 }
 
@@ -1470,4 +1542,41 @@ function stableJson(value: unknown): string {
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`)
     .join(",")}}`;
+}
+
+function validateLinearFinalizationPolicy(trigger: CompiledTrigger): void {
+  const policy = trigger.filters?.finalize_issue;
+  if (policy === undefined) return;
+  if (
+    !trigger.on.startsWith("linear.") ||
+    trigger.filters?.require_delegate !== true ||
+    trigger.filters.publish_issue_comment !== true ||
+    trigger.filters.team !== policy.team_id ||
+    (trigger.filters.connection ?? trigger.filters.connectionId) === undefined ||
+    !trigger.filters.from_users?.length
+  ) {
+    throw new Error(
+      `trigger ${trigger.name} finalize_issue requires scoped Linear delegation, published issue replies, and the same explicit team`,
+    );
+  }
+  if (policy.review_state_id === policy.completed_state_id) {
+    throw new Error(
+      `trigger ${trigger.name} finalize_issue requires different review and completed states`,
+    );
+  }
+}
+
+function validateLinearTriageIntakePolicy(trigger: CompiledTrigger): void {
+  if (
+    trigger.filters?.intake_triage_state_id !== undefined &&
+    (trigger.on !== "linear.delegated_issue_updated" ||
+      !trigger.filters.team ||
+      !(trigger.filters.connection ?? trigger.filters.connectionId) ||
+      !trigger.filters.from_users?.length ||
+      trigger.filters.from_users.includes("*"))
+  ) {
+    throw new Error(
+      `trigger ${trigger.name} intake_triage_state_id requires linear.delegated_issue_updated, team, connection and explicit from_users`,
+    );
+  }
 }

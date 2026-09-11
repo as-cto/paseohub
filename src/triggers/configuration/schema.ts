@@ -1,3 +1,4 @@
+import { LinearFinalizationPolicySchema } from "../../config/linear-policy.js";
 import { z } from "zod";
 import { AuthoredGitHubAuthoritySchema } from "../../config/github-authority.js";
 
@@ -8,6 +9,8 @@ const WorktreeTargetSchema = z.discriminatedUnion("mode", [
   z.object({
     mode: z.literal("branch-off"),
     newBranch: z.string().min(1),
+    reuseWorkspace: z.boolean().optional(),
+    workspaceKey: z.string().min(1).max(2048).optional(),
     base: z.string().min(1).optional(),
   }),
   z.object({ mode: z.literal("checkout-branch"), branch: z.string().min(1) }),
@@ -38,6 +41,15 @@ export const TriggerFilterSchema = z
     guild: z.string().min(1).optional(),
     workspace: z.string().min(1).optional(),
     project: z.string().min(1).optional(),
+    team: z.string().min(1).optional(),
+    allow_automated_sessions: z.boolean().optional(),
+    publish_issue_comment: z.boolean().optional(),
+    require_delegate: z.boolean().optional(),
+    continue_issue: z.boolean().optional(),
+    intake_triage_state_id: z.string().min(1).optional(),
+    finalize_issue: LinearFinalizationPolicySchema.optional(),
+    replies_only: z.boolean().optional(),
+    thread_with_app: z.boolean().optional(),
     states: z.array(z.string().min(1)).min(1).optional(),
     exclude_labels: z.array(z.string().min(1)).min(1).optional(),
     assignees: z.array(z.string().min(1)).min(1).optional(),

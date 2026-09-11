@@ -52,6 +52,7 @@ const IssueResponseSchema = z.object({
         id: z.string().min(1),
         identifier: z.string().min(1).optional(),
         title: z.string(),
+        updatedAt: z.string().optional(),
         description: z.string().nullable().optional(),
         url: z.string().url().optional(),
         project: z
@@ -63,10 +64,14 @@ const IssueResponseSchema = z.object({
           .nullable()
           .optional(),
         state: z
-          .object({ id: z.string().min(1) })
+          .object({ id: z.string().min(1), type: z.string().optional() })
           .nullable()
           .optional(),
         assignee: z
+          .object({ id: z.string().min(1) })
+          .nullable()
+          .optional(),
+        delegate: z
           .object({ id: z.string().min(1) })
           .nullable()
           .optional(),
@@ -110,13 +115,23 @@ const CommentAuthorSchema = z.object({
 });
 
 const CommentRepliesSchema = z.object({ nodes: z.array(CommentAuthorSchema) });
+const CommentAgentSessionSchema = z
+  .object({
+    id: z.string().min(1),
+    createdAt: z.string().optional(),
+    appUser: z.object({ id: z.string().min(1) }),
+  })
+  .nullable()
+  .optional();
 
 const CommentThreadResponseSchema = z.object({
   data: z.object({
     comment: CommentAuthorSchema.extend({
       id: z.string().min(1),
+      agentSession: CommentAgentSessionSchema,
       parent: CommentAuthorSchema.extend({
         id: z.string().min(1),
+        agentSession: CommentAgentSessionSchema,
         children: CommentRepliesSchema,
       })
         .nullable()
@@ -194,6 +209,47 @@ const AgentActivityResponseSchema = z.object({
 const AgentSessionUpdateResponseSchema = z.object({
   data: z.object({ agentSessionUpdate: z.object({ success: z.boolean() }) }),
 });
+const AgentSessionCreateResponseSchema = z.object({
+  data: z.object({
+    agentSessionCreateOnComment: z.object({
+      success: z.literal(true),
+      agentSession: z.object({ id: z.string().min(1) }),
+    }),
+  }),
+});
+
+const IssueSessionsResponseSchema = z.object({
+  data: z.object({
+    issue: z
+      .object({
+        agentSessions: z.object({
+          nodes: z.array(
+            z.object({
+              id: z.string().min(1),
+              appUser: z.object({ id: z.string().min(1) }),
+              externalLinks: z.array(z.object({ label: z.string(), url: z.string().url() })),
+            }),
+          ),
+          pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+        }),
+      })
+      .nullable(),
+  }),
+});
+const AgentSessionOnIssueResponseSchema = z.object({
+  data: z.object({
+    agentSessionCreateOnIssue: z.object({
+      success: z.literal(true),
+      agentSession: z.object({ id: z.string().min(1) }),
+    }),
+  }),
+});
+
+export interface LinearIssueSessionSummary {
+  id: string;
+  appUserId: string;
+  externalUrls: ReadonlyArray<{ label: string; url: string }>;
+}
 
 export interface LinearInstallation {
   linearOrganizationId: string;
@@ -220,6 +276,7 @@ export interface LinearConnectionClient {
 }
 
 export interface LinearIssueDetails {
+  updatedAt?: string;
   id: string;
   identifier?: string;
   title: string;
@@ -228,7 +285,9 @@ export interface LinearIssueDetails {
   projectId: string | null;
   teamId: string | null;
   stateId: string | null;
+  stateType?: string;
   assigneeId: string | null;
+  delegateId?: string | null;
   labelIds: string[];
 }
 
@@ -250,6 +309,8 @@ export interface LinearCommentThread {
    * a thread the session already handles.
    */
   agentSessionRootIds: string[];
+  /** Native session already associated with this root; callers verify the app owner. */
+  agentSession?: { id: string; appUserId: string; createdAt?: string } | null;
 }
 
 export interface LinearIssueCommentHistory {
@@ -296,41 +357,97 @@ export type LinearAgentActivityContent =
     };
 
 /** Linear renders a `select` elicitation as a choice list built from `signalMetadata.options`. */
-export type LinearAgentActivitySignal = "select";
+export type LinearAgentActivitySignal = "select" | "auth";
 
-export interface LinearAgentActivitySignalMetadata {
-  options: Array<{ label: string; value: string }>;
+export type LinearAgentActivitySignalMetadata =
+  | { options: Array<{ label: string; value: string }> }
+  | { url: string; userId?: string; providerName?: string };
+
+export interface LinearAgentPlanStep {
+  content: string;
+  status: "pending" | "inProgress" | "completed" | "canceled";
 }
 
 export interface LinearApiClient {
+  readTeamWorkflowStates?(input: {
+    linearOrganizationId: string;
+    expectedConnectionId?: string;
+    teamId: string;
+  }): Promise<Array<{ id: string; type: string }>>;
+  readTeamMembers?(input: {
+    linearOrganizationId: string;
+    expectedConnectionId?: string;
+    teamId: string;
+  }): Promise<Array<{ id: string; active: boolean; app: boolean }>>;
+  updateIssue?(input: {
+    linearOrganizationId: string;
+    expectedConnectionId?: string;
+    issueId: string;
+    stateId?: string;
+    assigneeId?: string;
+  }): Promise<void>;
+  /** Complete listing or error; required for safe recovery of issue session creation. */
+  readIssueSessions?(input: {
+    linearOrganizationId: string;
+    expectedConnectionId?: string;
+    issueId: string;
+  }): Promise<ReadonlyArray<LinearIssueSessionSummary>>;
+  /** Caller owns durable reservation: this API has no client-provided session ID. */
+  createAgentSessionOnIssue?(input: {
+    linearOrganizationId: string;
+    expectedConnectionId?: string;
+    issueId: string;
+    externalUrls: ReadonlyArray<{ label: string; url: string }>;
+  }): Promise<{ id: string }>;
+
+  /** Exact-ID reconciliation for durable publication; absent on older custom adapters. */
+  readPublishedComment?(input: {
+    linearOrganizationId: string;
+    expectedConnectionId?: string;
+    id: string;
+  }): Promise<{ id: string; issueId: string; parentId: string | null; body: string } | undefined>;
+  readPublishedAgentActivity?(input: {
+    linearOrganizationId: string;
+    expectedConnectionId?: string;
+    id: string;
+  }): Promise<{ id: string; agentSessionId: string; body: string; type: string } | undefined>;
   readIssue(input: {
     linearOrganizationId: string;
+    expectedConnectionId?: string;
     issueId: string;
   }): Promise<LinearIssueDetails | undefined>;
   readIssueComments(input: {
     linearOrganizationId: string;
+    expectedConnectionId?: string;
     issueId: string;
     beforeCreatedAt: string;
   }): Promise<LinearIssueCommentHistory>;
   readAgentSessionActivities(input: {
     linearOrganizationId: string;
+    expectedConnectionId?: string;
     agentSessionId: string;
     beforeCreatedAt: string;
   }): Promise<LinearAgentActivityHistory>;
   /** The thread a comment belongs to; `undefined` when Linear no longer has the comment. */
   readCommentThread(input: {
     linearOrganizationId: string;
+    expectedConnectionId?: string;
     commentId: string;
   }): Promise<LinearCommentThread | undefined>;
   createComment(input: {
+    /** UUID v4 reserved durably by the caller before the first network request. */
+    id?: string;
     linearOrganizationId: string;
+    expectedConnectionId?: string;
     issueId: string;
     body: string;
     /** Top-level comment to reply under; Linear rejects a nested comment as parent. */
     parentId?: string;
   }): Promise<void>;
   createAgentActivity(input: {
+    id?: string;
     linearOrganizationId: string;
+    expectedConnectionId?: string;
     agentSessionId: string;
     content: LinearAgentActivityContent;
     ephemeral?: boolean;
@@ -345,9 +462,22 @@ export interface LinearApiClient {
    */
   updateAgentSessionExternalUrls(input: {
     linearOrganizationId: string;
+    expectedConnectionId?: string;
     agentSessionId: string;
     externalUrls: ReadonlyArray<{ label: string; url: string }>;
   }): Promise<void>;
+  updateAgentSessionPlan(input: {
+    linearOrganizationId: string;
+    expectedConnectionId?: string;
+    agentSessionId: string;
+    plan: ReadonlyArray<LinearAgentPlanStep>;
+  }): Promise<void>;
+  /** Caller owns authorization, root resolution and durable deduplication. */
+  createAgentSessionOnComment(input: {
+    linearOrganizationId: string;
+    expectedConnectionId?: string;
+    commentId: string;
+  }): Promise<{ id: string }>;
 }
 
 export function hasRequiredLinearScopes(scopes: readonly string[]): boolean {
@@ -451,6 +581,7 @@ export function createLinearConnectionClient(options: {
     },
     async revoke(accessToken) {
       const response = await request("https://api.linear.app/oauth/revoke", {
+        signal: AbortSignal.timeout(20_000),
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
@@ -490,9 +621,14 @@ export function createLinearApiClient(options: {
   const hasUsableAccessToken = (connection: LinearConnectionRecord): boolean =>
     hasUsableLinearAccessToken(connection, now());
 
-  const accessTokenFor = async (linearOrganizationId: string): Promise<string> => {
+  const accessTokenFor = async (
+    linearOrganizationId: string,
+    expectedConnectionId?: string,
+  ): Promise<string> => {
     const connection = await options.connectionForLinearOrganization(linearOrganizationId);
     if (connection === undefined) throw new Error("Linear connection unavailable");
+    if (expectedConnectionId !== undefined && connection.id !== expectedConnectionId)
+      throw new Error("The authorized Linear connection changed before credential lookup");
     if (hasUsableAccessToken(connection)) return connection.accessToken;
     if (connection.refreshToken === null)
       throw new Error("Linear connection requires reauthorization");
@@ -509,6 +645,8 @@ export function createLinearApiClient(options: {
       linearOrganizationId,
       async (current, updateTokens) => {
         if (current === undefined) throw new Error("Linear connection unavailable");
+        if (current.id !== connection.id)
+          throw new Error("The authorized Linear connection changed before credential refresh");
         if (hasUsableAccessToken(current)) return current.accessToken;
         if (current.refreshToken === null)
           throw new Error("Linear connection requires reauthorization");
@@ -526,27 +664,135 @@ export function createLinearApiClient(options: {
   };
 
   return {
+    async readTeamWorkflowStates(input) {
+      const nodes: Array<{ id: string; type: string }> = [];
+      let after: string | null = null;
+      for (let page = 0; page < 10; page += 1) {
+        const result = z
+          .object({
+            data: z.object({
+              team: z.object({
+                states: z.object({
+                  nodes: z.array(z.object({ id: z.string().min(1), type: z.string().min(1) })),
+                  pageInfo: z.object({
+                    hasNextPage: z.boolean(),
+                    endCursor: z.string().nullable(),
+                  }),
+                }),
+              }),
+            }),
+          })
+          .parse(
+            await graphql(
+              request,
+              await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+              {
+                query: `query PaseoTeamStates($teamId: String!, $after: String) {
+            team(id: $teamId) { states(first: 100, after: $after) { nodes { id type } pageInfo { hasNextPage endCursor } } }
+          }`,
+                variables: { teamId: input.teamId, after },
+              },
+            ),
+          );
+        const states = result.data.team.states;
+        nodes.push(...states.nodes);
+        if (!states.pageInfo.hasNextPage) return nodes;
+        const cursor = states.pageInfo.endCursor;
+        if (cursor === null || cursor === after)
+          throw new Error("Linear workflow state pagination is incomplete");
+        after = cursor;
+      }
+      throw new Error("Linear workflow state pagination exceeded its limit");
+    },
+    async readTeamMembers(input) {
+      const nodes: Array<{ id: string; active: boolean; app: boolean }> = [];
+      let after: string | null = null;
+      for (let page = 0; page < 10; page += 1) {
+        const result = z
+          .object({
+            data: z.object({
+              team: z.object({
+                members: z.object({
+                  nodes: z.array(
+                    z.object({ id: z.string().min(1), active: z.boolean(), app: z.boolean() }),
+                  ),
+                  pageInfo: z.object({
+                    hasNextPage: z.boolean(),
+                    endCursor: z.string().nullable(),
+                  }),
+                }),
+              }),
+            }),
+          })
+          .parse(
+            await graphql(
+              request,
+              await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+              {
+                query: `query PaseoTeamMembers($teamId: String!, $after: String) {
+            team(id: $teamId) { members(first: 100, after: $after) { nodes { id active app } pageInfo { hasNextPage endCursor } } }
+          }`,
+                variables: { teamId: input.teamId, after },
+              },
+            ),
+          );
+        const members = result.data.team.members;
+        nodes.push(...members.nodes);
+        if (!members.pageInfo.hasNextPage) return nodes;
+        const cursor = members.pageInfo.endCursor;
+        if (cursor === null || cursor === after)
+          throw new Error("Linear team member pagination is incomplete");
+        after = cursor;
+      }
+      throw new Error("Linear team member pagination exceeded its limit");
+    },
+    async updateIssue(input) {
+      if (input.stateId === undefined && input.assigneeId === undefined)
+        throw new Error("Linear issue update is empty");
+      z.object({ data: z.object({ issueUpdate: z.object({ success: z.literal(true) }) }) }).parse(
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+          {
+            query: `mutation PaseoFinalizeIssue($issueId: String!, $input: IssueUpdateInput!) { issueUpdate(id: $issueId, input: $input) { success } }`,
+            variables: {
+              issueId: input.issueId,
+              input: {
+                ...(input.stateId === undefined ? {} : { stateId: input.stateId }),
+                ...(input.assigneeId === undefined ? {} : { assigneeId: input.assigneeId }),
+              },
+            },
+          },
+        ),
+      );
+    },
     async readIssue(input) {
       const result = IssueResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoIssue($id: String!) {
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+          {
+            query: `query PaseoIssue($id: String!) {
             issue(id: $id) {
-              id identifier title description url
+              id identifier title description url updatedAt
               project { id }
               team { id }
-              state { id }
+              state { id type }
               assignee { id }
+              delegate { id }
               labels { nodes { id } }
             }
           }`,
-          variables: { id: input.issueId },
-        }),
+            variables: { id: input.issueId },
+          },
+        ),
       );
       const issue = result.data.issue;
       return issue === null
         ? undefined
         : {
             id: issue.id,
+            ...(issue.updatedAt === undefined ? {} : { updatedAt: issue.updatedAt }),
             ...(issue.identifier === undefined ? {} : { identifier: issue.identifier }),
             title: issue.title,
             description: issue.description ?? null,
@@ -554,14 +800,19 @@ export function createLinearApiClient(options: {
             projectId: issue.project?.id ?? null,
             teamId: issue.team?.id ?? null,
             stateId: issue.state?.id ?? null,
+            ...(issue.state?.type === undefined ? {} : { stateType: issue.state.type }),
             assigneeId: issue.assignee?.id ?? null,
+            ...(issue.delegate === undefined ? {} : { delegateId: issue.delegate?.id ?? null }),
             labelIds: issue.labels.nodes.map(({ id }) => id),
           };
     },
     async readIssueComments(input) {
       const result = IssueCommentHistoryResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoIssueCommentHistory($issueId: ID!, $before: DateTimeOrDuration!) {
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+          {
+            query: `query PaseoIssueCommentHistory($issueId: ID!, $before: DateTimeOrDuration!) {
             comments(
               last: ${LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT}
               orderBy: createdAt
@@ -574,8 +825,9 @@ export function createLinearApiClient(options: {
               pageInfo { hasPreviousPage }
             }
           }`,
-          variables: { issueId: input.issueId, before: input.beforeCreatedAt },
-        }),
+            variables: { issueId: input.issueId, before: input.beforeCreatedAt },
+          },
+        ),
       );
       const comments = result.data.comments.nodes
         .map((comment) => ({
@@ -600,8 +852,11 @@ export function createLinearApiClient(options: {
     },
     async readAgentSessionActivities(input) {
       const result = AgentActivityHistoryResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoAgentSessionActivityHistory(
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+          {
+            query: `query PaseoAgentSessionActivityHistory(
             $agentSessionId: String!
             $before: DateTimeOrDuration!
           ) {
@@ -627,11 +882,12 @@ export function createLinearApiClient(options: {
               }
             }
           }`,
-          variables: {
-            agentSessionId: input.agentSessionId,
-            before: input.beforeCreatedAt,
+            variables: {
+              agentSessionId: input.agentSessionId,
+              before: input.beforeCreatedAt,
+            },
           },
-        }),
+        ),
       );
       const activities = result.data.agentSession.activities.nodes
         .map((activity) => ({
@@ -649,20 +905,26 @@ export function createLinearApiClient(options: {
     },
     async readCommentThread(input) {
       const result = CommentThreadResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoCommentThread($id: String!) {
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+          {
+            query: `query PaseoCommentThread($id: String!) {
             comment(id: $id) {
               id user { id } botActor { id }
+              agentSession { id createdAt appUser { id } }
               parent {
                 id user { id } botActor { id }
+                agentSession { id createdAt appUser { id } }
                 children(first: 100) { nodes { user { id } botActor { id } } }
               }
               children(first: 100) { nodes { user { id } botActor { id } } }
               issue { agentSessions(first: 50) { nodes { comment { id } } } }
             }
           }`,
-          variables: { id: input.commentId },
-        }),
+            variables: { id: input.commentId },
+          },
+        ),
       );
       const comment = result.data.comment;
       if (comment === null) return undefined;
@@ -684,29 +946,136 @@ export function createLinearApiClient(options: {
         rootId: root.id,
         authorIds: [...authorIds],
         agentSessionRootIds: [...agentSessionRootIds],
+        ...(root.agentSession === undefined
+          ? {}
+          : {
+              agentSession:
+                root.agentSession === null
+                  ? null
+                  : {
+                      id: root.agentSession.id,
+                      appUserId: root.agentSession.appUser.id,
+                      ...(root.agentSession.createdAt === undefined
+                        ? {}
+                        : { createdAt: root.agentSession.createdAt }),
+                    },
+            }),
       };
+    },
+    async readPublishedComment(input) {
+      const result = z
+        .object({
+          data: z.object({
+            comments: z.object({
+              nodes: z.array(
+                z.object({
+                  id: z.string(),
+                  body: z.string(),
+                  issue: z.object({ id: z.string() }).nullable(),
+                  parent: z.object({ id: z.string() }).nullable(),
+                }),
+              ),
+            }),
+          }),
+        })
+        .parse(
+          await graphql(
+            request,
+            await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+            {
+              query: `query PaseoPublishedComment($id: ID!) {
+          comments(filter: { id: { eq: $id } }, first: 1) {
+            nodes { id body issue { id } parent { id } }
+          }
+        }`,
+              variables: { id: input.id },
+            },
+          ),
+        );
+      const node = result.data.comments.nodes[0];
+      if (node === undefined) return undefined;
+      if (node.issue === null) throw new Error("Published Linear comment is not an issue comment");
+      return {
+        id: node.id,
+        body: node.body,
+        issueId: node.issue.id,
+        parentId: node.parent?.id ?? null,
+      };
+    },
+    async readPublishedAgentActivity(input) {
+      const result = z
+        .object({
+          data: z.object({
+            agentActivities: z.object({
+              nodes: z.array(
+                z.object({
+                  id: z.string(),
+                  agentSession: z.object({ id: z.string() }),
+                  content: AgentActivityBodyContentSchema,
+                }),
+              ),
+            }),
+          }),
+        })
+        .parse(
+          await graphql(
+            request,
+            await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+            {
+              query: `query PaseoPublishedAgentActivity($id: ID!) {
+          agentActivities(filter: { id: { eq: $id } }, first: 1) {
+            nodes { id agentSession { id } content {
+              __typename
+              ... on AgentActivityResponseContent { type body }
+              ... on AgentActivityElicitationContent { type body }
+              ... on AgentActivityErrorContent { type body }
+            } }
+          }
+        }`,
+              variables: { id: input.id },
+            },
+          ),
+        );
+      const node = result.data.agentActivities.nodes[0];
+      return node === undefined
+        ? undefined
+        : {
+            id: node.id,
+            agentSessionId: node.agentSession.id,
+            type: node.content.type,
+            body: node.content.body,
+          };
     },
     async createComment(input) {
       const result = CommentResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `mutation PaseoComment($issueId: String!, $body: String!, $parentId: String) {
-            commentCreate(input: { issueId: $issueId, body: $body, parentId: $parentId }) {
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+          {
+            query: `mutation PaseoComment($id: String, $issueId: String!, $body: String!, $parentId: String) {
+            commentCreate(input: { id: $id, issueId: $issueId, body: $body, parentId: $parentId }) {
               success
             }
           }`,
-          variables: {
-            issueId: input.issueId,
-            body: input.body,
-            ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
+            variables: {
+              ...(input.id === undefined ? {} : { id: input.id }),
+              issueId: input.issueId,
+              body: input.body,
+              ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
+            },
           },
-        }),
+        ),
       );
       if (!result.data.commentCreate.success) throw new Error("Linear comment was not accepted");
     },
     async createAgentActivity(input) {
       const result = AgentActivityResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `mutation PaseoAgentActivity(
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+          {
+            query: `mutation PaseoAgentActivity(
+            $id: String
             $agentSessionId: String!
             $content: JSONObject!
             $ephemeral: Boolean
@@ -714,6 +1083,7 @@ export function createLinearApiClient(options: {
             $signalMetadata: JSONObject
           ) {
             agentActivityCreate(input: {
+              id: $id
               agentSessionId: $agentSessionId
               content: $content
               ephemeral: $ephemeral
@@ -721,14 +1091,18 @@ export function createLinearApiClient(options: {
               signalMetadata: $signalMetadata
             }) { success }
           }`,
-          variables: {
-            agentSessionId: input.agentSessionId,
-            content: input.content,
-            ...(input.ephemeral === undefined ? {} : { ephemeral: input.ephemeral }),
-            ...(input.signal === undefined ? {} : { signal: input.signal }),
-            ...(input.signalMetadata === undefined ? {} : { signalMetadata: input.signalMetadata }),
+            variables: {
+              ...(input.id === undefined ? {} : { id: input.id }),
+              agentSessionId: input.agentSessionId,
+              content: input.content,
+              ...(input.ephemeral === undefined ? {} : { ephemeral: input.ephemeral }),
+              ...(input.signal === undefined ? {} : { signal: input.signal }),
+              ...(input.signalMetadata === undefined
+                ? {}
+                : { signalMetadata: input.signalMetadata }),
+            },
           },
-        }),
+        ),
       );
       if (!result.data.agentActivityCreate.success) {
         throw new Error("Linear agent activity was not accepted");
@@ -736,22 +1110,112 @@ export function createLinearApiClient(options: {
     },
     async updateAgentSessionExternalUrls(input) {
       const result = AgentSessionUpdateResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `mutation PaseoAgentSessionUrls($id: String!, $externalUrls: [AgentSessionExternalUrlInput!]) {
-            agentSessionUpdate(id: $id, input: { externalUrls: $externalUrls }) { success }
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+          {
+            query: `mutation PaseoAgentSessionUrls($id: String!, $externalUrls: [AgentSessionExternalUrlInput!]) {
+            agentSessionUpdate(id: $id, input: { addedExternalUrls: $externalUrls }) { success }
           }`,
-          variables: {
-            id: input.agentSessionId,
-            externalUrls: input.externalUrls.map((entry) => ({
-              label: entry.label,
-              url: entry.url,
-            })),
+            variables: {
+              id: input.agentSessionId,
+              externalUrls: input.externalUrls.map((entry) => ({
+                label: entry.label,
+                url: entry.url,
+              })),
+            },
           },
-        }),
+        ),
       );
       if (!result.data.agentSessionUpdate.success) {
         throw new Error("Linear agent session update was not accepted");
       }
+    },
+    async updateAgentSessionPlan(input) {
+      const result = AgentSessionUpdateResponseSchema.parse(
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+          {
+            query: `mutation PaseoAgentSessionPlan($id: String!, $plan: JSONObject!) {
+            agentSessionUpdate(id: $id, input: { plan: $plan }) { success }
+          }`,
+            variables: { id: input.agentSessionId, plan: input.plan },
+          },
+        ),
+      );
+      if (!result.data.agentSessionUpdate.success) {
+        throw new Error("Linear agent session plan was not accepted");
+      }
+    },
+    async readIssueSessions(input) {
+      const sessions: LinearIssueSessionSummary[] = [];
+      const seen = new Set<string>();
+      let after: string | null = null;
+      // Refuse an incomplete listing. The caller must never interpret truncation as no match.
+      for (let page = 0; page < 100; page += 1) {
+        const result = IssueSessionsResponseSchema.parse(
+          await graphql(
+            request,
+            await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+            {
+              query: `query PaseoIssueSessions($id: String!, $after: String) {
+            issue(id: $id) { agentSessions(first: 100, after: $after, includeArchived: true) {
+              nodes { id appUser { id } externalLinks { label url } }
+              pageInfo { hasNextPage endCursor }
+            } }
+          }`,
+              variables: { id: input.issueId, after },
+            },
+          ),
+        );
+        if (result.data.issue === null)
+          throw new Error("Linear issue disappeared while reading its sessions");
+        const connection = result.data.issue.agentSessions;
+        for (const session of connection.nodes)
+          sessions.push({
+            id: session.id,
+            appUserId: session.appUser.id,
+            externalUrls: session.externalLinks,
+          });
+        if (!connection.pageInfo.hasNextPage) return sessions;
+        const next = connection.pageInfo.endCursor;
+        if (!next || seen.has(next))
+          throw new Error("Linear issue session pagination did not advance");
+        seen.add(next);
+        after = next;
+      }
+      throw new Error("Linear issue session listing exceeds the safe pagination limit");
+    },
+    async createAgentSessionOnIssue(input) {
+      const result = AgentSessionOnIssueResponseSchema.parse(
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+          {
+            query: `mutation PaseoAgentSessionOnIssue($input: AgentSessionCreateOnIssue!) {
+          agentSessionCreateOnIssue(input: $input) { success agentSession { id } }
+        }`,
+            variables: { input: { issueId: input.issueId, externalUrls: input.externalUrls } },
+          },
+        ),
+      );
+      return result.data.agentSessionCreateOnIssue.agentSession;
+    },
+    async createAgentSessionOnComment(input) {
+      const result = AgentSessionCreateResponseSchema.parse(
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId, input.expectedConnectionId),
+          {
+            query: `mutation PaseoAgentSessionOnComment($input: AgentSessionCreateOnComment!) {
+            agentSessionCreateOnComment(input: $input) { success agentSession { id } }
+          }`,
+            variables: { input: { commentId: input.commentId } },
+          },
+        ),
+      );
+      return result.data.agentSessionCreateOnComment.agentSession;
     },
   };
 }
@@ -796,6 +1260,7 @@ async function exchangeToken(
   scopes?: string[];
 }> {
   const response = await request("https://api.linear.app/oauth/token", {
+    signal: AbortSignal.timeout(20_000),
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -832,6 +1297,7 @@ async function graphql(
   payload: { query: string; variables: Record<string, unknown> },
 ): Promise<unknown> {
   const response = await request("https://api.linear.app/graphql", {
+    signal: AbortSignal.timeout(20_000),
     method: "POST",
     headers: {
       authorization: `Bearer ${accessToken}`,

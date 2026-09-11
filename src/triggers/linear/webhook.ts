@@ -13,6 +13,7 @@ import {
   normalizeLinearEvent,
 } from "./events.js";
 import type { LinearIssueDetails } from "../../providers/linear/client.js";
+import { LinearWebhookInboxWorker, type LinearWebhookInboxStore } from "./inbox.js";
 
 const MAX_WEBHOOK_BYTES = 1_048_576;
 const MAX_TIMESTAMP_SKEW_MS = 60_000;
@@ -20,6 +21,11 @@ const MAX_TIMESTAMP_SKEW_MS = 60_000;
 export interface LinearWebhookSourceOptions {
   signingSecret: string;
   now?: () => number;
+  inbox?: {
+    database: LinearWebhookInboxStore;
+    applicationId: string;
+    configurationVersion: number;
+  };
   canHydrateIssue?(linearOrganizationId: string): Promise<boolean>;
   resolveIssue?(input: {
     linearOrganizationId: string;
@@ -35,6 +41,7 @@ export interface LinearWebhookSourceOptions {
     payload: unknown;
     receivedAt: Date;
     dropReason?: ProviderEventDropReasonCode;
+    providerConfigurationVersion?: number;
   }): Promise<ProviderEventAcceptance>;
 }
 
@@ -48,22 +55,53 @@ interface VerifiedLinearRequest {
   payload: unknown;
   signatureHash: string;
   receivedAt: Date;
+  configurationVersion?: number;
 }
 
 export function createLinearWebhookSource(
   options: LinearWebhookSourceOptions,
 ): LinearWebhookEndpoint {
   const handlers = new Set<TriggerHandler>();
+  const worker =
+    options.inbox === undefined
+      ? undefined
+      : new LinearWebhookInboxWorker({
+          database: options.inbox.database,
+          applicationId: options.inbox.applicationId,
+          ...(options.now === undefined ? {} : { now: options.now }),
+          handle: async (row) => {
+            await processLinearEvent(row, handlers, options);
+          },
+        });
   return {
     async handle(request) {
       const verified = await verifyLinearRequest(request, options);
       if (verified instanceof Response) return verified;
+      if (options.inbox !== undefined) {
+        try {
+          await options.inbox.database.admitLinearWebhook({
+            ...verified,
+            applicationId: options.inbox.applicationId,
+            configurationVersion: options.inbox.configurationVersion,
+          });
+          worker?.wake();
+          return new Response("OK", { status: 200 });
+        } catch (error) {
+          logger.error(
+            { err: error, deliveryId: verified.deliveryId },
+            "Linear webhook admission failed",
+          );
+          return Response.json({ error: "event_admission_unavailable" }, { status: 503 });
+        }
+      }
       return handoffLinearEvent(verified, handlers, options);
     },
     async start(handler) {
       handlers.add(handler);
+      worker?.start();
     },
     async stop() {
+      await worker?.stop();
       handlers.clear();
     },
   };
@@ -116,47 +154,55 @@ async function handoffLinearEvent(
   options: LinearWebhookSourceOptions,
 ): Promise<Response> {
   try {
-    let event = normalizeLinearEvent(verified.payload, verified.eventName);
-    if (event === undefined) {
-      logger.info({ deliveryId: verified.deliveryId }, "ignoring unsupported Linear event");
-      return new Response("OK", { status: 200 });
-    }
-    const hasCompleteTeamRoute =
-      eventTeamId(event) !== undefined &&
-      hasExplicitNullLinearProject(verified.payload, verified.eventName);
-    // Issue webhooks carry their filter fields directly. Comment and Agent Session issue
-    // relations can be compact even when they already identify a project or team.
-    const needsIssueHydration =
-      event.type !== "issue" || (eventProjectId(event) === undefined && !hasCompleteTeamRoute);
-    if (needsIssueHydration && options.resolveIssue !== undefined) {
-      const source = linearEventSource(event);
-      if (
-        options.canHydrateIssue !== undefined &&
-        !(await options.canHydrateIssue(event.organizationId))
-      ) {
-        return await acceptAndDispatchLinearEvent(event, source, verified, handlers, options, true);
-      }
-      const issue = await options.resolveIssue({
-        linearOrganizationId: event.organizationId,
-        issueId: eventIssueId(event),
-      });
-      event = normalizeLinearEvent(verified.payload, verified.eventName, issue);
-    }
-    if (event === undefined) {
-      logger.warn({ deliveryId: verified.deliveryId }, "Linear event issue hydration was invalid");
-      return Response.json({ error: "invalid_linear_event" }, { status: 400 });
-    }
-    return await acceptAndDispatchLinearEvent(
-      event,
-      linearEventSource(event),
-      verified,
-      handlers,
-      options,
-    );
+    return await processLinearEvent(verified, handlers, options);
   } catch (error) {
     logger.error({ err: error, deliveryId: verified.deliveryId }, "Linear event handoff failed");
     return Response.json({ error: "event_handoff_unavailable" }, { status: 503 });
   }
+}
+
+async function processLinearEvent(
+  verified: VerifiedLinearRequest,
+  handlers: Set<TriggerHandler>,
+  options: LinearWebhookSourceOptions,
+): Promise<Response> {
+  let event = normalizeLinearEvent(verified.payload, verified.eventName);
+  if (event === undefined) {
+    logger.info({ deliveryId: verified.deliveryId }, "ignoring unsupported Linear event");
+    return new Response("OK", { status: 200 });
+  }
+  const hasCompleteTeamRoute =
+    eventTeamId(event) !== undefined &&
+    hasExplicitNullLinearProject(verified.payload, verified.eventName);
+  // Issue webhooks carry their filter fields directly. Comment and Agent Session issue
+  // relations can be compact even when they already identify a project or team.
+  const needsIssueHydration =
+    event.type !== "issue" || (eventProjectId(event) === undefined && !hasCompleteTeamRoute);
+  if (needsIssueHydration && options.resolveIssue !== undefined) {
+    const source = linearEventSource(event);
+    if (
+      options.canHydrateIssue !== undefined &&
+      !(await options.canHydrateIssue(event.organizationId))
+    ) {
+      return await acceptAndDispatchLinearEvent(event, source, verified, handlers, options, true);
+    }
+    const issue = await options.resolveIssue({
+      linearOrganizationId: event.organizationId,
+      issueId: eventIssueId(event),
+    });
+    event = normalizeLinearEvent(verified.payload, verified.eventName, issue);
+  }
+  if (event === undefined) {
+    logger.warn({ deliveryId: verified.deliveryId }, "Linear event issue hydration was invalid");
+    return Response.json({ error: "invalid_linear_event" }, { status: 400 });
+  }
+  return await acceptAndDispatchLinearEvent(
+    event,
+    linearEventSource(event),
+    verified,
+    handlers,
+    options,
+  );
 }
 
 async function acceptAndDispatchLinearEvent(
@@ -178,6 +224,9 @@ async function acceptAndDispatchLinearEvent(
     source,
     payload: event,
     receivedAt: verified.receivedAt,
+    ...(verified.configurationVersion === undefined
+      ? {}
+      : { providerConfigurationVersion: verified.configurationVersion }),
     ...(handlers.size === 0 && !preserveBindingDrop
       ? { dropReason: "configuration_unavailable" }
       : {}),

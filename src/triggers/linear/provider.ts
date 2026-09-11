@@ -1,9 +1,21 @@
+import type { LinearTriageIntakeStore } from "../../db/linear-triage-intakes.js";
+import { intakeIssueCreated, type LinearTriageIntakeResult } from "./triage-intake.js";
+import { randomUUID } from "node:crypto";
 import type { CompiledTriggerConfig } from "../../config/index.js";
-import type { ProjectConfigurationStore } from "../../configuration/store.js";
-import type { Database, LinearConnectionRecord } from "../../db/types.js";
+import type {
+  ProjectConfigurationStore,
+  StoredProjectConfiguration,
+} from "../../configuration/store.js";
+import type {
+  Database,
+  LinearConnectionRecord,
+  LinearCommentBridgeKey,
+  LinearCommentBridgeRecord,
+} from "../../db/types.js";
 import {
   LINEAR_AGENT_ACTIVITY_CONTEXT_LIMIT,
   LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT,
+  type LinearCommentThread,
   type LinearApiClient,
   type LinearAgentActivity,
   type LinearIssueComment,
@@ -29,10 +41,16 @@ import {
 } from "./events.js";
 import {
   matchLinearTriggers,
+  matchesIssueScope,
+  matchesLinearWorkAuthority,
+  type MatchedLinearTrigger,
   readLinearAgentSessionInvocationParserMessage,
   readLinearCommentInvocationParserMessage,
 } from "./match.js";
 import { LINEAR_REPLY_OUTPUT_TYPE } from "./reply.js";
+import type { LinearIssueSessionBridgeStore } from "../../db/linear-issue-session-bridges.js";
+import { isIssueSessionBridgeEcho, sessionForIssueEvent } from "./issue-session-bridge.js";
+import { continueLinearIssue } from "./issue-continuation.js";
 import {
   createLinearMirrorState,
   planLinearMirrorActivities,
@@ -44,6 +62,15 @@ export interface LinearOutputContext {
   linearOrganizationId: string;
   issueId: string;
   agentSessionId: string | null;
+  turnKey?: string;
+  publishIssueComment?: boolean;
+  finalizeIssue?: {
+    teamId: string;
+    reviewStateId: string;
+    completedStateId: string;
+    waitingStateId?: string;
+    allowedAssigneeIds?: string[];
+  };
   /**
    * Linear threads are one level deep: a reply's parent must be the top-level comment, and
    * Linear rejects a nested comment as parent. Null when the trigger was not a comment.
@@ -73,12 +100,15 @@ export interface LinearTriggerContext {
         state: { id: string } | null;
         assignee: { id: string } | null;
         label_ids: string[];
+        delegate?: { id: string } | null;
       };
       comment: { id: string; body: string; parent_id: string | null } | null;
       agent_session: {
         id: string;
         app_user_id: string;
         status: string;
+        root_comment_id?: string;
+        source_comment_id?: string;
         url?: string;
       } | null;
       agent_activity: {
@@ -88,6 +118,7 @@ export interface LinearTriggerContext {
         created_at: string;
         signal?: "stop";
       } | null;
+      changes?: import("./events.js").NormalizedLinearIssueEvent["changes"];
       prompt_context: string | null;
       trigger_thread_context:
         | {
@@ -139,15 +170,31 @@ export const LINEAR_SUPERSEDED_BY_NEW_TURN_REASON = "superseded_by_new_turn";
 
 export interface LinearTriggerProviderOptions {
   configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
+  publicBaseUrl?: string;
+  reportMissingTerminalOutcome?: (executionId: string) => Promise<void>;
   client?: Pick<
     LinearApiClient,
     "readIssueComments" | "readAgentSessionActivities" | "readCommentThread" | "createAgentActivity"
-  >;
+  > &
+    Partial<
+      Pick<
+        LinearApiClient,
+        | "readIssue"
+        | "createAgentSessionOnComment"
+        | "readIssueSessions"
+        | "createAgentSessionOnIssue"
+        | "readTeamWorkflowStates"
+        | "updateIssue"
+      >
+    >;
   /** The connection bound to a Linear workspace; its app user is what `thread_with_app` looks for. */
   connectionForLinearOrganization?: (input: {
     organizationId: string;
     linearOrganizationId: string;
-  }) => Promise<Pick<LinearConnectionRecord, "appUserId"> | undefined>;
+  }) => Promise<
+    | (Pick<LinearConnectionRecord, "appUserId"> & Partial<Pick<LinearConnectionRecord, "id">>)
+    | undefined
+  >;
   /**
    * Finds the runs a comment trigger started, so a new agent session can supersede them, and
    * the session receipts a comment already opened or prompted, so the comment starts none.
@@ -155,7 +202,18 @@ export interface LinearTriggerProviderOptions {
   database?: Pick<
     Database,
     "listTriggerRunsForLinearComments" | "listLinearAgentSessionReceiptsForComment"
-  >;
+  > &
+    Partial<LinearIssueSessionBridgeStore> &
+    Partial<LinearTriageIntakeStore> &
+    Partial<
+      Pick<
+        Database,
+        | "claimLinearCommentBridge"
+        | "findLinearCommentBridge"
+        | "bindLinearCommentBridge"
+        | "startLinearCommentBridgeCreation"
+      >
+    >;
   executions?: TriggerProviderExecutionControl;
 }
 
@@ -239,78 +297,76 @@ export function createLinearTriggerProvider(
         await stopLinearAgentSession(options, externalTrigger.projectId, received);
         return "agent_session_stopped";
       }
-      const { event, appUserId } = await hydrateLinearCommentThread(
+      const intake = await processLinearIssueIntake(
         options,
         externalTrigger,
         received,
         stored.configuration.triggers,
       );
+      const { event, appUserId, thread } = await hydrateLinearCommentThread(
+        options,
+        externalTrigger,
+        received,
+        stored.configuration.triggers,
+      );
+      if (
+        (await isIssueEventSessionEcho(options, externalTrigger, event, appUserId)) ||
+        (await isLinearBridgeSessionEcho(options.database, externalTrigger, event))
+      ) {
+        return LINEAR_SUPERSEDED_BY_AGENT_SESSION_REASON;
+      }
       const matched = matchLinearTriggers(
         stored.configuration,
         event,
         externalTrigger.connectionId,
         appUserId,
       );
-      if (matched.length === 0) return "trigger_filters_rejected";
-
-      const matches: TriggerProviderMatch<LinearTriggerContext, LinearOutputContext>[] = [];
-      for (const candidate of matched) {
-        const compiledTrigger = stored.configuration.triggers.find(
-          (trigger) => trigger.name === candidate.trigger.name,
-        );
-        if (compiledTrigger === undefined) {
-          throw new Error(`compiled trigger not found: ${candidate.trigger.name}`);
-        }
-        const issue = event.type === "issue" ? event.issue : event.issue;
-        if (issue === null) continue;
-        const outputContext: LinearOutputContext = {
-          provider: "linear",
-          linearOrganizationId: event.organizationId,
-          issueId: issue.id,
-          agentSessionId: event.type === "agent_session" ? event.agentSession.id : null,
-          threadRootCommentId:
-            event.type === "comment" ? (event.comment.parentId ?? event.comment.id) : null,
-        };
-        const triggerContext: LinearTriggerContext = {
-          provider: "linear",
-          target: outputContext,
-          event: {
-            linear: buildLinearContext(
-              event,
-              externalTrigger.deliveryId,
-              externalTrigger.connectionId,
-            ),
-          },
-        };
-        const prompt = promptForEvent(event);
-        const invocation = parseInvocation(
-          prompt,
-          compiledTrigger.inputs,
-          undefined,
-          parserMessageForEvent(event, compiledTrigger.filters),
-        );
-        if (invocation.status === "accepted") {
-          if (!matchesInputFilters(invocation.inputs, compiledTrigger.filters?.inputs)) continue;
-          matches.push({
-            triggerName: candidate.trigger.name,
-            triggerContext,
-            outputContext,
-            configurationRevisionId: stored.revision.id,
-            hubConfig: stored.configuration,
-            invocation,
-          });
-        } else {
-          matches.push({
-            triggerName: candidate.trigger.name,
-            triggerContext,
-            outputContext,
-            configurationRevisionId: stored.revision.id,
-            hubConfig: stored.configuration,
-            invocation,
-          });
-        }
+      if (matched.length === 0 && intake !== undefined) {
+        if (intake.status === "applied") return "linear_intake_applied";
+        if (intake.status === "ambiguous") return "linear_intake_ambiguous";
+        return "linear_intake_ignored";
       }
+      if (matched.length === 0)
+        return linearFilterRejectionReason(
+          stored.configuration.triggers,
+          externalTrigger,
+          event,
+          appUserId,
+        );
+
+      // Authorization has already checked the real comment author, project team and connection.
+      // Creating a session never borrows the app's authority to authorize that human.
+      const delegatedComment =
+        event.type === "comment" &&
+        matched.some((candidate) => candidate.trigger.on === "linear.delegated_comment");
+      const matches = await buildLinearMatches({
+        options,
+        externalTrigger,
+        event,
+        appUserId,
+        thread,
+        stored,
+        matched,
+        delegatedComment,
+      });
       if (matches.length === 0) return "trigger_filters_rejected";
+      if (
+        await continueAcceptedIssueMatch(options, externalTrigger, event, stored, matches, (id) =>
+          mirrors.set(id, createLinearMirrorState()),
+        )
+      )
+        return "steered_into_live_session";
+      // The native session webhook and this comment may arrive in either order. Persisted
+      // dispatch keys arbitrate ownership; legacy comment supplanting must not cancel this run.
+      if (
+        delegatedComment ||
+        matches.some(
+          (match) =>
+            stored.configuration.triggers.find((trigger) => trigger.name === match.triggerName)
+              ?.filters?.continue_issue === true,
+        )
+      )
+        return matches;
       // Deliberately after the filters. A steer injects text straight into an agent running with
       // `bypassPermissions` on a private repository, so it must clear exactly the checks a new run
       // clears — `from_users`, team, connection. The `stop` path above skips them; this one must
@@ -328,6 +384,24 @@ export function createLinearTriggerProvider(
         stored.configuration,
       );
       return superseded ?? matches;
+    },
+    async continuePendingRun(input) {
+      if (
+        options.executions === undefined ||
+        input.trigger.steps.length !== 1 ||
+        input.trigger.filters?.continue_issue !== true
+      )
+        return false;
+      const triggerContext = await refreshPendingIssueAuthority(options, input);
+      const continued = await continueLinearIssue({
+        ...input,
+        triggerContext,
+        executions: options.executions,
+        prompt: `${input.prompt}\n\n<linear-event>\n${JSON.stringify(triggerContext.event.linear)}\n</linear-event>`,
+      });
+      if (continued && input.outputContext.agentSessionId !== null)
+        mirrors.set(input.outputContext.agentSessionId, createLinearMirrorState());
+      return continued;
     },
     async materializeContext(launch): Promise<LinearMaterializedContext> {
       const { trigger_thread_context: locator, ...linear } = launch.triggerContext.event.linear;
@@ -418,6 +492,17 @@ export function createLinearTriggerProvider(
         ? identifier.toLowerCase()
         : undefined;
     },
+    workspaceKeyFor(triggerContext) {
+      const linear = triggerContext.event.linear;
+      if (linear.connection_id === null)
+        throw new Error("Linear workspace binding requires a connection");
+      return JSON.stringify([
+        "linear",
+        linear.connection_id,
+        linear.organization.id,
+        linear.issue.id,
+      ]);
+    },
     keepsExecutionAliveBetweenTurns(triggerContext) {
       // Only agent sessions. A comment-triggered run answers once and is done; a session is a
       // panel the user keeps writing into, and Linear treats it as one conversation.
@@ -449,6 +534,7 @@ export function createLinearTriggerProvider(
       // lands. A reply already closed it; otherwise close it explicitly. Unknown
       // emissions are left alone rather than risking a false "no reply" notice.
       if (
+        _outputContext.publishIssueComment !== true &&
         result.outputEmissions !== undefined &&
         (result.outputEmissions[LINEAR_REPLY_OUTPUT_TYPE] ?? 0) === 0
       ) {
@@ -480,7 +566,10 @@ export function createLinearTriggerProvider(
       if (agentSession === null) return;
       await mirrorActivities(triggerContext.event.linear.organization.id, agentSession.id, event);
     },
-    async onAgentExecutionTerminal(_executionId, triggerContext) {
+    async onAgentExecutionTerminal(executionId, triggerContext) {
+      if (triggerContext.target.publishIssueComment === true) {
+        await options.reportMissingTerminalOutcome?.(executionId);
+      }
       const agentSession = triggerContext.event.linear.agent_session;
       if (agentSession === null) return;
       // Drains before dropping: the last activities of a turn are the ones that explain how it
@@ -488,6 +577,195 @@ export function createLinearTriggerProvider(
       await mirrorQueues.get(agentSession.id);
       mirrors.delete(agentSession.id);
       mirrorQueues.delete(agentSession.id);
+    },
+  };
+}
+
+async function refreshPendingIssueAuthority(
+  options: LinearTriggerProviderOptions,
+  input: Parameters<
+    NonNullable<
+      TriggerProvider<"linear", LinearTriggerContext, LinearOutputContext>["continuePendingRun"]
+    >
+  >[0],
+): Promise<LinearTriggerContext> {
+  const active = await options.configurationStoreForProject(input.projectId).getActive();
+  if (active?.revision.id !== input.revisionId)
+    throw new Error(
+      "Linear pending run configuration is no longer active; reconcile before continuing",
+    );
+  const linear = input.triggerContext.event.linear;
+  const connection = await options.connectionForLinearOrganization?.({
+    organizationId: input.organizationId,
+    linearOrganizationId: linear.organization.id,
+  });
+  if (
+    !connection?.id ||
+    connection.id !== linear.connection_id ||
+    (linear.agent_session !== null && linear.agent_session.app_user_id !== connection.appUserId)
+  )
+    throw new Error("Linear pending run connection authority was revoked or changed");
+  if (options.client?.readIssue === undefined)
+    throw new Error("Linear pending run requires a current issue read");
+  const issue = await options.client.readIssue({
+    linearOrganizationId: linear.organization.id,
+    issueId: linear.issue.id,
+  });
+  if (
+    issue === undefined ||
+    issue.id !== linear.issue.id ||
+    !matchesLinearWorkAuthority(
+      input.trigger,
+      {
+        type: linear.event_type,
+        action: linear.action,
+        actor: linear.actor,
+      },
+      issue,
+      connection.id,
+      connection.appUserId,
+    )
+  )
+    throw new Error("Linear pending run issue scope, delegate, or author authority was revoked");
+  return {
+    ...input.triggerContext,
+    event: { linear: { ...linear, issue: linearIssueContext(issue) } },
+  };
+}
+
+async function continueAcceptedIssueMatch(
+  options: LinearTriggerProviderOptions,
+  external: ExternalTrigger,
+  event: NormalizedLinearEvent,
+  stored: StoredProjectConfiguration,
+  matches: TriggerProviderMatch<LinearTriggerContext, LinearOutputContext>[],
+  resetMirror: (id: string) => void,
+): Promise<boolean> {
+  if (options.executions === undefined || matches.length !== 1) return false;
+  const match = matches[0]!;
+  const trigger = stored.configuration.triggers.find((item) => item.name === match.triggerName);
+  if (trigger?.filters?.continue_issue !== true || match.invocation.status !== "accepted")
+    return false;
+  const continued = await continueLinearIssue({
+    executions: options.executions,
+    projectId: external.projectId,
+    revisionId: stored.revision.id,
+    trigger,
+    triggerContext: match.triggerContext,
+    outputContext: match.outputContext,
+    prompt: `${promptForEvent(event)}\n\n<linear-event>\n${JSON.stringify(match.triggerContext.event.linear)}\n</linear-event>`,
+  });
+  if (continued && match.outputContext.agentSessionId !== null)
+    resetMirror(match.outputContext.agentSessionId);
+  return continued;
+}
+
+async function processLinearIssueIntake(
+  options: LinearTriggerProviderOptions,
+  external: ExternalTrigger,
+  received: NormalizedLinearEvent,
+  triggers: readonly CompiledTriggerConfig[],
+): Promise<LinearTriageIntakeResult | undefined> {
+  if (received.type !== "issue" || received.action !== "create") return undefined;
+  const candidates = triggers.filter(
+    (trigger) =>
+      trigger.on === "linear.delegated_issue_updated" &&
+      trigger.filters?.intake_triage_state_id !== undefined &&
+      matchesIssueScope(
+        received.issue,
+        {
+          team: trigger.filters.team,
+          project: trigger.filters.project,
+          connectionId: trigger.filters.connectionId,
+        },
+        external.connectionId,
+      ),
+  );
+  if (candidates.length === 0) return undefined;
+  const disposition = (result: LinearTriageIntakeResult) => {
+    const details = {
+      issueId: received.issue.id,
+      providerEventReceiptId: external.providerEventReceiptId,
+      intakeStatus: result.status,
+      intakeReason: result.reason,
+    };
+    if (result.status === "ambiguous") logger.warn(details, "Linear Triage intake disposition");
+    else logger.info(details, "Linear Triage intake disposition");
+    return result;
+  };
+  const connection = await options.connectionForLinearOrganization?.({
+    organizationId: external.organizationId,
+    linearOrganizationId: received.organizationId,
+  });
+  if (connection === undefined) throw new Error("Linear intake connection identity is unavailable");
+  if (connection.id !== external.connectionId)
+    throw new Error("Linear intake connection no longer matches the authorized event");
+  if (received.sourceActorIsBot === true || received.actor?.id === connection.appUserId)
+    return disposition({ status: "ignored", reason: "bot_or_app_actor" });
+  const authorized = candidates.filter(
+    (trigger) =>
+      received.actor !== null && trigger.filters?.from_users?.includes(received.actor.id),
+  );
+  if (authorized.length === 0)
+    return disposition({ status: "ignored", reason: "actor_not_authorized" });
+  if (new Set(authorized.map((trigger) => trigger.filters!.intake_triage_state_id)).size !== 1)
+    throw new Error("Linear issue intake has conflicting configured Triage states");
+  const filter = authorized[0]!.filters!;
+  if (!external.connectionId) throw new Error("Linear intake requires a bound connection");
+  const dependencies = linearIntakeDependencies(options);
+  const result = await intakeIssueCreated({
+    key: {
+      organizationId: external.organizationId,
+      projectId: external.projectId,
+      connectionId: external.connectionId,
+      linearOrganizationId: received.organizationId,
+      issueId: received.issue.id,
+    },
+    eventKey: external.deliveryId,
+    providerEventReceiptId: external.providerEventReceiptId,
+    teamId: filter.team!,
+    triageStateId: filter.intake_triage_state_id!,
+    sourceActorId: received.actor?.id ?? null,
+    fromUsers: filter.from_users!,
+    sourceStateId: received.sourceStateId ?? null,
+    ...(received.sourceIssueUpdatedAt === undefined
+      ? {}
+      : { sourceIssueUpdatedAt: received.sourceIssueUpdatedAt }),
+    ...dependencies,
+  });
+  disposition(result);
+  if (result.status === "pending")
+    throw new Error(`Linear intake remains pending: ${result.reason}`);
+  return result;
+}
+
+function linearIntakeDependencies(
+  options: LinearTriggerProviderOptions,
+): Pick<Parameters<typeof intakeIssueCreated>[0], "client" | "database"> {
+  const { client, database } = options;
+  if (
+    !client?.readIssue ||
+    !client.readTeamWorkflowStates ||
+    !client.updateIssue ||
+    !database?.findLinearTriageIntake ||
+    !database.claimLinearTriageIntake ||
+    !database.startLinearTriageIntake ||
+    !database.settleLinearTriageIntake
+  )
+    throw new Error("Linear intake requires its durable journal and provider API");
+  return {
+    client: {
+      readIssue: (input) => client.readIssue!(input),
+      readTeamWorkflowStates: (input) => client.readTeamWorkflowStates!(input),
+      updateIssue: (input) => client.updateIssue!(input),
+    },
+    database: {
+      findLinearTriageIntake: (key) => database.findLinearTriageIntake!(key),
+      claimLinearTriageIntake: (input) => database.claimLinearTriageIntake!(input),
+      startLinearTriageIntake: (key, lease, now) =>
+        database.startLinearTriageIntake!(key, lease, now),
+      settleLinearTriageIntake: (key, lease, outcome) =>
+        database.settleLinearTriageIntake!(key, lease, outcome),
     },
   };
 }
@@ -560,18 +838,239 @@ function hasSourceTrigger(triggers: readonly { on: string }[], source: string): 
 
 function triggerMatchesLinearSource(trigger: string, source: string): boolean {
   if (source === "linear.issue") {
-    return trigger === "linear.issue_entered_scope" || trigger === "linear.issue_assigned";
+    return (
+      trigger === "linear.issue_entered_scope" ||
+      trigger === "linear.issue_assigned" ||
+      trigger === "linear.delegated_issue_updated"
+    );
   }
-  if (source === "linear.comment") return trigger === "linear.comment_created";
+  if (source === "linear.comment")
+    return trigger === "linear.comment_created" || trigger === "linear.delegated_comment";
   return source === "linear.agent_session" && trigger === "linear.agent_session";
+}
+
+function linearFilterRejectionReason(
+  triggers: readonly CompiledTriggerConfig[],
+  external: ExternalTrigger,
+  event: NormalizedLinearEvent,
+  appUserId: string | undefined,
+): ProviderEventDropReasonCode {
+  const candidates = triggers.filter((trigger) =>
+    triggerMatchesLinearSource(trigger.on, external.source),
+  );
+  if (
+    !candidates.length ||
+    candidates.some((trigger) => trigger.filters?.require_delegate !== true)
+  )
+    return "trigger_filters_rejected";
+  if (appUserId !== undefined && event.actor?.id === appUserId) return "linear_app_event_ignored";
+  if (
+    event.type === "issue" &&
+    event.action === "update" &&
+    candidates.every((trigger) => trigger.on === "linear.delegated_issue_updated") &&
+    !(event.changes ?? []).some(({ field }) => field !== "delegateId")
+  )
+    return "linear_no_work_change";
+  if (
+    event.issue === null ||
+    !candidates.some((trigger) =>
+      matchesIssueScope(event.issue!, trigger.filters, external.connectionId),
+    )
+  )
+    return "linear_issue_outside_scope";
+  if (appUserId === undefined || event.issue.delegateId !== appUserId)
+    return "linear_issue_not_delegated";
+  if (
+    event.actor !== null &&
+    candidates.every(
+      (trigger) =>
+        trigger.filters?.from_users !== undefined &&
+        !trigger.filters.from_users.includes("*") &&
+        !trigger.filters.from_users.includes(event.actor!.id),
+    )
+  )
+    return "linear_actor_not_authorized";
+  return "trigger_filters_rejected";
 }
 
 function promptForEvent(event: NormalizedLinearEvent): string {
   if (event.type === "comment") return event.comment.body;
   if (event.type === "agent_session") return event.prompt;
+  if (event.action === "update" && (event.changes?.length ?? 0) > 0) {
+    return `Issue updated: ${event.issue.identifier ?? event.issue.id} — ${event.issue.title}\nChanges: ${JSON.stringify(event.changes)}`;
+  }
   return event.issue.description === null
     ? event.issue.title
     : `${event.issue.title}\n\n${event.issue.description}`;
+}
+
+async function buildLinearMatches(input: {
+  options: LinearTriggerProviderOptions;
+  externalTrigger: ExternalTrigger;
+  event: NormalizedLinearEvent;
+  appUserId: string | undefined;
+  thread: LinearCommentThread | undefined;
+  stored: StoredProjectConfiguration;
+  matched: readonly MatchedLinearTrigger[];
+  delegatedComment: boolean;
+}): Promise<TriggerProviderMatch<LinearTriggerContext, LinearOutputContext>[]> {
+  const { options, externalTrigger, event, appUserId, thread, stored, matched, delegatedComment } =
+    input;
+  let commentSession: string | undefined;
+  const matches: TriggerProviderMatch<LinearTriggerContext, LinearOutputContext>[] = [];
+  for (const candidate of matched) {
+    const trigger = stored.configuration.triggers.find(
+      (value) => value.name === candidate.trigger.name,
+    );
+    if (trigger === undefined)
+      throw new Error(`compiled trigger not found: ${candidate.trigger.name}`);
+    const invocation = parseInvocation(
+      promptForEvent(event),
+      trigger.inputs,
+      undefined,
+      parserMessageForEvent(event, trigger.filters),
+    );
+    if (invocation.status === "accepted") {
+      if (!matchesInputFilters(invocation.inputs, trigger.filters?.inputs)) continue;
+      if (
+        event.type === "issue" &&
+        trigger.on === "linear.delegated_issue_updated" &&
+        commentSession === undefined
+      ) {
+        commentSession = await sessionForDelegatedIssue(
+          options,
+          externalTrigger,
+          event,
+          appUserId!,
+          trigger,
+        );
+      }
+      if (delegatedComment && event.type === "comment" && commentSession === undefined) {
+        commentSession = await sessionForDelegatedComment(
+          options,
+          externalTrigger,
+          event,
+          thread,
+          appUserId!,
+        );
+      }
+    }
+    const contexts = linearMatchContexts(event, externalTrigger, {
+      thread,
+      appUserId,
+      commentSession,
+    });
+    if (contexts === undefined) continue;
+    if (trigger.filters?.publish_issue_comment === true) {
+      contexts.outputContext.publishIssueComment = true;
+    }
+    const policy = trigger.filters?.finalize_issue;
+    if (policy !== undefined)
+      contexts.outputContext.finalizeIssue = {
+        teamId: policy.team_id,
+        reviewStateId: policy.review_state_id,
+        completedStateId: policy.completed_state_id,
+        ...(policy.waiting_state_id === undefined
+          ? {}
+          : { waitingStateId: policy.waiting_state_id }),
+        ...(policy.allowed_assignee_ids === undefined
+          ? {}
+          : { allowedAssigneeIds: policy.allowed_assignee_ids }),
+      };
+    const base = {
+      triggerName: trigger.name,
+      ...contexts,
+      configurationRevisionId: stored.revision.id,
+      hubConfig: stored.configuration,
+    };
+    if (invocation.status === "accepted") matches.push({ ...base, invocation });
+    else matches.push({ ...base, invocation });
+  }
+  return matches;
+}
+
+function linearMatchContexts(
+  event: NormalizedLinearEvent,
+  external: ExternalTrigger,
+  bridge: {
+    thread: LinearCommentThread | undefined;
+    appUserId: string | undefined;
+    commentSession: string | undefined;
+  },
+): { triggerContext: LinearTriggerContext; outputContext: LinearOutputContext } | undefined {
+  if (event.issue === null) return undefined;
+  const { thread, appUserId, commentSession } = bridge;
+  const rootId =
+    event.type === "comment"
+      ? (thread?.rootId ?? event.comment.parentId ?? event.comment.id)
+      : null;
+  const outputContext: LinearOutputContext = {
+    provider: "linear",
+    linearOrganizationId: event.organizationId,
+    issueId: event.issue.id,
+    agentSessionId:
+      event.type === "agent_session" ? event.agentSession.id : (commentSession ?? null),
+    threadRootCommentId: rootId,
+    ...(event.type === "agent_session" || commentSession !== undefined
+      ? { turnKey: linearTurnKey(event, commentSession, external.connectionId) }
+      : {}),
+  };
+  const triggerContext: LinearTriggerContext = {
+    provider: "linear",
+    target: outputContext,
+    event: { linear: buildLinearContext(event, external.deliveryId, external.connectionId) },
+  };
+  if (commentSession !== undefined && event.type !== "agent_session") {
+    triggerContext.event.linear.agent_session = {
+      id: commentSession,
+      app_user_id: appUserId!,
+      status: "active",
+      ...(event.type === "comment"
+        ? { root_comment_id: rootId!, source_comment_id: event.comment.id }
+        : {}),
+    };
+  }
+  return { triggerContext, outputContext };
+}
+
+function linearTurnKey(
+  event: NormalizedLinearEvent,
+  commentSession?: string,
+  connectionId?: string | null,
+): string {
+  if (event.type === "comment")
+    return JSON.stringify([
+      connectionId,
+      event.organizationId,
+      commentSession,
+      "comment",
+      event.comment.id,
+    ]);
+  if (event.type === "issue")
+    return JSON.stringify([
+      connectionId,
+      event.organizationId,
+      commentSession,
+      "issue",
+      event.id,
+      event.occurredAt,
+    ]);
+  if (event.action === "prompted")
+    return JSON.stringify([
+      connectionId,
+      event.organizationId,
+      event.agentSession.id,
+      "activity",
+      event.agentActivity?.id ?? event.id,
+    ]);
+  const source = event.agentSession.sourceCommentId ?? event.agentSession.rootCommentId;
+  return JSON.stringify([
+    connectionId,
+    event.organizationId,
+    event.agentSession.id,
+    source === undefined ? "session" : "comment",
+    source ?? event.agentSession.id,
+  ]);
 }
 
 function parserMessageForEvent(
@@ -583,6 +1082,26 @@ function parserMessageForEvent(
     return readLinearAgentSessionInvocationParserMessage(event, filters);
   }
   return promptForEvent(event);
+}
+
+function linearIssueContext(
+  issue: NonNullable<NormalizedLinearEvent["issue"]>,
+): LinearTriggerContext["event"]["linear"]["issue"] {
+  return {
+    id: issue.id,
+    ...(issue.identifier === undefined ? {} : { identifier: issue.identifier }),
+    title: issue.title,
+    description: issue.description,
+    ...(issue.url === undefined ? {} : { url: issue.url }),
+    project: issue.projectId === null ? null : { id: issue.projectId },
+    team: issue.teamId === null ? null : { id: issue.teamId },
+    state: issue.stateId === null ? null : { id: issue.stateId },
+    assignee: issue.assigneeId === null ? null : { id: issue.assigneeId },
+    label_ids: issue.labelIds,
+    ...(issue.delegateId === undefined
+      ? {}
+      : { delegate: issue.delegateId === null ? null : { id: issue.delegateId } }),
+  };
 }
 
 function buildLinearContext(
@@ -599,18 +1118,7 @@ function buildLinearContext(
     connection_id: connectionId ?? null,
     organization: { id: event.organizationId },
     actor: event.actor,
-    issue: {
-      id: issue.id,
-      ...(issue.identifier === undefined ? {} : { identifier: issue.identifier }),
-      title: issue.title,
-      description: issue.description,
-      ...(issue.url === undefined ? {} : { url: issue.url }),
-      project: issue.projectId === null ? null : { id: issue.projectId },
-      team: issue.teamId === null ? null : { id: issue.teamId },
-      state: issue.stateId === null ? null : { id: issue.stateId },
-      assignee: issue.assigneeId === null ? null : { id: issue.assigneeId },
-      label_ids: issue.labelIds,
-    },
+    issue: linearIssueContext(issue),
     comment:
       event.type === "comment"
         ? {
@@ -625,6 +1133,12 @@ function buildLinearContext(
             id: event.agentSession.id,
             app_user_id: event.agentSession.appUserId,
             status: event.agentSession.status,
+            ...(event.agentSession.rootCommentId === undefined
+              ? {}
+              : { root_comment_id: event.agentSession.rootCommentId }),
+            ...(event.agentSession.sourceCommentId === undefined
+              ? {}
+              : { source_comment_id: event.agentSession.sourceCommentId }),
             ...(event.agentSession.url === undefined ? {} : { url: event.agentSession.url }),
           }
         : null,
@@ -640,6 +1154,7 @@ function buildLinearContext(
               : { signal: event.agentActivity.signal }),
           }
         : null,
+    ...(event.type === "issue" && event.changes !== undefined ? { changes: event.changes } : {}),
     prompt_context: event.type === "agent_session" ? event.promptContext : null,
     trigger_thread_context: linearThreadContextLocator(event, issue.id),
   };
@@ -665,6 +1180,20 @@ function linearThreadContextLocator(
   };
 }
 
+function assertLinearEventConnection(
+  connection: { id?: string } | undefined,
+  external: ExternalTrigger,
+  triggers: readonly Pick<CompiledTriggerConfig, "filters">[],
+  required: boolean,
+): void {
+  if (
+    required &&
+    triggers.some((trigger) => trigger.filters?.connectionId === external.connectionId) &&
+    connection?.id !== external.connectionId
+  )
+    throw new Error("Linear connection no longer matches the authorized event");
+}
+
 /**
  * `thread_with_app` needs three things the webhook does not carry: who wrote in the thread,
  * whether the thread is an agent session's, and which Linear user the connection acts as. All
@@ -672,58 +1201,430 @@ function linearThreadContextLocator(
  * delivered so the filter fails closed while every other trigger still dispatches.
  */
 async function hydrateLinearCommentThread(
-  options: Pick<LinearTriggerProviderOptions, "client" | "connectionForLinearOrganization">,
+  options: Pick<
+    LinearTriggerProviderOptions,
+    "client" | "connectionForLinearOrganization" | "database"
+  >,
   externalTrigger: ExternalTrigger,
-  event: NormalizedLinearEvent,
+  received: NormalizedLinearEvent,
   triggers: readonly Pick<CompiledTriggerConfig, "on" | "filters">[],
-): Promise<{ event: NormalizedLinearEvent; appUserId: string | undefined }> {
-  if (
-    event.type !== "comment" ||
-    event.action !== "create" ||
-    event.comment.parentId === null ||
-    !triggers.some(
-      (trigger) =>
-        trigger.on === "linear.comment_created" && trigger.filters?.thread_with_app === true,
-    )
-  ) {
-    return { event, appUserId: undefined };
+): Promise<{
+  event: NormalizedLinearEvent;
+  appUserId: string | undefined;
+  thread?: LinearCommentThread;
+}> {
+  const delegated = triggers.some((trigger) => trigger.on === "linear.delegated_comment");
+  const requiresCurrentDelegate = triggers.some(
+    (trigger) =>
+      trigger.filters?.require_delegate === true || trigger.on === "linear.delegated_issue_updated",
+  );
+  const wildcard = triggers.some((trigger) => trigger.filters?.from_users?.includes("*"));
+  const legacyThread = isLegacyLinearThread(received, triggers);
+  if (![delegated, wildcard, legacyThread, requiresCurrentDelegate].includes(true))
+    return { event: received, appUserId: undefined };
+  const connection = await options.connectionForLinearOrganization?.({
+    organizationId: externalTrigger.organizationId,
+    linearOrganizationId: received.organizationId,
+  });
+  const appUserId = connection?.appUserId;
+  assertLinearEventConnection(
+    connection,
+    externalTrigger,
+    triggers,
+    delegated || requiresCurrentDelegate,
+  );
+  if (requiresCurrentDelegate && received.type !== "comment") {
+    return { event: await refreshNonCommentIssue(options.client, received), appUserId };
   }
+  if (received.type !== "comment" || received.action !== "create") {
+    return { event: received, appUserId };
+  }
+  const event = delegated ? await refreshDelegatedLinearIssue(options.client, received) : received;
   const diagnostic = { linearOrganizationId: event.organizationId, commentId: event.comment.id };
-  let appUserId: string | undefined;
-  try {
-    const connection = await options.connectionForLinearOrganization?.({
-      organizationId: externalTrigger.organizationId,
-      linearOrganizationId: event.organizationId,
-    });
-    appUserId = connection?.appUserId;
-  } catch (error) {
-    logger.warn(
-      { err: error, ...diagnostic },
-      "Linear connection lookup failed; thread_with_app triggers will not match",
-    );
-  }
-  if (appUserId === undefined || event.threadAuthorIds !== undefined) return { event, appUserId };
+  const needsThread = delegated || legacyThread;
+  if (!needsThread || appUserId === undefined) return { event, appUserId };
+  if (!delegated && event.threadAuthorIds !== undefined) return { event, appUserId };
   try {
     const thread = await options.client?.readCommentThread(diagnostic);
     if (thread === undefined) return { event, appUserId };
-    const threadIsAgentSession = thread.agentSessionRootIds.includes(thread.rootId);
-    if (threadIsAgentSession) {
-      logger.debug(
-        { ...diagnostic, rootCommentId: thread.rootId },
-        "Linear comment is in an agent-session thread; thread_with_app triggers leave it to the session",
-      );
-    }
+    const threadIsAgentSession = await threadUsesNativePrompt(
+      options.database,
+      externalTrigger,
+      event,
+      thread,
+      appUserId,
+      delegated,
+    );
     return {
       event: { ...event, threadAuthorIds: thread.authorIds, threadIsAgentSession },
       appUserId,
+      thread,
     };
   } catch (error) {
+    // A delegated message must not be marked filtered after a transient provider failure.
+    if (delegated) throw error;
     logger.warn(
       { err: error, ...diagnostic },
       "Linear comment thread read failed; thread_with_app triggers will not match",
     );
     return { event, appUserId };
   }
+}
+
+async function refreshNonCommentIssue(
+  client: LinearTriggerProviderOptions["client"],
+  received: Exclude<NormalizedLinearEvent, NormalizedLinearCommentEvent>,
+): Promise<NormalizedLinearEvent> {
+  if (client?.readIssue === undefined)
+    throw new Error("Delegated Linear events require a current issue read");
+  const issueId = received.type === "issue" ? received.issue.id : received.agentSession.issueId;
+  const issue = await client.readIssue({ linearOrganizationId: received.organizationId, issueId });
+  if (issue === undefined || issue.id !== issueId)
+    throw new Error("Delegated Linear issue is unavailable");
+  return { ...received, issue: { ...issue, delegateId: issue.delegateId ?? null } };
+}
+
+function isLegacyLinearThread(
+  event: NormalizedLinearEvent,
+  triggers: readonly Pick<CompiledTriggerConfig, "on" | "filters">[],
+): boolean {
+  return (
+    event.type === "comment" &&
+    event.comment.parentId !== null &&
+    triggers.some(
+      (trigger) =>
+        trigger.on === "linear.comment_created" && trigger.filters?.thread_with_app === true,
+    )
+  );
+}
+
+async function refreshDelegatedLinearIssue(
+  client: LinearTriggerProviderOptions["client"],
+  event: NormalizedLinearCommentEvent,
+): Promise<NormalizedLinearCommentEvent> {
+  if (client?.readIssue === undefined)
+    throw new Error("Linear delegated comments require a current issue read");
+  const issue = await client.readIssue({
+    linearOrganizationId: event.organizationId,
+    issueId: event.comment.issueId,
+  });
+  return {
+    ...event,
+    issue: issue === undefined ? null : { ...issue, delegateId: issue.delegateId ?? null },
+  };
+}
+
+async function threadUsesNativePrompt(
+  database: LinearTriggerProviderOptions["database"],
+  external: ExternalTrigger,
+  event: NormalizedLinearCommentEvent,
+  thread: LinearCommentThread,
+  appUserId: string,
+  delegated: boolean,
+): Promise<boolean> {
+  const native = thread.agentSession != null || thread.agentSessionRootIds.includes(thread.rootId);
+  if (!native || !delegated) return native;
+  const key = linearBridgeKey(external, event.organizationId, thread.rootId);
+  const bridge = key === undefined ? undefined : await database?.findLinearCommentBridge?.(key);
+  // The bridge owner still owns its original nested receipt after the thread becomes native.
+  // A delayed comment posted before session creation could not have emitted a native prompt.
+  const predatesSession =
+    thread.agentSession?.id === bridge?.sessionId &&
+    event.occurredAt !== undefined &&
+    thread.agentSession?.createdAt !== undefined &&
+    Date.parse(event.occurredAt) < Date.parse(thread.agentSession.createdAt);
+  return !(
+    bridge?.appUserId === appUserId &&
+    (bridge.sourceCommentId === event.comment.id || predatesSession)
+  );
+}
+
+function issueBridgeDatabase(
+  database: LinearTriggerProviderOptions["database"],
+): LinearIssueSessionBridgeStore {
+  if (
+    !database?.claimLinearIssueSessionBridge ||
+    !database.findLinearIssueSessionBridge ||
+    !database.bindLinearIssueSessionBridge ||
+    !database.startLinearIssueSessionBridgeCreation ||
+    !database.findLinearIssueSessionBridgeBySession ||
+    !database.findLinearIssueSessionBridgeByMarker
+  ) {
+    throw new Error("Linear issue events require durable native session storage");
+  }
+  return {
+    claimLinearIssueSessionBridge: database.claimLinearIssueSessionBridge.bind(database),
+    findLinearIssueSessionBridge: database.findLinearIssueSessionBridge.bind(database),
+    bindLinearIssueSessionBridge: database.bindLinearIssueSessionBridge.bind(database),
+    startLinearIssueSessionBridgeCreation:
+      database.startLinearIssueSessionBridgeCreation.bind(database),
+    findLinearIssueSessionBridgeBySession:
+      database.findLinearIssueSessionBridgeBySession.bind(database),
+    findLinearIssueSessionBridgeByMarker:
+      database.findLinearIssueSessionBridgeByMarker.bind(database),
+  };
+}
+
+async function isIssueEventSessionEcho(
+  options: LinearTriggerProviderOptions,
+  external: ExternalTrigger,
+  event: NormalizedLinearEvent,
+  appUserId: string | undefined,
+): Promise<boolean> {
+  if (
+    event.type !== "agent_session" ||
+    event.action !== "created" ||
+    appUserId === undefined ||
+    external.connectionId == null ||
+    options.database?.findLinearIssueSessionBridgeBySession === undefined
+  )
+    return false;
+  return isIssueSessionBridgeEcho({
+    scope: {
+      organizationId: external.organizationId,
+      projectId: external.projectId,
+      connectionId: external.connectionId,
+      linearOrganizationId: event.organizationId,
+      issueId: event.agentSession.issueId,
+      appUserId,
+    },
+    session: {
+      id: event.agentSession.id,
+      appUserId: event.agentSession.appUserId,
+      externalUrls: event.agentSession.externalUrls ?? [],
+    },
+    database: issueBridgeDatabase(options.database),
+    ...(options.client?.readIssueSessions === undefined
+      ? {}
+      : { client: { readIssueSessions: options.client.readIssueSessions.bind(options.client) } }),
+  });
+}
+
+async function sessionForDelegatedIssue(
+  options: LinearTriggerProviderOptions,
+  external: ExternalTrigger,
+  event: import("./events.js").NormalizedLinearIssueEvent,
+  appUserId: string,
+  trigger: CompiledTriggerConfig,
+): Promise<string> {
+  const client = options.client;
+  if (
+    external.connectionId == null ||
+    options.publicBaseUrl === undefined ||
+    client?.readIssue === undefined ||
+    client.readIssueSessions === undefined ||
+    client.createAgentSessionOnIssue === undefined ||
+    event.actor === null
+  ) {
+    throw new Error(
+      "Linear issue events require an actor, connection, public Hub URL and native issue-session API",
+    );
+  }
+  return sessionForIssueEvent({
+    key: {
+      organizationId: external.organizationId,
+      projectId: external.projectId,
+      connectionId: external.connectionId,
+      linearOrganizationId: event.organizationId,
+      issueId: event.issue.id,
+      eventKey: external.deliveryId,
+    },
+    appUserId,
+    providerEventReceiptId: external.providerEventReceiptId,
+    sourceActorId: event.actor.id,
+    sourceBody: promptForEvent(event),
+    publicBaseUrl: options.publicBaseUrl,
+    client: {
+      readIssue: client.readIssue.bind(client),
+      readIssueSessions: client.readIssueSessions.bind(client),
+      createAgentSessionOnIssue: client.createAgentSessionOnIssue.bind(client),
+    },
+    database: issueBridgeDatabase(options.database),
+    issueAllowed: (issue) => matchesIssueScope(issue, trigger.filters, external.connectionId),
+  });
+}
+
+async function sessionForDelegatedComment(
+  options: Pick<LinearTriggerProviderOptions, "client" | "database">,
+  externalTrigger: ExternalTrigger,
+  event: NormalizedLinearCommentEvent,
+  thread: LinearCommentThread | undefined,
+  appUserId: string,
+): Promise<string> {
+  const { client, database } = options;
+  if (thread === undefined) throw new Error("Linear delegated comment requires a readable thread");
+  requireNativeBridgeClient(client);
+  requireNativeBridgeDatabase(database);
+  const key = linearBridgeKey(externalTrigger, event.organizationId, thread.rootId);
+  if (key === undefined)
+    throw new Error("Linear delegated comments require an explicit connection");
+  const prior = await database.findLinearCommentBridge(key);
+  if (prior !== undefined && prior.appUserId !== appUserId)
+    throw new Error("Linear bridge belongs to another agent");
+  if (prior?.sessionId != null) return prior.sessionId;
+  if (thread.agentSession) {
+    if (thread.agentSession.appUserId !== appUserId)
+      throw new Error("Linear thread belongs to another agent");
+    if (prior !== undefined)
+      return (await database.bindLinearCommentBridge(key, thread.agentSession.id)).sessionId!;
+    return thread.agentSession.id;
+  }
+  const now = new Date();
+  const reservation = await database.claimLinearCommentBridge({
+    ...key,
+    appUserId,
+    providerEventReceiptId: externalTrigger.providerEventReceiptId,
+    sourceCommentId: event.comment.id,
+    sourceActorId: event.actor!.id,
+    sourceBody: event.comment.body,
+    now,
+    leaseId: randomUUID(),
+    leaseExpiresAt: new Date(now.getTime() + 30_000),
+  });
+  if (reservation.bridge.appUserId !== appUserId)
+    throw new Error("Linear bridge belongs to another agent");
+  if (reservation.bridge.sessionId !== null) return reservation.bridge.sessionId;
+  if (!reservation.claimed)
+    throw new Error("Linear comment session creation is pending; retry this receipt");
+  return createReservedLinearSession({
+    client,
+    database,
+    key,
+    bridge: reservation.bridge,
+    event,
+    appUserId,
+  });
+}
+
+type NativeBridgeClient = Pick<
+  LinearApiClient,
+  "readIssue" | "readCommentThread" | "createAgentSessionOnComment"
+>;
+type NativeBridgeDatabase = Pick<
+  Database,
+  | "claimLinearCommentBridge"
+  | "findLinearCommentBridge"
+  | "bindLinearCommentBridge"
+  | "startLinearCommentBridgeCreation"
+>;
+
+function requireNativeBridgeClient(
+  client: LinearTriggerProviderOptions["client"],
+): asserts client is NonNullable<LinearTriggerProviderOptions["client"]> & NativeBridgeClient {
+  if (client?.createAgentSessionOnComment === undefined || client.readIssue === undefined) {
+    throw new Error(
+      "Linear delegated comments require native session support and a current issue read",
+    );
+  }
+}
+
+function requireNativeBridgeDatabase(
+  database: LinearTriggerProviderOptions["database"],
+): asserts database is NonNullable<LinearTriggerProviderOptions["database"]> &
+  NativeBridgeDatabase {
+  if (
+    database?.claimLinearCommentBridge === undefined ||
+    database.findLinearCommentBridge === undefined ||
+    database.bindLinearCommentBridge === undefined ||
+    database.startLinearCommentBridgeCreation === undefined
+  ) {
+    throw new Error("Linear delegated comments require a durable bridge reservation");
+  }
+}
+
+async function createReservedLinearSession(input: {
+  client: NativeBridgeClient;
+  database: NativeBridgeDatabase;
+  key: LinearCommentBridgeKey;
+  bridge: LinearCommentBridgeRecord;
+  event: NormalizedLinearCommentEvent;
+  appUserId: string;
+}): Promise<string> {
+  const { client, database, key, bridge, event, appUserId } = input;
+  // A reservation grants no authority: delegation remains revocable until the mutation.
+  const currentIssue = await client.readIssue({
+    linearOrganizationId: event.organizationId,
+    issueId: event.comment.issueId,
+  });
+  if (currentIssue?.delegateId !== appUserId || currentIssue.teamId !== event.issue?.teamId) {
+    throw new Error("Linear delegation or team changed while the comment was pending");
+  }
+  const bind = async (id: string) => (await database.bindLinearCommentBridge(key, id)).sessionId!;
+  const readRoot = () =>
+    client.readCommentThread({
+      linearOrganizationId: event.organizationId,
+      commentId: key.rootCommentId,
+    });
+  // Recover a lost acknowledgement by reading the exact root, before sending a mutation.
+  const beforeCreate = await readRoot();
+  if (beforeCreate?.agentSession) {
+    if (beforeCreate.agentSession.appUserId !== appUserId)
+      throw new Error("Linear thread belongs to another agent");
+    return bind(beforeCreate.agentSession.id);
+  }
+  if (bridge.creationStartedAt !== null) {
+    throw new Error(
+      "Linear session creation delivery is uncertain; reconcile the original attempt before retrying mutation",
+    );
+  }
+  if (!(await database.startLinearCommentBridgeCreation(key, bridge.leaseId, new Date()))) {
+    throw new Error("Linear bridge creation lease changed; retry this receipt");
+  }
+  try {
+    return await bind(
+      (
+        await client.createAgentSessionOnComment({
+          linearOrganizationId: event.organizationId,
+          commentId: key.rootCommentId,
+        })
+      ).id,
+    );
+  } catch (error) {
+    const reread = await readRoot();
+    if (reread?.agentSession?.appUserId === appUserId) return bind(reread.agentSession.id);
+    throw error;
+  }
+}
+
+function linearBridgeKey(
+  external: ExternalTrigger,
+  linearOrganizationId: string,
+  rootCommentId: string,
+): LinearCommentBridgeKey | undefined {
+  if (!external.connectionId) return undefined;
+  return {
+    organizationId: external.organizationId,
+    projectId: external.projectId,
+    connectionId: external.connectionId,
+    linearOrganizationId,
+    rootCommentId,
+  };
+}
+
+async function isLinearBridgeSessionEcho(
+  database: LinearTriggerProviderOptions["database"],
+  external: ExternalTrigger,
+  event: NormalizedLinearEvent,
+): Promise<boolean> {
+  if (
+    event.type !== "agent_session" ||
+    event.action !== "created" ||
+    event.agentSession.rootCommentId === undefined
+  )
+    return false;
+  const key = linearBridgeKey(external, event.organizationId, event.agentSession.rootCommentId);
+  const bridge = key === undefined ? undefined : await database?.findLinearCommentBridge?.(key);
+  if (
+    bridge === undefined ||
+    bridge.appUserId !== event.agentSession.appUserId ||
+    bridge.creationStartedAt === null
+  )
+    return false;
+  if (bridge.sessionId === null)
+    throw new Error("Linear bridge session binding is pending; retry this receipt");
+  // A real Retry creates another session on the same root. Only the session this bridge
+  // actually created is an echo; its original receipt owns the latest human comment body.
+  return bridge.sessionId === event.agentSession.id;
 }
 
 /**
@@ -750,9 +1651,9 @@ async function supersedeLinearCommentRuns(
   }
   try {
     const superseded = new Set(
-      (await options.database.listTriggerRunsForLinearComments(projectId, commentIds)).map(
-        (run) => run.id,
-      ),
+      (await options.database.listTriggerRunsForLinearComments(projectId, commentIds))
+        .filter((run) => readLinearAgentSessionId(run.outputContext) !== event.agentSession.id)
+        .map((run) => run.id),
     );
     if (superseded.size === 0) return;
     await options.executions.stopActive({
@@ -809,6 +1710,7 @@ async function steerLiveLinearSession(
   const agentSessionId = event.agentSession.id;
   const result = await options.executions.promptActive({
     projectId: externalTrigger.projectId,
+    inputId: linearTurnKey(event, undefined, externalTrigger.connectionId),
     prompt,
     // `steer` rather than `interrupt`: the user adding a precision mid-work expects it to be taken
     // into account, not to cancel what they asked for a minute earlier.

@@ -166,6 +166,44 @@ describe("daemon socket generations", () => {
     });
   });
 
+  it("rejects workspace bindings before sending a create request to an unsupported daemon", async () => {
+    await assert.rejects(
+      daemon.create("bound-create", {
+        mode: "branch-off",
+        newBranch: "issue",
+        reuseWorkspace: true,
+        workspaceKey: "issue-uuid",
+      }),
+      {
+        name: DaemonCreateRejectedError.name,
+        code: "workspace_binding_unsupported",
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(daemon.pendingRequestTypes(), []);
+    assert.deepEqual(await daemon.completeCreate("ordinary-create", "ordinary-agent"), {
+      id: "ordinary-agent",
+    });
+  });
+
+  it("forwards workspace bindings only after explicit capability negotiation", async () => {
+    await daemon.replaceConnection(true, "session-v1", { hubWorkspaceBindings: true });
+    const worktree = {
+      mode: "branch-off" as const,
+      newBranch: "renamed-issue",
+      reuseWorkspace: true,
+      workspaceKey: "issue-uuid",
+    };
+    const pending = await daemon.pendingCreate("bound-create", worktree);
+    assert.deepEqual(pending.request["worktree"], worktree);
+    await daemon.replaceConnection();
+    await assert.rejects(pending.promise, { name: DaemonCreateResponseLostError.name });
+    await assert.rejects(daemon.create("after-reconnect", worktree), {
+      name: DaemonCreateRejectedError.name,
+    });
+    assert.deepEqual(daemon.pendingRequestTypes(), []);
+  });
+
   it("delegates provider, model, mode, and structured option validation to the daemon", async () => {
     const pending = await daemon.pendingAgentValidation();
 
@@ -297,5 +335,163 @@ describe("daemon socket generations", () => {
     await daemon.replaceConnection();
 
     await assert.rejects(pending.promise, /daemon disconnected/u);
+  });
+
+  it("uses advertised public agent RPC with the exact agent and stable input key", async () => {
+    await daemon.replaceConnection(true, "session-v1", { hubAgentRpc: true });
+    const agentId = randomUUID();
+    const prompt = "Full Linear context ".repeat(100);
+    const pending = await daemon.pendingPrompt(
+      {
+        executionId: "execution-1",
+        agentId,
+        messageId: "linear-input-1",
+        prompt,
+        activeTurnBehavior: "steer",
+      },
+      true,
+    );
+    assert.deepEqual(pending.request, {
+      type: "send_agent_message_request",
+      requestId: pending.request.requestId,
+      agentId,
+      messageId: "linear-input-1",
+      text: prompt,
+      activeTurnBehavior: "steer",
+    });
+    pending.respond({
+      type: "send_agent_message_response",
+      payload: { requestId: pending.request.requestId, agentId, accepted: true, error: null },
+    });
+    assert.deepEqual(await pending.promise, { delivered: true, disposition: null });
+    assert.deepEqual(daemon.pendingRequestTypes(), []);
+  });
+
+  it.each([{}, { hubAgentRpc: false }])(
+    "keeps the private execution RPC when public RPC is not advertised: %j",
+    async (features) => {
+      await daemon.replaceConnection(true, "session-v1", features);
+      const pending = await daemon.pendingPrompt({
+        executionId: "execution-legacy",
+        agentId: randomUUID(),
+        messageId: "input-legacy",
+        prompt: "Continue",
+      });
+      assert.deepEqual(pending.request, {
+        type: "hub.execution.agent.prompt.request",
+        requestId: pending.request.requestId,
+        executionId: "execution-legacy",
+        prompt: "Continue",
+      });
+      pending.respond({
+        type: "hub.execution.agent.prompt.response",
+        payload: {
+          requestId: pending.request.requestId,
+          executionId: "execution-legacy",
+          delivered: true,
+          disposition: "steered",
+          error: null,
+        },
+      });
+      assert.deepEqual(await pending.promise, { delivered: true, disposition: "steered" });
+    },
+  );
+
+  it("pairs public acknowledgements by request, agent, protocol, and socket generation", async () => {
+    await daemon.replaceConnection(true, "session-v1", { hubAgentRpc: true });
+    const agentId = randomUUID();
+    const pending = await daemon.pendingPrompt(
+      { executionId: "execution-1", agentId, prompt: "Continue" },
+      true,
+    );
+    pending.respond({
+      type: "send_agent_message_response",
+      payload: { requestId: "stale-request", agentId, accepted: true, error: null },
+    });
+    pending.respond({
+      type: "send_agent_message_response",
+      payload: {
+        requestId: pending.request.requestId,
+        agentId: randomUUID(),
+        accepted: true,
+        error: null,
+      },
+    });
+    pending.respond({
+      type: "hub.execution.agent.prompt.response",
+      payload: {
+        requestId: pending.request.requestId,
+        executionId: "execution-1",
+        delivered: true,
+        disposition: "steered",
+        error: null,
+      },
+    });
+    assert.equal(await daemon.requestSettled(pending.promise), false);
+    await daemon.replaceConnection(true, "session-v1", { hubAgentRpc: true });
+    await assert.rejects(pending.promise, /daemon disconnected/u);
+    const next = await daemon.pendingPrompt(
+      { executionId: "execution-1", agentId, prompt: "A different input" },
+      true,
+    );
+    const response = {
+      type: "send_agent_message_response",
+      payload: { requestId: next.request.requestId, agentId, accepted: true, error: null },
+    };
+    pending.respond(response);
+    assert.equal(await daemon.requestSettled(next.promise), false);
+    next.respond(response);
+    assert.deepEqual(await next.promise, { delivered: true, disposition: null });
+    assert.deepEqual(daemon.pendingRequestTypes(), []);
+  });
+
+  it("does not switch protocol after a public send is rejected", async () => {
+    await daemon.replaceConnection(true, "session-v1", { hubAgentRpc: true });
+    const agentId = randomUUID();
+    const pending = await daemon.pendingPrompt(
+      { executionId: "execution-1", agentId, prompt: "Continue" },
+      true,
+    );
+    pending.respond({
+      type: "send_agent_message_response",
+      payload: {
+        requestId: pending.request.requestId,
+        agentId,
+        accepted: false,
+        error: "Agent is unavailable",
+      },
+    });
+    await assert.rejects(pending.promise, /Agent is unavailable/u);
+    assert.deepEqual(daemon.pendingRequestTypes(), []);
+  });
+
+  it("does not switch protocol after losing a public send acknowledgement", async () => {
+    await daemon.replaceConnection(true, "session-v1", { hubAgentRpc: true });
+    const pending = await daemon.pendingPrompt(
+      {
+        executionId: "execution-1",
+        agentId: randomUUID(),
+        messageId: "stable-input",
+        prompt: "Continue",
+      },
+      true,
+    );
+    await daemon.disconnectCurrent();
+    await assert.rejects(pending.promise, /daemon disconnected/u);
+    assert.deepEqual(daemon.pendingRequestTypes(), []);
+    await daemon.replaceConnection();
+    assert.deepEqual(daemon.pendingRequestTypes(), []);
+  });
+
+  it("requires a full stored agent UUID before sending public RPC", async () => {
+    await daemon.replaceConnection(true, "session-v1", { hubAgentRpc: true });
+    assert.deepEqual(await daemon.prompt({ executionId: "spawning", prompt: "Continue" }), {
+      delivered: false,
+      disposition: null,
+    });
+    assert.throws(() =>
+      daemon.prompt({ executionId: "execution-1", agentId: "title-or-prefix", prompt: "Continue" }),
+    );
+    assert.deepEqual(daemon.pendingRequestTypes(), []);
   });
 });

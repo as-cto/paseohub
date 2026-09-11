@@ -155,7 +155,7 @@ interface OrganizationIsolationJourney {
 }
 
 type StartBuiltApplication = (options?: BuiltApplicationOptions) => Promise<BuiltApplication>;
-type StartSourcePaseo = () => Promise<SourcePaseo>;
+type StartSourcePaseo = (deterministicExecution?: boolean) => Promise<SourcePaseo>;
 
 export class PaseoHub {
   private readonly users = new Map<string, HubUser>();
@@ -1549,8 +1549,11 @@ export class PaseoHub {
     await user.acceptInvitationAfterSessionExpiry(invitee, invitation, organization);
   }
 
-  async startDaemonRegistration(alias: string): Promise<void> {
-    this.sourcePaseo ??= await this.startSourcePaseo();
+  async startDaemonRegistration(
+    alias: string,
+    options: { deterministicExecution?: boolean } = {},
+  ): Promise<void> {
+    this.sourcePaseo ??= await this.startSourcePaseo(options.deterministicExecution);
     const credential = `paseo_cli_${randomUUID().replaceAll("-", "").slice(0, 12)}_${randomUUID().replaceAll("-", "")}`;
     const prefix = credential.slice(0, "paseo_cli_".length + 12);
     await this.queryDatabase(
@@ -1571,11 +1574,20 @@ export class PaseoHub {
     this.hubCredentials.set(alias, credential);
   }
 
-  async approveDaemon(alias: string, displayName: string): Promise<string> {
+  sourceDaemonWorkingDirectory(): string {
+    return this.requireSourcePaseo().paths.paseoHome;
+  }
+
+  async approveDaemon(
+    alias: string,
+    displayName: string,
+    permissions: readonly string[] = [],
+  ): Promise<string> {
     const credential = this.requireHubCredential(alias);
     const result = await this.requireSourcePaseo().connectWithCredential(
       this.primary.origin,
       credential,
+      permissions,
     );
     const daemonId = z.string().uuid().parse(result["daemonId"]);
     await this.queryDatabase(this.primary, "update daemons set slug = $2 where id = $1", [

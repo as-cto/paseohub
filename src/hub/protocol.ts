@@ -65,6 +65,13 @@ export const HubDaemonServerInfoEnvelopeSchema = z.object({
       .object({
         status: z.literal("server_info"),
         permissions: z.array(z.string()),
+        features: z
+          .object({
+            hubAgentRpc: z.boolean().optional(),
+            hubWorkspaceBindings: z.boolean().optional(),
+          })
+          .passthrough()
+          .optional(),
       })
       .passthrough(),
   }),
@@ -252,6 +259,27 @@ export const HubExecutionAgentPromptResponseSchema = z.object({
   }),
 });
 
+/** Public agent RPC advertised by Paseo 0.8 through `features.hubAgentRpc`. */
+export const DaemonAgentMessageRequestSchema = z.object({
+  type: z.literal("send_agent_message_request"),
+  requestId: z.string(),
+  // Never accept the public protocol's title/prefix lookup for an owned execution.
+  agentId: z.string().uuid(),
+  text: z.string(),
+  messageId: z.string(),
+  activeTurnBehavior: z.enum(["interrupt", "steer"]).optional(),
+});
+
+export const DaemonAgentMessageResponseSchema = z.object({
+  type: z.literal("send_agent_message_response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    accepted: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const HubExecutionControlActionSchema = z.enum(["interrupt", "archive"]);
 
 export const HubExecutionControlRequestSchema = z.object({
@@ -291,6 +319,7 @@ export const HubExecutionOutboundSchema = z.object({
     HubExecutionControlResponseSchema,
     HubExecutionAgentValidateResponseSchema,
     HubExecutionAgentPromptResponseSchema,
+    DaemonAgentMessageResponseSchema,
     RpcErrorSchema,
   ]),
 });

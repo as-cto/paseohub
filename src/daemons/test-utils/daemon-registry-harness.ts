@@ -7,8 +7,10 @@ import type { HubExecutionAgentSnapshot } from "../../hub/protocol.js";
 import type {
   DaemonAgentSnapshot,
   DaemonConnection,
+  DaemonCreateAgentOptions,
   DaemonEvent,
   DaemonEventHandler,
+  DaemonExecutionPromptOptions,
 } from "../protocol.js";
 import { ActiveDaemonRegistry } from "../registry.js";
 
@@ -51,13 +53,13 @@ export class DaemonRegistryHarness {
     return harness;
   }
 
-  async pendingCreate(executionId: string): Promise<PendingRequest<DaemonAgentSnapshot>> {
-    const connection = this.connection();
-    const promise = connection.createAgent({
+  create(executionId: string, worktree?: DaemonCreateAgentOptions["worktree"]) {
+    return this.connection().createAgent({
       executionId,
       provider: "opencode",
       mode: "full-access",
       cwd: "/workspace",
+      ...(worktree === undefined ? {} : { worktree }),
       prompt: "Do the work",
       env: {},
       providerOptions: { permission: { edit: "ask", bash: "deny" } },
@@ -65,6 +67,13 @@ export class DaemonRegistryHarness {
         preapproved: [{ kind: "mcp", server: "hub", tool: "finish_execution" }],
       },
     });
+  }
+
+  async pendingCreate(
+    executionId: string,
+    worktree?: DaemonCreateAgentOptions["worktree"],
+  ): Promise<PendingRequest<DaemonAgentSnapshot>> {
+    const promise = this.create(executionId, worktree);
     void promise.catch(() => undefined);
     return {
       promise,
@@ -82,6 +91,27 @@ export class DaemonRegistryHarness {
       promise,
       request: await this.currentSocket().next("hub.execution.control.request"),
     };
+  }
+
+  async pendingPrompt(options: DaemonExecutionPromptOptions, publicRpc = false) {
+    const socket = this.currentSocket();
+    const promise = this.connection().promptExecution(options);
+    void promise.catch(() => undefined);
+    return {
+      promise,
+      request: await socket.next(
+        publicRpc ? "send_agent_message_request" : "hub.execution.agent.prompt.request",
+      ),
+      respond: (message: unknown) => socket.send(message),
+    };
+  }
+
+  prompt(options: DaemonExecutionPromptOptions) {
+    return this.connection().promptExecution(options);
+  }
+
+  pendingRequestTypes(): string[] {
+    return this.currentSocket().pendingRequestTypes();
   }
 
   async pendingAgentValidation() {
@@ -131,11 +161,12 @@ export class DaemonRegistryHarness {
     });
   }
 
-  async requestSettled(request: Promise<void>): Promise<boolean> {
+  async requestSettled(request: Promise<unknown>): Promise<boolean> {
     let settled = false;
-    void request.finally(() => {
+    const markSettled = () => {
       settled = true;
-    });
+    };
+    void request.then(markSettled, markSettled);
     await new Promise((resolve) => setImmediate(resolve));
     return settled;
   }
@@ -143,6 +174,7 @@ export class DaemonRegistryHarness {
   async replaceConnection(
     completeHello = true,
     sessionProtocol: "legacy" | "session-v1" = "session-v1",
+    features: { hubAgentRpc?: boolean; hubWorkspaceBindings?: boolean } = {},
   ): Promise<{ supersededClosed: boolean }> {
     const superseded = this.socket;
     const address = this.server.address();
@@ -157,6 +189,7 @@ export class DaemonRegistryHarness {
     const registrySocket = new RegistrySocket(
       client,
       completeHello ? this.daemon.permissions : null,
+      features,
     );
     let ready: Promise<void> | null = null;
     let unsubscribeReady: () => void = () => undefined;
@@ -381,6 +414,7 @@ class RegistrySocket {
   constructor(
     private readonly socket: WebSocket,
     private readonly helloPermissions: readonly string[] | null,
+    private readonly features: { hubAgentRpc?: boolean; hubWorkspaceBindings?: boolean },
   ) {
     socket.once("close", () => {
       this.didClose = true;
@@ -399,6 +433,10 @@ class RegistrySocket {
 
   get closed(): boolean {
     return this.didClose;
+  }
+
+  pendingRequestTypes(): string[] {
+    return this.messages.map((message) => message.type);
   }
 
   async next(type: string): Promise<z.infer<typeof SessionRequestSchema>["message"]> {
@@ -422,7 +460,7 @@ class RegistrySocket {
         status: "server_info",
         serverId: "test-daemon",
         permissions,
-        features: {},
+        features: this.features,
       },
     });
   }

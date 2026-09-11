@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { WebSocket } from "ws";
 import { z } from "zod";
 import { runCommand } from "./command.js";
+import { relayConnectionLogMessages } from "./daemon-log-evidence.js";
 
 const exec = promisify(execFile);
 const TIMELINE_READER = fileURLToPath(new URL("./timeline-reader.mjs", import.meta.url));
@@ -87,6 +88,7 @@ export class SourcePaseo {
   async connectWithCredential(
     hubOrigin: string,
     credential: string,
+    permissions: readonly string[] = [],
   ): Promise<Record<string, unknown>> {
     this.rememberedHubOrigin = hubOrigin;
     const result = await this.run([
@@ -95,6 +97,7 @@ export class SourcePaseo {
       hubOrigin,
       "--api-key",
       credential,
+      ...(permissions.length === 0 ? [] : ["--permission", ...permissions]),
       "--host",
       this.paths.daemonHost,
       "--json",
@@ -196,7 +199,11 @@ export class SourcePaseo {
   }
 
   attemptedRelayConnection(): boolean {
-    return this.daemonOutput.some((line) => /relay.+(?:connect|dial|socket)/iu.test(line));
+    return this.relayConnectionEvidence().length > 0;
+  }
+
+  relayConnectionEvidence(): string[] {
+    return relayConnectionLogMessages(this.daemonOutput);
   }
 
   async stop(): Promise<SourcePaseoStopEvidence> {
@@ -283,7 +290,13 @@ export async function packagePaseoArtifacts(paseoRoot: string, root: string): Pr
   const packages = join(root, "paseo-packages");
   const tarballs = join(root, "paseo-tarballs");
   await Promise.all([mkdir(packages), mkdir(tarballs)]);
-  for (const workspace of ["protocol", "relay", "highlight", "client", "server", "cli"]) {
+  const serverManifest = z
+    .object({ dependencies: z.record(z.string(), z.string()) })
+    .parse(JSON.parse(await readFile(join(paseoRoot, "packages/server/package.json"), "utf8")));
+  const workspaces = ["protocol", "relay", "highlight", "client", "server", "cli"];
+  // Exercise the matching plugin SDK source build whenever the companion depends on it.
+  if (serverManifest.dependencies["@getpaseo/plugin"]) workspaces.push("plugin");
+  for (const workspace of workspaces) {
     await runCommand(
       "npm",
       ["pack", "--ignore-scripts", "--pack-destination", tarballs],

@@ -41,6 +41,93 @@ export type MachineSource =
 export const machineStatus = pgEnum("machine_status", MACHINE_STATUSES);
 export const agentExecutionStatus = pgEnum("agent_execution_status", AGENT_EXECUTION_STATUSES);
 
+/** Permanent placement proof: deleting a project, daemon, or execution must not allow a second checkout. */
+export const workspacePlacements = pgTable("workspace_placements", {
+  keyHash: text("key_hash").primaryKey(),
+  organizationId: text("organization_id")
+    .notNull()
+    .references(() => organizations.id, { onDelete: "cascade" }),
+  workspaceKey: text("workspace_key").notNull(),
+  projectId: uuid("project_id").notNull(),
+  daemonId: uuid("daemon_id").notNull(),
+  sourceCwd: text("source_cwd").notNull(),
+  firstExecutionId: uuid("first_execution_id").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+/** Verified webhook admission precedes issue hydration and route selection. */
+export const linearWebhookInbox = pgTable(
+  "linear_webhook_inbox",
+  {
+    id: uuid().defaultRandom().primaryKey(),
+    applicationId: text("application_id").notNull(),
+    configurationVersion: integer("configuration_version").notNull(),
+    deliveryId: text("delivery_id").notNull(),
+    signatureHash: text("signature_hash").notNull(),
+    eventName: text("event_name"),
+    payload: jsonb().notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull(),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).defaultNow().notNull(),
+    attempts: integer().default(0).notNull(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    lastError: text("last_error"),
+  },
+  (table) => [
+    uniqueIndex("linear_webhook_inbox_delivery_unique").on(table.applicationId, table.deliveryId),
+    uniqueIndex("linear_webhook_inbox_signature_unique").on(
+      table.applicationId,
+      table.signatureHash,
+    ),
+    index("linear_webhook_inbox_pending_idx")
+      .on(table.applicationId, table.nextAttemptAt)
+      .where(sql`${table.completedAt} is null`),
+  ],
+);
+
+/** Opt-in final reports reserve both provider UUIDs before any publication. */
+export const linearReplyDeliveries = pgTable(
+  "linear_reply_deliveries",
+  {
+    id: uuid().primaryKey(),
+    executionId: uuid("execution_id")
+      .notNull()
+      .references(() => agentExecutions.id, { onDelete: "cascade" }),
+    turnKey: text("turn_key").notNull(),
+    attemptId: text("attempt_id").notNull(),
+    applicationId: text("application_id"),
+    payload: jsonb().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+    commentConfirmedAt: timestamp("comment_confirmed_at", { withTimezone: true }),
+    activityConfirmedAt: timestamp("activity_confirmed_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    supersededAt: timestamp("superseded_at", { withTimezone: true }),
+    leaseId: text("lease_id"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull(),
+    attempts: integer().notNull().default(0),
+    lastError: text("last_error"),
+  },
+  (table) => [
+    uniqueIndex("linear_reply_deliveries_turn_unique").on(table.executionId, table.turnKey),
+    index("linear_reply_deliveries_pending_idx")
+      .on(table.applicationId, table.nextAttemptAt)
+      .where(sql`${table.completedAt} is null and ${table.supersededAt} is null`),
+  ],
+);
+
+export const linearIssueFinalizations = pgTable("linear_issue_finalizations", {
+  replyId: uuid("reply_id")
+    .primaryKey()
+    .references(() => linearReplyDeliveries.id, { onDelete: "cascade" }),
+  target: jsonb().notNull(),
+  previous: jsonb().notNull(),
+  status: text().notNull().default("pending"),
+  detail: text(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+});
+
 export const providerEventReceipts = pgTable(
   "provider_event_receipts",
   {
@@ -153,6 +240,135 @@ export const projects = pgTable(
       "projects_archive_shape_check",
       sql`(${table.status} = 'active' and ${table.archivedAt} is null) or (${table.status} = 'archived' and ${table.archivedAt} is not null and ${table.activeConfigurationRevisionId} is null)`,
     ),
+  ],
+);
+
+/** Durable ownership precedes Linear session creation, whose webhook can beat its HTTP reply. */
+export const linearTriageIntakes = pgTable(
+  "linear_triage_intakes",
+  {
+    organizationId: text("organization_id").notNull(),
+    projectId: uuid("project_id").notNull(),
+    connectionId: text("connection_id").notNull(),
+    linearOrganizationId: text("linear_organization_id").notNull(),
+    issueId: text("issue_id").notNull(),
+    providerEventReceiptId: uuid("provider_event_receipt_id").notNull(),
+    source: jsonb("source").notNull(),
+    status: text("status").notNull(),
+    reason: text("reason"),
+    attemptStartedAt: timestamp("attempt_started_at", { withTimezone: true }),
+    leaseId: text("lease_id").notNull(),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    primaryKey({
+      name: "linear_triage_intakes_pk",
+      columns: [
+        table.organizationId,
+        table.projectId,
+        table.connectionId,
+        table.linearOrganizationId,
+        table.issueId,
+      ],
+    }),
+    foreignKey({
+      name: "linear_triage_intake_project_fk",
+      columns: [table.projectId, table.organizationId],
+      foreignColumns: [projects.id, projects.organizationId],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "linear_triage_intake_receipt_fk",
+      columns: [table.providerEventReceiptId, table.organizationId],
+      foreignColumns: [providerEventReceipts.id, providerEventReceipts.organizationId],
+    }).onDelete("cascade"),
+    check(
+      "linear_triage_intakes_status_check",
+      sql`${table.status} in ('reserved','attempted','applied','ignored','ambiguous')`,
+    ),
+  ],
+);
+
+export const linearIssueSessionBridges = pgTable(
+  "linear_issue_session_bridges",
+  {
+    organizationId: text("organization_id").notNull(),
+    projectId: uuid("project_id").notNull(),
+    connectionId: text("connection_id").notNull(),
+    linearOrganizationId: text("linear_organization_id").notNull(),
+    issueId: text("issue_id").notNull(),
+    eventKey: text("event_key").notNull(),
+    markerUrl: text("marker_url").notNull(),
+    appUserId: text("app_user_id").notNull(),
+    providerEventReceiptId: uuid("provider_event_receipt_id").notNull(),
+    sourceActorId: text("source_actor_id").notNull(),
+    sourceBody: text("source_body").notNull(),
+    sessionId: text("session_id"),
+    creationStartedAt: timestamp("creation_started_at", { withTimezone: true }),
+    leaseId: text("lease_id").notNull(),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [
+        table.organizationId,
+        table.projectId,
+        table.connectionId,
+        table.linearOrganizationId,
+        table.issueId,
+        table.eventKey,
+      ],
+    }),
+    foreignKey({
+      name: "linear_issue_session_bridge_project_fk",
+      columns: [table.projectId, table.organizationId],
+      foreignColumns: [projects.id, projects.organizationId],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "linear_issue_session_bridge_receipt_fk",
+      columns: [table.providerEventReceiptId, table.organizationId],
+      foreignColumns: [providerEventReceipts.id, providerEventReceipts.organizationId],
+    }).onDelete("cascade"),
+  ],
+);
+
+export const linearCommentBridges = pgTable(
+  "linear_comment_bridges",
+  {
+    organizationId: text("organization_id").notNull(),
+    projectId: uuid("project_id").notNull(),
+    connectionId: text("connection_id").notNull(),
+    linearOrganizationId: text("linear_organization_id").notNull(),
+    rootCommentId: text("root_comment_id").notNull(),
+    appUserId: text("app_user_id").notNull(),
+    providerEventReceiptId: uuid("provider_event_receipt_id").notNull(),
+    sourceCommentId: text("source_comment_id").notNull(),
+    sourceActorId: text("source_actor_id").notNull(),
+    sourceBody: text("source_body").notNull(),
+    sessionId: text("session_id"),
+    creationStartedAt: timestamp("creation_started_at", { withTimezone: true }),
+    leaseId: text("lease_id").notNull(),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [
+        table.organizationId,
+        table.projectId,
+        table.connectionId,
+        table.linearOrganizationId,
+        table.rootCommentId,
+      ],
+    }),
+    foreignKey({
+      name: "linear_comment_bridge_project_fk",
+      columns: [table.projectId, table.organizationId],
+      foreignColumns: [projects.id, projects.organizationId],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "linear_comment_bridge_receipt_fk",
+      columns: [table.providerEventReceiptId, table.organizationId],
+      foreignColumns: [providerEventReceipts.id, providerEventReceipts.organizationId],
+    }).onDelete("cascade"),
   ],
 );
 

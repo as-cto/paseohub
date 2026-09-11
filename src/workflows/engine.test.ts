@@ -27,9 +27,154 @@ import { EntitlementsService } from "../entitlements/service.js";
 import { createDurableWorkflowHandler } from "./engine.js";
 import { currentProjectConfigurationFiles } from "../test-utils/current-project-configuration.js";
 import { createLogger } from "../logger.js";
+import { createDaemonDispatchLifecycle } from "../daemons/lifecycle.js";
+import { ProjectConfigurationStore } from "../configuration/store.js";
 import { assertOneFailure, FailureLogStream } from "../test-utils/failure-logs.js";
+import {
+  createLinearTriggerProvider,
+  type LinearTriggerContext,
+} from "../triggers/linear/provider.js";
 
 describe("durable multi-step workflow engine", () => {
+  it("rechecks revoked issue authority after acceptance and before a queued run wakes", async () => {
+    const race = await continuationRaceFixture("revoked");
+    try {
+      await race.acceptBoth();
+      race.revokeAuthority();
+      await race.first.engine.processAvailable();
+      await race.retry();
+      assert.equal(race.dispatches(), 0);
+      assert.equal(race.promptCalls(), 0);
+      assert.equal((await race.database.findPendingAgentExecutions()).length, 0);
+      assert.equal((await race.waitingRun()).status, "running");
+    } finally {
+      await race.close();
+    }
+  });
+
+  it.each(["ack-crash", "lost-ack", "incompatible"] as const)(
+    "continues a concurrently deferred issue once without another agent (%s)",
+    async (mode) => {
+      const race = await continuationRaceFixture(mode);
+      try {
+        await race.acceptBoth();
+        const firstProcessing = race.first.engine.processAvailable();
+        await Promise.race([
+          race.dispatchStarted,
+          firstProcessing.then(() => {
+            throw new Error("initial issue run did not reach dispatch");
+          }),
+        ]);
+        await race.second.engine.processAvailable();
+        assert.equal(race.dispatches(), 1);
+        assert.equal((await race.database.findPendingAgentExecutions()).length, 1);
+        race.releaseDispatch();
+        await firstProcessing;
+        if (mode === "ack-crash") {
+          vi.spyOn(race.database, "markWorkflowStepSkipped").mockRejectedValueOnce(
+            new Error("crash after durable prompt ACK"),
+          );
+        }
+        await race.retry();
+        const pending = await race.waitingRun();
+        assert.equal(pending.status, "running");
+        await race.retry();
+        const replayed = await race.waitingRun();
+        assert.equal(replayed.status, mode === "ack-crash" ? "succeeded" : "running");
+        const [step] = await race.database.listWorkflowStepRunsForTriggerRun(replayed.id);
+        assert.equal(step?.agentExecutionId, null);
+        assert.equal(step?.status, mode === "ack-crash" ? "skipped" : "pending");
+        if (mode === "ack-crash") assert.equal(step?.failureReason, "continued_existing_execution");
+        assert.equal(race.promptCalls(), mode === "incompatible" ? 0 : 1);
+        assert.equal(race.dispatches(), 1);
+        assert.equal((await race.database.findPendingAgentExecutions()).length, 1);
+        assert.equal((await race.entitlements.usage("org-1", "executions.monthly")).used, 1);
+      } finally {
+        await race.close();
+      }
+      assert.equal(
+        race.terminalCalls(),
+        0,
+        "forwarding an event must not publish an agent completion",
+      );
+    },
+  );
+
+  it("persists the stable Linear workspace identity across issue renames and scopes every authority", async () => {
+    const initial = await materializedLinearWorkspace({});
+    const renamed = await materializedLinearWorkspace({ identifier: "OTHER-987" });
+    assert.equal(initial.workspaceKey, renamed.workspaceKey);
+    assert.notEqual(initial.newBranch, renamed.newBranch);
+    assert.equal(
+      initial.workspaceKey,
+      JSON.stringify([
+        "org-1",
+        JSON.stringify(["linear", "connection-1", "linear-org-1", "issue-uuid"]),
+      ]),
+    );
+    for (const changes of [
+      { organizationId: "other-hub-org" },
+      { connectionId: "other-connection" },
+      { linearOrganizationId: "other-linear-org" },
+      { issueId: "other-issue" },
+    ]) {
+      const other = await materializedLinearWorkspace(changes);
+      assert.notEqual(other.workspaceKey, initial.workspaceKey);
+    }
+    assert.equal(
+      (await materializedLinearWorkspace({ reuseWorkspace: false })).workspaceKey,
+      undefined,
+    );
+  });
+
+  it.each(["projectId", "daemonId", "sourceCwd"] as const)(
+    "rejects a changed workspace %s before creating or dispatching another execution",
+    async (field) => {
+      const fixture = await workflowFixture({
+        rawConfiguration: executionWorktreeConfiguration(true),
+      });
+      const key = JSON.stringify(["org-1", "stable-provider-key"]);
+      await fixture.database.claimWorkspacePlacement({
+        organizationId: "org-1",
+        workspaceKey: key,
+        projectId: fixture.projectId,
+        daemonId: "daemon-1",
+        sourceCwd: "/workspace",
+        firstExecutionId: randomUUID(),
+        [field]: "previous-placement",
+      });
+      const dispatch = vi.fn();
+      const { handler, engine } = createDurableWorkflowHandler({
+        database: fixture.database,
+        entitlements: fixture.entitlements,
+        providers: [
+          {
+            ...providerMatch(fixture.configuration, fixture.revisionId),
+            workspaceKeyFor: () => "stable-provider-key",
+            workKeyFor: () => "issue",
+          },
+        ],
+        dispatchLaunchMachineIntent: dispatch,
+      });
+      await handler(fixture.trigger("continue"));
+      await engine.processAvailable();
+      const [run] = await fixture.database.findTriggerRunsByProviderEventReceiptId(
+        fixture.providerEventReceiptId,
+      );
+      assert.ok(run);
+      assert.equal(run.status, "failed");
+      assert.match(run.failureReason ?? "", /workspace_placement_conflict/u);
+      const [step] = await fixture.database.listWorkflowStepRunsForTriggerRun(run.id);
+      assert.ok(step);
+      assert.equal(
+        await fixture.database.findAgentExecutionByWorkflowStepRunId(step.id),
+        undefined,
+      );
+      assert.equal(dispatch.mock.calls.length, 0);
+      assert.equal((await fixture.entitlements.usage("org-1", "executions.monthly")).used, 0);
+    },
+  );
+
   it.each(["github", "discord"] as const)(
     "materializes one reusable environment from each %s execution identity before persistence",
     async (providerName) => {
@@ -1483,17 +1628,22 @@ async function workflowFixture(
     compiledConfiguration?: CompiledHubConfig;
     resolvedPromptPartials?: ResolvedPromptPartials;
     namedAgents?: Record<string, CompiledAgent>;
+    organizationId?: string;
   } = {},
 ): Promise<Fixture> {
-  const database = createMemoryDatabase({ organizationIds: ["org-1"] });
+  const organizationId = options.organizationId ?? "org-1";
+  const database = createMemoryDatabase({ organizationIds: [organizationId] });
   // A real EntitlementsService over the SAME database the engine uses — not an auto-unlimited
   // proxy over a separate store. Metering the engine performs is therefore observable here, and
   // a per-execution regression actually fails these tests. Stamped unlimited by default; tests
   // that exercise the meter override it down.
   const entitlements = new EntitlementsService(database, { seats: async () => 0 });
-  await entitlements.stamp("org-1", UNLIMITED_TEMPLATE, { source: "provisioning", planId: null });
+  await entitlements.stamp(organizationId, UNLIMITED_TEMPLATE, {
+    source: "provisioning",
+    planId: null,
+  });
   const project = await database.createProject({
-    organizationId: "org-1",
+    organizationId,
     name: "Workflow",
     slug: randomUUID(),
     createdByUserId: "user-1",
@@ -1533,7 +1683,7 @@ async function workflowFixture(
   });
   await database.activateProjectConfigurationRevision(project.id, revision.id, []);
   const receipt = await database.persistManualEvent({
-    organizationId: "org-1",
+    organizationId,
     projectId: project.id,
     deliveryId: randomUUID(),
     source: "manual.run",
@@ -1552,7 +1702,7 @@ async function workflowFixture(
     trigger(message) {
       return {
         providerEventReceiptId: receipt.event.providerEventReceiptId,
-        organizationId: "org-1",
+        organizationId,
         projectId: project.id,
         configurationRevisionId: revision.id,
         source: "manual.run",
@@ -2006,7 +2156,7 @@ function terminalRecoveryConfiguration(): Record<string, unknown> {
   };
 }
 
-function executionWorktreeConfiguration(): Record<string, unknown> {
+function executionWorktreeConfiguration(reuseWorkspace?: boolean): Record<string, unknown> {
   const step = (id: string) => ({
     id,
     environment: "runner",
@@ -2022,7 +2172,14 @@ function executionWorktreeConfiguration(): Record<string, unknown> {
         kind: "daemon",
         daemon: "runner",
         cwd: "/workspace",
-        worktree: { mode: "branch-off", newBranch: "trigger-${{ paseo.execution.id }}" },
+        worktree: {
+          mode: "branch-off",
+          newBranch:
+            reuseWorkspace === undefined
+              ? "trigger-${{ paseo.execution.id }}"
+              : "linear/${{ paseo.work.id }}",
+          ...(reuseWorkspace === undefined ? {} : { reuseWorkspace }),
+        },
       },
     ],
     triggers: ["first", "second"].map((name) => ({
@@ -2031,6 +2188,364 @@ function executionWorktreeConfiguration(): Record<string, unknown> {
       max_runtime: "1h",
       steps: [step(`work-${name}`)],
     })),
+  };
+}
+
+async function materializedLinearWorkspace(options: {
+  organizationId?: string;
+  connectionId?: string;
+  linearOrganizationId?: string;
+  issueId?: string;
+  identifier?: string;
+  reuseWorkspace?: boolean;
+}) {
+  const fixture = await workflowFixture({
+    rawConfiguration: executionWorktreeConfiguration(options.reuseWorkspace ?? true),
+    ...(options.organizationId === undefined ? {} : { organizationId: options.organizationId }),
+  });
+  const context = linearWorkspaceContext(options);
+  const linear = createLinearTriggerProvider({
+    configurationStoreForProject: () => {
+      throw new Error("matching is supplied by the fixture");
+    },
+  });
+  const base = providerMatch(fixture.configuration, fixture.revisionId);
+  const provider = {
+    ...base,
+    name: "linear",
+    workspaceKeyFor: () => {
+      assert.notEqual(
+        options.reuseWorkspace,
+        false,
+        "the work identity is resolved only for opted-in environments",
+      );
+      return linear.workspaceKeyFor!(context);
+    },
+    workKeyFor: () => linear.workKeyFor!(context),
+    async match(event: DurableProviderEvent) {
+      return (await base.match(event)).map((match) =>
+        Object.assign({}, match, { triggerContext: context }),
+      );
+    },
+  };
+  let dispatched: LaunchMachineIntent | undefined;
+  const { handler, engine } = createDurableWorkflowHandler({
+    database: fixture.database,
+    entitlements: fixture.entitlements,
+    providers: [provider],
+    dispatchLaunchMachineIntent: async (intent) => {
+      dispatched = intent;
+      return {
+        execution: await fixture.database.findAgentExecutionByWorkflowStepRunId(
+          intent.workflowStepRunId!,
+        ),
+      };
+    },
+  });
+  await handler(fixture.trigger("continue"));
+  await engine.processAvailable();
+  assert.ok(dispatched);
+  const persisted = await fixture.database.findAgentExecutionByWorkflowStepRunId(
+    dispatched.workflowStepRunId!,
+  );
+  assert.deepEqual(persisted?.launchIntent?.environment.worktree, dispatched.environment.worktree);
+  const worktree = dispatched.environment.worktree;
+  assert.equal(worktree?.mode, "branch-off");
+  if (worktree?.mode !== "branch-off") throw new Error("workspace missing");
+  return worktree;
+}
+
+function linearWorkspaceContext(
+  options: {
+    connectionId?: string;
+    linearOrganizationId?: string;
+    issueId?: string;
+    identifier?: string;
+    sessionId?: string;
+  } = {},
+): LinearTriggerContext {
+  const linearOrganizationId = options.linearOrganizationId ?? "linear-org-1";
+  const issueId = options.issueId ?? "issue-uuid";
+  return {
+    provider: "linear",
+    target: {
+      provider: "linear",
+      linearOrganizationId,
+      issueId,
+      agentSessionId: options.sessionId ?? null,
+      ...(options.sessionId === undefined ? {} : { turnKey: `turn-${options.sessionId}` }),
+      threadRootCommentId: null,
+    },
+    event: {
+      linear: {
+        event_type: "issue",
+        action: "update",
+        delivery_id: randomUUID(),
+        connection_id: options.connectionId ?? "connection-1",
+        organization: { id: linearOrganizationId },
+        actor: { id: "human" },
+        issue: {
+          id: issueId,
+          identifier: options.identifier ?? "POS-123",
+          title: "Issue",
+          description: null,
+          project: null,
+          team: null,
+          state: null,
+          assignee: null,
+          label_ids: [],
+        },
+        comment: null,
+        agent_session:
+          options.sessionId === undefined
+            ? null
+            : { id: options.sessionId, app_user_id: "app", status: "active" },
+        agent_activity: null,
+        prompt_context: null,
+        trigger_thread_context: { status: "embedded" },
+      },
+    },
+  };
+}
+
+async function continuationRaceFixture(
+  mode: "ack-crash" | "lost-ack" | "incompatible" | "revoked",
+) {
+  const connectionId = randomUUID();
+  const compiled = compileHubConfig({
+    environments: [
+      {
+        name: "runner",
+        kind: "daemon",
+        daemon: "runner",
+        cwd: "/workspace",
+        worktree: { mode: "branch-off", newBranch: "${{ paseo.work.id }}", reuseWorkspace: true },
+      },
+    ],
+    triggers: [
+      {
+        name: "issue",
+        on: "linear.agent_session",
+        max_runtime: "1h",
+        filters: {
+          connection: "linear",
+          team: "team-1",
+          from_users: ["human"],
+          require_delegate: true,
+          continue_issue: true,
+        },
+        steps: [
+          {
+            id: "work",
+            environment: "runner",
+            max_runtime: "10m",
+            idle_timeout: "1m",
+            agent: { provider: "codex" },
+            prompt: [{ text: "Handle the supplied Linear event" }],
+          },
+        ],
+      },
+    ],
+  });
+  const configuration: CompiledHubConfig = {
+    ...compiled,
+    triggers: compiled.triggers.map((trigger) =>
+      Object.assign({}, trigger, { filters: { ...trigger.filters, connectionId } }),
+    ),
+  };
+  const fixture = await workflowFixture({ compiledConfiguration: configuration });
+  const { database, entitlements } = fixture;
+  let now = new Date();
+  let dispatched = 0;
+  let prompts = 0;
+  let revoked = false;
+  let releaseDispatch!: () => void;
+  let markDispatchStarted!: () => void;
+  const dispatchGate = new Promise<void>((resolve) => {
+    releaseDispatch = resolve;
+  });
+  const dispatchStarted = new Promise<void>((resolve) => {
+    markDispatchStarted = resolve;
+  });
+  const terminal = vi.fn(async () => undefined);
+  const lifecycle = createDaemonDispatchLifecycle({
+    database,
+    connectionForDaemon: () => ({
+      on: () => () => {},
+      createAgent: async () => {
+        throw new Error("continuation cannot create an agent");
+      },
+      controlExecution: async () => {},
+      promptExecution: async () => {
+        prompts += 1;
+        if (mode === "lost-ack") throw new Error("prompt ACK lost");
+        return { delivered: true, disposition: "steered" };
+      },
+    }),
+    test: {
+      logger: createLogger(new FailureLogStream()),
+      deadlineClock: { now: () => now.getTime(), schedule: () => () => {} },
+    },
+  });
+  const linear = createLinearTriggerProvider({
+    configurationStoreForProject: () => new ProjectConfigurationStore(database, fixture.projectId),
+    connectionForLinearOrganization: async () => ({ id: connectionId, appUserId: "app" }),
+    client: {
+      readIssueComments: async () => {
+        throw new Error("unused");
+      },
+      readAgentSessionActivities: async () => {
+        throw new Error("unused");
+      },
+      readCommentThread: async () => {
+        throw new Error("unused");
+      },
+      createAgentActivity: async () => {
+        throw new Error("unused");
+      },
+      readIssue: async () => ({
+        id: "issue-uuid",
+        identifier: "POS-123",
+        title: "Issue",
+        description: null,
+        projectId: null,
+        teamId: "team-1",
+        stateId: null,
+        assigneeId: null,
+        delegateId: revoked ? null : "app",
+        labelIds: [],
+      }),
+    },
+    executions: {
+      promptActive: (input) => lifecycle.promptAgentExecutions(input),
+      stopActive: async () => ({ stopped: 0 }),
+    },
+  });
+  const base = providerMatch(fixture.configuration, fixture.revisionId);
+  const secondConfiguration: CompiledHubConfig =
+    mode !== "incompatible"
+      ? fixture.configuration
+      : {
+          ...fixture.configuration,
+          triggers: fixture.configuration.triggers.map((trigger) =>
+            Object.assign({}, trigger, { maxRuntimeMs: trigger.maxRuntimeMs + 1 }),
+          ),
+        };
+  const secondRevision =
+    mode !== "incompatible"
+      ? fixture.revisionId
+      : (
+          await database.insertProjectConfigurationRevision({
+            projectId: fixture.projectId,
+            sourceKind: "manual",
+            sourceEvidence: {},
+            normalizedConfiguration: secondConfiguration,
+            contentHash: compiledConfigurationHash(secondConfiguration),
+          })
+        ).id;
+  const provider = {
+    ...linear,
+    async match(event: DurableProviderEvent) {
+      const second = isRecord(event.payload) && event.payload["input"] === "second";
+      const context = linearWorkspaceContext({
+        connectionId,
+        sessionId: second ? "second" : "first",
+      });
+      return (await base.match(event)).map((match) =>
+        Object.assign({}, match, {
+          triggerContext: context,
+          outputContext: context.target,
+          configurationRevisionId: second ? secondRevision : fixture.revisionId,
+          hubConfig: second ? secondConfiguration : fixture.configuration,
+        }),
+      );
+    },
+  };
+  const options = {
+    database,
+    entitlements,
+    providers: [provider],
+    now: () => now,
+    leaseMs: 1000,
+    logger: createLogger(new FailureLogStream()),
+    onWorkflowRunTerminal: terminal,
+    dispatchLaunchMachineIntent: async (intent: LaunchMachineIntent) => {
+      dispatched += 1;
+      markDispatchStarted();
+      await dispatchGate;
+      const execution = await database.findAgentExecutionByWorkflowStepRunId(
+        intent.workflowStepRunId!,
+      );
+      assert.ok(execution);
+      await database.prepareAgentExecutionForDispatch(
+        execution.id,
+        "daemon-1",
+        "machine-1",
+        "hash",
+      );
+      await database.attachAgentToExecution(execution.id, "daemon-1", "agent-1");
+      await database.transitionAgentExecution(execution.id, "running");
+      return { execution: (await database.findAgentExecutionById(execution.id))! };
+    },
+  };
+  const first = createDurableWorkflowHandler(options);
+  const second = createDurableWorkflowHandler(options);
+  const receipt = await database.persistManualEvent({
+    organizationId: "org-1",
+    projectId: fixture.projectId,
+    deliveryId: randomUUID(),
+    source: "manual.run",
+    payload: {},
+    receivedAt: now,
+  });
+  assert.equal(receipt.status, "accepted");
+  if (receipt.status !== "accepted") throw new Error("second receipt unavailable");
+  const secondEvent = {
+    ...fixture.trigger("second"),
+    source: "linear.agent_session" as const,
+    connectionId,
+    providerEventReceiptId: receipt.event.providerEventReceiptId,
+    deliveryId: receipt.event.deliveryId,
+    configurationRevisionId: secondRevision,
+  };
+  return {
+    first,
+    second,
+    database,
+    entitlements,
+    dispatchStarted,
+    releaseDispatch,
+    revokeAuthority: () => {
+      revoked = true;
+    },
+    dispatches: () => dispatched,
+    promptCalls: () => prompts,
+    terminalCalls: () => terminal.mock.calls.length,
+    acceptBoth: () =>
+      Promise.all([
+        first.handler({
+          ...fixture.trigger("first"),
+          source: "linear.agent_session",
+          connectionId,
+        }),
+        second.handler(secondEvent),
+      ]),
+    retry: async () => {
+      now = new Date(now.getTime() + 2000);
+      await second.engine.processAvailable();
+    },
+    waitingRun: async () => {
+      const [run] = await database.findTriggerRunsByProviderEventReceiptId(
+        secondEvent.providerEventReceiptId,
+      );
+      assert.ok(run);
+      return run;
+    },
+    close: async () => {
+      releaseDispatch();
+      await Promise.all([first.engine.stop(), second.engine.stop()]);
+      await lifecycle.stop();
+    },
   };
 }
 

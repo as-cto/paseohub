@@ -1,0 +1,1 @@
+ALTER TABLE "linear_comment_bridges" ADD COLUMN "creation_started_at" timestamp with time zone;

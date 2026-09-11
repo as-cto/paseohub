@@ -111,7 +111,14 @@ describe("Linear session mirror", () => {
     // block that never closes, so the session looks busy while the agent only waits. Seen on
     // SEN-98. The reply body would also be printed twice — the second time badly.
     const state = createLinearMirrorState();
-    for (const name of ["mcp__hub__reply", "mcp__hub__finish_execution"]) {
+    for (const name of [
+      "mcp__hub__reply",
+      "mcp__hub__progress",
+      "hub.progress",
+      "mcp__hub__plan",
+      "hub.plan",
+      "mcp__hub__finish_execution",
+    ]) {
       const planned = planLinearMirrorActivities(
         timeline({
           type: "tool_call",

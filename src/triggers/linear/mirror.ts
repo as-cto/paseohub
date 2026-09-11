@@ -210,7 +210,10 @@ function planToolCall(
   // closes — the session looks busy while the agent is only waiting for the next message.
   // Observed on SEN-98: "Posted a reply" and "Finished the turn" landed after the answer and left
   // the panel spinning. They say nothing a reader needs; the answer above them says it all.
-  if (closesTurn || name.includes("hub__reply") || name === "hub.reply") {
+  const nativeOutput = ["reply", "progress", "plan"].some(
+    (tool) => name === `hub.${tool}` || name.endsWith(`hub__${tool}`),
+  );
+  if (closesTurn || nativeOutput) {
     if (closesTurn) state.turnClosed = true;
     return;
   }

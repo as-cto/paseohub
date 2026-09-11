@@ -196,7 +196,15 @@ function toOutputDeliveryAttempts(
     ) {
       continue;
     }
-    attempts[id] = { id, outputType, status, startedAt, leaseExpiresAt, completedAt: completedAt! };
+    attempts[id] = {
+      id,
+      outputType,
+      status,
+      startedAt,
+      leaseExpiresAt,
+      completedAt: completedAt!,
+      ...(typeof raw["turnId"] === "string" ? { turnId: raw["turnId"] } : {}),
+    };
   }
   return attempts;
 }
@@ -229,7 +237,29 @@ function toAgentExecutionHubAcknowledgements(value: unknown): AgentExecutionHubA
       finishExecutionCall = { callId: callId ?? null, status, observedAt };
     }
   }
-  return { terminalAt, idleAt, finishExecutionCall };
+  const rawTurn = value["turn"];
+  const turnStartedAt = isRecord(rawTurn) ? toDate(rawTurn["started_at"]) : undefined;
+  const turn =
+    isRecord(rawTurn) && typeof rawTurn["id"] === "string" && turnStartedAt !== undefined
+      ? { id: rawTurn["id"], startedAt: turnStartedAt }
+      : undefined;
+  const inputDeliveries = toInputDeliveries(value["input_deliveries"]);
+  return {
+    terminalAt,
+    idleAt,
+    finishExecutionCall,
+    ...(turn === undefined ? {} : { turn }),
+    ...(Object.keys(inputDeliveries).length === 0 ? {} : { inputDeliveries }),
+  };
+}
+
+function toInputDeliveries(value: unknown): Record<string, "pending" | "delivered"> {
+  const result: Record<string, "pending" | "delivered"> = {};
+  if (!isRecord(value)) return result;
+  for (const [id, status] of Object.entries(value)) {
+    if (status === "pending" || status === "delivered") result[id] = status;
+  }
+  return result;
 }
 
 function emptyAgentExecutionHubAcknowledgements(): AgentExecutionHubAcknowledgements {

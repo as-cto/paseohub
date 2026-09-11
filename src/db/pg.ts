@@ -1,3 +1,30 @@
+import {
+  LinearTriageIntakeRepository,
+  type LinearTriageIntakeClaim,
+  type LinearTriageIntakeKey,
+  type LinearTriageIntakeSettlement,
+} from "./linear-triage-intakes.js";
+import {
+  LinearIssueSessionBridgeRepository,
+  type LinearIssueSessionBridgeClaim,
+  type LinearIssueSessionBridgeKey,
+  type LinearIssueSessionBridgeScope,
+} from "./linear-issue-session-bridges.js";
+import {
+  WorkspacePlacementRepository,
+  type WorkspacePlacementClaim,
+} from "./workspace-placements.js";
+import { linearDispatchKey } from "./linear-dispatch.js";
+import {
+  LinearFinalizationRepository,
+  type ReserveLinearFinalization,
+  type LinearIssueFinalization,
+} from "./linear-finalizations.js";
+import { nextTurnOutputContext } from "./turn-output-context.js";
+import { LinearReplyRepository, type ReserveLinearReply } from "./linear-replies.js";
+import { LinearCommentBridgeRepository } from "./linear-comment-bridges.js";
+import { LinearWebhookInboxRepository } from "./linear-webhook-inbox.js";
+import type { LinearCommentBridgeClaim, LinearCommentBridgeKey } from "./types.js";
 import { randomUUID } from "node:crypto";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
@@ -9,7 +36,12 @@ import {
   mergeOverrides,
 } from "../entitlements/catalog.js";
 import { toDatabaseError } from "./errors.js";
-import { completesAtIdleDeadline } from "./idle-completion.js";
+import { completesAtIdleDeadline, matchesIdleTurnCompletionCondition } from "./idle-completion.js";
+import { linearIssueExecutionKey, ISSUE_EXECUTION_RETRY_MS } from "./linear-issue-serialization.js";
+import {
+  currentTurnOutputEmissions,
+  isCurrentTurnAttempt,
+} from "../execution-capabilities/required-outputs.js";
 import { withApiKeySerialization } from "./api-key-serialization.js";
 import { ConnectionRepository } from "./connections.js";
 import { ProviderEventAcceptanceRepository } from "./trigger-acceptance.js";
@@ -132,7 +164,125 @@ export function createDatabase(runtime: DatabaseRuntime, locks: Locks): Database
 }
 
 class PgDatabase implements Database {
+  claimWorkspacePlacement(input: WorkspacePlacementClaim) {
+    return new WorkspacePlacementRepository(this.pool).claim(input);
+  }
+  admitLinearWebhook(input: Parameters<Database["admitLinearWebhook"]>[0]) {
+    return new LinearWebhookInboxRepository(this.pool.drizzle()).admit(input);
+  }
+  listPendingLinearWebhooks(applicationId: string, now: Date, limit: number) {
+    return new LinearWebhookInboxRepository(this.pool.drizzle()).pending(applicationId, now, limit);
+  }
+  findLinearWebhook(id: string) {
+    return new LinearWebhookInboxRepository(this.pool.drizzle()).find(id);
+  }
+  settleLinearWebhook(id: string, outcome: Parameters<Database["settleLinearWebhook"]>[1]) {
+    return new LinearWebhookInboxRepository(this.pool.drizzle()).settle(id, outcome);
+  }
+  findLinearTriageIntake(key: LinearTriageIntakeKey) {
+    return new LinearTriageIntakeRepository(this.pool).find(key);
+  }
+  claimLinearTriageIntake(input: LinearTriageIntakeClaim) {
+    return new LinearTriageIntakeRepository(this.pool).claim(input);
+  }
+  startLinearTriageIntake(key: LinearTriageIntakeKey, leaseId: string, now: Date) {
+    return new LinearTriageIntakeRepository(this.pool).start(key, leaseId, now);
+  }
+  settleLinearTriageIntake(
+    key: LinearTriageIntakeKey,
+    leaseId: string,
+    outcome: LinearTriageIntakeSettlement,
+  ) {
+    return new LinearTriageIntakeRepository(this.pool).settle(key, leaseId, outcome);
+  }
+
+  claimLinearIssueSessionBridge(input: LinearIssueSessionBridgeClaim) {
+    return new LinearIssueSessionBridgeRepository(this.pool).claim(input);
+  }
+  findLinearIssueSessionBridge(key: LinearIssueSessionBridgeKey) {
+    return new LinearIssueSessionBridgeRepository(this.pool).find(key);
+  }
+  findLinearIssueSessionBridgeBySession(scope: LinearIssueSessionBridgeScope, sessionId: string) {
+    return new LinearIssueSessionBridgeRepository(this.pool).findBySession(scope, sessionId);
+  }
+  findLinearIssueSessionBridgeByMarker(scope: LinearIssueSessionBridgeScope, markerUrl: string) {
+    return new LinearIssueSessionBridgeRepository(this.pool).findByMarker(scope, markerUrl);
+  }
+  bindLinearIssueSessionBridge(key: LinearIssueSessionBridgeKey, sessionId: string) {
+    return new LinearIssueSessionBridgeRepository(this.pool).bind(key, sessionId);
+  }
+  startLinearIssueSessionBridgeCreation(
+    key: LinearIssueSessionBridgeKey,
+    leaseId: string,
+    now: Date,
+  ) {
+    return new LinearIssueSessionBridgeRepository(this.pool).startCreation(key, leaseId, now);
+  }
+
+  claimLinearCommentBridge(input: LinearCommentBridgeClaim) {
+    return new LinearCommentBridgeRepository(this.pool).claim(input);
+  }
+  findLinearCommentBridge(key: LinearCommentBridgeKey) {
+    return new LinearCommentBridgeRepository(this.pool).find(key);
+  }
+  bindLinearCommentBridge(key: LinearCommentBridgeKey, sessionId: string) {
+    return new LinearCommentBridgeRepository(this.pool).bind(key, sessionId);
+  }
+  startLinearCommentBridgeCreation(key: LinearCommentBridgeKey, leaseId: string, now: Date) {
+    return new LinearCommentBridgeRepository(this.pool).startCreation(key, leaseId, now);
+  }
   private readonly connections;
+  reserveLinearFinalization(input: ReserveLinearFinalization) {
+    return new LinearFinalizationRepository(this.pool).reserve(input);
+  }
+  findLinearFinalization(replyId: string) {
+    return new LinearFinalizationRepository(this.pool).find(replyId);
+  }
+  startLinearFinalization(replyId: string, now: Date) {
+    return new LinearFinalizationRepository(this.pool).start(replyId, now);
+  }
+  completeLinearFinalization(
+    replyId: string,
+    status: Exclude<LinearIssueFinalization["status"], "pending">,
+    detail: string,
+    now: Date,
+  ) {
+    return new LinearFinalizationRepository(this.pool).complete(replyId, status, detail, now);
+  }
+  reserveLinearReply(input: ReserveLinearReply) {
+    return new LinearReplyRepository(this.pool).reserve(input);
+  }
+  beginTerminalLinearReplyAttempt(executionId: string, expectedTurnKey: string, now: Date) {
+    return new LinearReplyRepository(this.pool).beginTerminalAttempt(
+      executionId,
+      expectedTurnKey,
+      now,
+    );
+  }
+  listTerminalLinearReplyCandidates(applicationId: string, limit: number) {
+    return new LinearReplyRepository(this.pool).listTerminalCandidates(applicationId, limit);
+  }
+  findLinearReply(executionId: string, turnKey: string) {
+    return new LinearReplyRepository(this.pool).find(executionId, turnKey);
+  }
+  listPendingLinearReplies(applicationId: string, now: Date, limit: number) {
+    return new LinearReplyRepository(this.pool).listPending(applicationId, now, limit);
+  }
+  claimLinearReply(id: string, leaseId: string, now: Date, leaseExpiresAt: Date) {
+    return new LinearReplyRepository(this.pool).claim(id, leaseId, now, leaseExpiresAt);
+  }
+  confirmLinearReplyDestination(id: string, destination: "comment" | "activity", now: Date) {
+    return new LinearReplyRepository(this.pool).confirm(id, destination, now);
+  }
+  retryLinearReply(id: string, leaseId: string, nextAttemptAt: Date, error: string) {
+    return new LinearReplyRepository(this.pool).retry(id, leaseId, nextAttemptAt, error);
+  }
+  supersedeLinearReply(id: string, now: Date) {
+    return new LinearReplyRepository(this.pool).supersede(id, now);
+  }
+  acknowledgeLinearReply(id: string, now: Date) {
+    return new LinearReplyRepository(this.pool).acknowledge(id, now);
+  }
   private readonly triggerAcceptance;
 
   constructor(
@@ -479,6 +629,28 @@ class PgDatabase implements Database {
   ): Promise<{ run: AcceptedTriggerRunRecord; created: boolean }> {
     try {
       return await this.pool.transaction(async (client) => {
+        const turnKey = linearDispatchKey(input.outputContext);
+        if (turnKey !== undefined) {
+          // Serialize competing webhook deliveries before checking the same native turn.
+          // Project ownership is already a foreign-key boundary; no instance-wide lock.
+          await client.query(
+            "select id from projects where id = $1 and organization_id = $2 for update",
+            [input.projectId, input.organizationId],
+          );
+          const duplicate = await client.query<TriggerRunRow>(
+            `select * from trigger_runs where project_id = $1 and organization_id = $2
+             and outcome = 'accepted' and output_context->>'provider' = 'linear'
+             and coalesce(output_context->>'agentSessionId','') <> ''
+             and output_context->>'turnKey' = $3 limit 1`,
+            [input.projectId, input.organizationId, turnKey],
+          );
+          if (duplicate.rows[0] !== undefined) {
+            const run = toTriggerRunRecord(duplicate.rows[0]);
+            if (run.outcome !== "accepted") throw new Error("native turn ownership conflict");
+            return { run, created: false };
+          }
+        }
+
         const inserted = await client.query<TriggerRunRow>(
           `insert into trigger_runs
            (id, organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
@@ -771,6 +943,39 @@ class PgDatabase implements Database {
             created: false,
           };
         }
+        const issueKey = linearIssueExecutionKey(
+          input.execution.projectId,
+          input.execution.triggerContext,
+        );
+        if (issueKey !== undefined) {
+          await this.locks.withTxLock(client, issueKey);
+          const live = await client.query<AgentExecutionRow>(
+            `select * from agent_executions where project_id = $1 and id <> $2
+             and (status in ('spawning', 'running') or (hub_action is not null and hub_action_completed_at is null))`,
+            [input.execution.projectId, input.executionId],
+          );
+          if (
+            live.rows.some(
+              (execution) =>
+                linearIssueExecutionKey(execution.project_id, execution.trigger_context) ===
+                issueKey,
+            )
+          ) {
+            const deferredUntil = new Date(startedAt.getTime() + ISSUE_EXECUTION_RETRY_MS);
+            await client.query(
+              `insert into workflow_wakeups (trigger_run_id, available_at, lease_expires_at)
+               values ($1, $2, null) on conflict (trigger_run_id) do update
+               set available_at = excluded.available_at, lease_expires_at = null`,
+              [input.triggerRunId, deferredUntil],
+            );
+            return {
+              stepRun: toWorkflowStepRunRecord(step),
+              execution: undefined,
+              created: false,
+              deferredUntil,
+            };
+          }
+        }
         const execution = await insertAgentExecutionOnClient(client, {
           ...input.execution,
           id: input.executionId,
@@ -919,16 +1124,7 @@ class PgDatabase implements Database {
         if (initial === undefined)
           throw new Error(`agent execution not found: ${input.executionId}`);
         if (initial.workflow_step_run_id === null) {
-          return this.transitionAgentExecution(input.executionId, input.executionStatus, {
-            result: input.result,
-            ...(input.completedByAgent === undefined
-              ? {}
-              : { completedByAgent: input.completedByAgent }),
-            ...(input.deadlineCondition === undefined
-              ? {}
-              : { deadlineCondition: input.deadlineCondition }),
-            ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
-          });
+          return this.completeStandaloneWorkflowExecution(input, initial);
         }
 
         const stepLookup = await client.query<WorkflowStepRunRow>(
@@ -957,6 +1153,13 @@ class PgDatabase implements Database {
         const execution = executionRows.rows[0];
         if (execution === undefined)
           throw new Error(`agent execution not found: ${input.executionId}`);
+        if (
+          !matchesIdleTurnCompletionCondition(
+            toAgentExecutionRecord(execution),
+            input.idleTurnCondition,
+          )
+        )
+          return { execution: toAgentExecutionRecord(execution), transitioned: false };
         const observedAt = input.observedAt ?? new Date();
         if (execution.status === "spawning" || execution.status === "running") {
           const deadlineKind = workflowDeadlineKind(execution, step, run, observedAt);
@@ -1031,6 +1234,23 @@ class PgDatabase implements Database {
     } catch (error) {
       throw toDatabaseError(error);
     }
+  }
+
+  private completeStandaloneWorkflowExecution(
+    input: WorkflowAgentCompletionInput,
+    row: AgentExecutionRow,
+  ) {
+    const execution = toAgentExecutionRecord(row);
+    if (!matchesIdleTurnCompletionCondition(execution, input.idleTurnCondition))
+      return Promise.resolve({ execution, transitioned: false });
+    return this.transitionAgentExecution(input.executionId, input.executionStatus, {
+      result: input.result,
+      ...(input.completedByAgent === undefined ? {} : { completedByAgent: input.completedByAgent }),
+      ...(input.deadlineCondition === undefined
+        ? {}
+        : { deadlineCondition: input.deadlineCondition }),
+      ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
+    });
   }
 
   async markWorkflowStepSkipped(triggerRunId: string, stepId: string, reason: string) {
@@ -2076,6 +2296,7 @@ class PgDatabase implements Database {
         const execution = toAgentExecutionRecord(row);
         const activeAttempts = Object.values(execution.outputDeliveryAttempts).filter(
           (attempt) =>
+            isCurrentTurnAttempt(execution, attempt) &&
             attempt.outputType === outputType &&
             attempt.status === "pending" &&
             attempt.leaseExpiresAt > startedAt,
@@ -2084,7 +2305,7 @@ class PgDatabase implements Database {
           (maxOutputs !== undefined && maxOutputs < 1) ||
           (execution.status !== "spawning" && execution.status !== "running") ||
           (maxOutputs !== undefined &&
-            (execution.outputEmissions[outputType] ?? 0) + activeAttempts >= maxOutputs)
+            (currentTurnOutputEmissions(execution)[outputType] ?? 0) + activeAttempts >= maxOutputs)
         ) {
           return undefined;
         }
@@ -2095,6 +2316,9 @@ class PgDatabase implements Database {
           startedAt,
           leaseExpiresAt: new Date(startedAt.getTime() + OUTPUT_ATTEMPT_LEASE_MS),
           completedAt: null,
+          ...(execution.hubActionAcknowledgements.turn === undefined
+            ? {}
+            : { turnId: execution.hubActionAcknowledgements.turn.id }),
         };
         await client.query(
           `update agent_executions
@@ -2118,6 +2342,8 @@ class PgDatabase implements Database {
   async beginAgentExecutionTurn(
     executionId: string,
     startedAt: Date,
+    inputId?: string,
+    context?: { triggerContext: unknown; outputContext: unknown },
   ): Promise<AgentExecutionRecord | undefined> {
     try {
       return await this.pool.transaction(async (client) => {
@@ -2129,20 +2355,32 @@ class PgDatabase implements Database {
         if (row === undefined) return undefined;
         const execution = toAgentExecutionRecord(row);
         if (execution.status !== "spawning" && execution.status !== "running") return undefined;
-        // Pending attempts belong to the turn that just ended; leaving them would count against
-        // the new turn's allowance and, if one had failed, condemn a turn that has not started.
-        const attempts = Object.fromEntries(
-          Object.entries(execution.outputDeliveryAttempts).filter(
-            ([, attempt]) => attempt.status === "pending" && attempt.leaseExpiresAt > startedAt,
-          ),
-        );
         const updated = await client.query<AgentExecutionRow>(
           `update agent_executions
-             set output_emissions = '{}'::jsonb,
-                 output_delivery_attempts = $2::jsonb
+             set hub_action_acknowledgements = $2::jsonb, idle_deadline_at = null,
+                 trigger_context = coalesce($3::jsonb, trigger_context),
+                 output_context = coalesce($4::jsonb, output_context)
            where id = $1
            returning *`,
-          [executionId, JSON.stringify(attempts)],
+          [
+            executionId,
+            JSON.stringify({
+              terminal_at: null,
+              idle_at: null,
+              finish_execution_call: null,
+              turn: { id: randomUUID(), started_at: startedAt },
+              input_deliveries: {
+                ...execution.hubActionAcknowledgements.inputDeliveries,
+                ...(inputId === undefined ? {} : { [inputId]: "pending" }),
+              },
+            }),
+            context === undefined ? null : JSON.stringify(context.triggerContext),
+            context === undefined
+              ? null
+              : JSON.stringify(
+                  nextTurnOutputContext(execution.outputContext, context.outputContext),
+                ),
+          ],
         );
         const updatedRow = updated.rows[0];
         return updatedRow === undefined ? undefined : toAgentExecutionRecord(updatedRow);
@@ -2150,6 +2388,42 @@ class PgDatabase implements Database {
     } catch (error) {
       throw toDatabaseError(error);
     }
+  }
+
+  async recordAgentExecutionInputDelivery(
+    executionId: string,
+    inputId: string,
+    delivered: boolean,
+  ): Promise<void> {
+    await query(
+      this.pool,
+      `update agent_executions set hub_action_acknowledgements = jsonb_set(
+         hub_action_acknowledgements, '{input_deliveries}',
+         case when $3::boolean then coalesce(hub_action_acknowledgements->'input_deliveries', '{}'::jsonb) || jsonb_build_object($2::text, 'delivered')
+           else coalesce(hub_action_acknowledgements->'input_deliveries', '{}'::jsonb) - $2::text end,
+         true) where id = $1`,
+      [executionId, inputId, delivered],
+    );
+  }
+
+  async findAgentExecutionInputDelivery(
+    projectId: string,
+    inputId: string,
+    initialTurnKey?: string,
+  ): Promise<{ executionId: string; status: "pending" | "delivered" } | undefined> {
+    const rows = await query<{ id: string; status: "pending" | "delivered" }>(
+      this.pool,
+      `select id, case when output_context->>'turnKey' = $3 then 'delivered'
+         else hub_action_acknowledgements->'input_deliveries'->>$2 end as status
+       from agent_executions where project_id = $1
+       and (hub_action_acknowledgements->'input_deliveries'->>$2 in ('pending', 'delivered')
+         or ($3::text is not null and output_context->>'provider' = 'linear'
+           and coalesce(output_context->>'agentSessionId', '') <> ''
+           and output_context->>'turnKey' = $3)) limit 1`,
+      [projectId, inputId, initialTurnKey ?? null],
+    );
+    const row = rows.rows[0];
+    return row === undefined ? undefined : { executionId: row.id, status: row.status };
   }
 
   async completeAgentExecutionOutput(
@@ -2432,6 +2706,7 @@ class PgDatabase implements Database {
             true
           )
           where id = $1
+            and (${state}->'turn'->>'started_at' is null or (${state}->'turn'->>'started_at')::timestamptz <= $2::timestamptz)
             and (
               ${state}->>'${field}' is null
               or (${state}->>'${field}')::timestamptz < $2::timestamptz
@@ -2452,6 +2727,8 @@ class PgDatabase implements Database {
             true
           )
           where id = $1
+            and ($5::boolean = false or (${state}->'turn'->>'id') is not distinct from $6::text)
+            and (${state}->'turn'->>'started_at' is null or (${state}->'turn'->>'started_at')::timestamptz <= $2::timestamptz)
             and (
               ${state}->'finish_execution_call'->>'observed_at' is null
               or (
@@ -2468,6 +2745,8 @@ class PgDatabase implements Database {
           acknowledgement.observedAt,
           acknowledgement.callId ?? null,
           acknowledgement.status,
+          acknowledgement.expectedTurnId !== undefined,
+          acknowledgement.expectedTurnId ?? null,
         ];
       }
       const rows = await query<AgentExecutionRow>(this.pool, statement, parameters);
@@ -4141,6 +4420,14 @@ class PgDatabase implements Database {
            'no_project_route',
            'no_trigger_for_source',
            'trigger_filters_rejected',
+           'linear_intake_ignored',
+           'linear_intake_ambiguous',
+           'linear_issue_not_delegated',
+           'linear_app_event_ignored',
+           'linear_no_work_change',
+           'linear_issue_outside_scope',
+           'linear_actor_not_authorized',
+
            'configuration_unavailable'
          )
          and not exists (

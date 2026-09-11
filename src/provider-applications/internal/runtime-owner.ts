@@ -4,7 +4,14 @@ import type { GitHubConfigurationProvider } from "../../configuration/github-syn
 import type { Database } from "../../db/types.js";
 import type { OutputToolDefinition } from "../../execution-capabilities/outputs.js";
 import { outputContextProvider, replyOutputTool } from "../../execution-capabilities/outputs.js";
-import { linearReplyOutputTool } from "../../triggers/linear/reply.js";
+import {
+  LINEAR_PROGRESS_OUTPUT_TYPE,
+  LINEAR_PLAN_OUTPUT_TYPE,
+  linearReplyOutputTool,
+  linearProgressOutputTool,
+  linearPlanOutputTool,
+  linearSessionOutputAvailable,
+} from "../../triggers/linear/reply.js";
 import { logger } from "../../logger.js";
 import { reportFailure } from "../../failures/index.js";
 import { createDiscordRegistration } from "../../providers/discord/index.js";
@@ -404,23 +411,21 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
       outputs:
         provider === "github"
           ? []
-          : [
-              {
-                type: `${provider}.reply`,
-                tool: replyOutputToolFor(provider),
-                available: outputContextProvider(provider),
-                execute: (input) => {
-                  const active = slot.active;
-                  const output = active?.registration.outputs.find(
-                    (candidate) => candidate.type === `${provider}.reply`,
-                  );
-                  if (active === undefined || output === undefined) {
-                    throw unavailable(`${provider}_output_unavailable`);
-                  }
-                  return this.withLease(active, () => output.execute(input));
-                },
+          : providerOutputTools(provider).map(({ type, tool, available }) => ({
+              type,
+              tool,
+              available,
+              execute: (input) => {
+                const active = slot.active;
+                const output = active?.registration.outputs.find(
+                  (candidate) => candidate.type === type,
+                );
+                if (active === undefined || output === undefined) {
+                  throw unavailable(`${provider}_output_unavailable`);
+                }
+                return this.withLease(active, () => output.execute(input));
               },
-            ],
+            })),
       requests:
         provider === "discord"
           ? []
@@ -657,6 +662,29 @@ function actionNames(provider: Provider): readonly string[] {
  */
 function replyOutputToolFor(provider: Provider): OutputToolDefinition {
   return provider === "linear" ? linearReplyOutputTool : replyOutputTool;
+}
+
+function providerOutputTools(provider: Provider) {
+  const reply = {
+    type: `${provider}.reply`,
+    tool: replyOutputToolFor(provider),
+    available: outputContextProvider(provider),
+  };
+  return provider === "linear"
+    ? [
+        reply,
+        {
+          type: LINEAR_PROGRESS_OUTPUT_TYPE,
+          tool: linearProgressOutputTool,
+          available: linearSessionOutputAvailable,
+        },
+        {
+          type: LINEAR_PLAN_OUTPUT_TYPE,
+          tool: linearPlanOutputTool,
+          available: linearSessionOutputAvailable,
+        },
+      ]
+    : [reply];
 }
 
 function eventNames(provider: Provider): TriggerProvider["eventNames"] {

@@ -76,6 +76,10 @@ export type DaemonEventHandler = (event: DaemonEvent) => void | Promise<void>;
 
 export interface DaemonExecutionPromptOptions {
   executionId: string;
+  /** Exact agent UUID persisted for this execution, never a user-provided selector. */
+  agentId?: string;
+  /** Stable input key for daemons advertising public agent request receipts. */
+  messageId?: string;
   prompt: string;
   /** What to do with a turn already in flight. `steer` folds the message into it. */
   activeTurnBehavior?: "interrupt" | "steer";
@@ -93,8 +97,8 @@ export interface DaemonConnection {
   /**
    * Sends a message to the agent an execution already owns.
    *
-   * Rejects with `daemon_prompt_unsupported` against a daemon that predates the capability, so a
-   * caller can fall back rather than hang: the fleet is upgraded one machine at a time.
+   * Uses the public agent RPC when advertised, otherwise the private execution RPC.
+   * A failed or unacknowledged send is never retried through the other protocol.
    */
   promptExecution(options: DaemonExecutionPromptOptions): Promise<DaemonExecutionPromptResult>;
   on(handler: DaemonEventHandler): () => void;

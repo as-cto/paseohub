@@ -11,7 +11,7 @@ import type {
   JsonPrimitive,
 } from "../../config/compiler.js";
 import { parseCompiledHubConfig } from "../../config/compiler.js";
-import type { TriggerDocument } from "./schema.js";
+import { TriggerFilterSchema, type TriggerDocument } from "./schema.js";
 import { compileTriggerDocument, serializeTriggerDocument } from "./index.js";
 
 export type MigratedLegacyTrigger =
@@ -223,22 +223,9 @@ function authoredFilters(
     ...rest
   } = filters;
   if (Object.keys(rest).length === 0) return undefined;
-  return {
-    pattern: rest.pattern,
-    contains: rest.contains,
-    label: rest.label,
-    labels: rest.labels === undefined ? undefined : [...rest.labels],
-    repo: rest.repo,
-    guild: rest.guild,
-    workspace: rest.workspace,
-    project: rest.project,
-    states: rest.states === undefined ? undefined : [...rest.states],
-    exclude_labels: rest.exclude_labels === undefined ? undefined : [...rest.exclude_labels],
-    assignees: rest.assignees === undefined ? undefined : [...rest.assignees],
-    channels: rest.channels === undefined ? undefined : [...rest.channels],
-    from_users: rest.from_users === undefined ? undefined : [...rest.from_users],
-    inputs: rest.inputs === undefined ? undefined : { ...rest.inputs },
-  };
+  // Clone every admitted filter. An unknown field must fail rather than silently broadening
+  // launch authority during startup migration.
+  return TriggerFilterSchema.parse(rest);
 }
 
 function hasNullableInputs(inputs: Readonly<Record<string, CompiledInput>>): boolean {

@@ -21,6 +21,8 @@ import {
   HubExecutionOutboundSchema,
   HubDaemonHelloSchema,
   HubDaemonServerInfoEnvelopeSchema,
+  DaemonAgentMessageRequestSchema,
+  DaemonAgentMessageResponseSchema,
 } from "../hub/protocol.js";
 import {
   DaemonCreateResponseLostError,
@@ -53,6 +55,8 @@ interface PendingPromptRequest {
   kind: "prompt";
   generation: number;
   executionId: string;
+  protocol: "execution" | "agent-rpc";
+  agentId?: string;
   resolve(value: DaemonExecutionPromptResult): void;
   reject(error: Error): void;
 }
@@ -77,6 +81,8 @@ interface ActiveSocket {
   daemon: DaemonRecord;
   ready: boolean;
   presenceReady: Promise<void>;
+  hubAgentRpc: boolean;
+  hubWorkspaceBindings: boolean;
 }
 
 export type DaemonSessionProtocol = "legacy" | "session-v1";
@@ -87,8 +93,8 @@ const DAEMON_SESSION_PROTOCOL_VERSION = "1";
 /**
  * How long Hub waits for a daemon to answer a prompt request.
  *
- * Short on purpose: the caller is a person's message in a Linear session, and falling back to a
- * fresh agent after a few seconds beats waiting on a daemon that will never answer.
+ * A missing acknowledgement must become a visible uncertain delivery, never an unbounded wait
+ * or an automatic second agent processing the same person's message.
  */
 const DAEMON_PROMPT_TIMEOUT_MS = 10_000;
 
@@ -123,6 +129,8 @@ export class ActiveDaemonRegistry {
       daemon,
       ready: false,
       presenceReady: Promise.resolve(),
+      hubAgentRpc: false,
+      hubWorkspaceBindings: false,
     };
     this.active.set(daemon.id, active);
     previous?.socket.close(4001, "replaced");
@@ -251,6 +259,18 @@ export class ActiveDaemonRegistry {
   ): Promise<{ id: string }> {
     const active = this.active.get(daemonId);
     if (!active?.ready) return Promise.reject(new Error("daemon_not_connected"));
+    if (
+      options.worktree?.mode === "branch-off" &&
+      options.worktree.workspaceKey !== undefined &&
+      !active.hubWorkspaceBindings
+    ) {
+      return Promise.reject(
+        new DaemonCreateRejectedError(
+          "Update the Paseo daemon to reuse the issue workspace safely",
+          "workspace_binding_unsupported",
+        ),
+      );
+    }
     const requestId = randomUUID();
     const executionId = options.executionId;
     const request = HubExecutionAgentCreateRequestSchema.parse({
@@ -316,10 +336,9 @@ export class ActiveDaemonRegistry {
   /**
    * Sends a message to the agent an execution already owns.
    *
-   * The timeout is the point: a daemon that predates this message answers `rpc_error` and rejects
-   * the promise, but a daemon that silently ignores it would leave the caller waiting forever —
-   * and the caller here is a user's Linear message. Rejecting after a few seconds turns that into
-   * a fallback (start a fresh agent) instead of a message that never lands.
+   * Select the protocol from the daemon's advertised capability, before sending. A timeout or
+   * disconnect may have lost only the acknowledgement, so neither triggers a second send using
+   * the other protocol. The lifecycle retains the durable input claim for reconciliation.
    */
   private promptExecution(
     daemonId: string,
@@ -327,16 +346,29 @@ export class ActiveDaemonRegistry {
   ): Promise<DaemonExecutionPromptResult> {
     const active = this.active.get(daemonId);
     if (!active?.ready) return Promise.reject(new Error("daemon_not_connected"));
+    if (active.hubAgentRpc && options.agentId === undefined)
+      return Promise.resolve({ delivered: false, disposition: null });
     const requestId = randomUUID();
-    const request = HubExecutionAgentPromptRequestSchema.parse({
-      type: "hub.execution.agent.prompt.request",
-      requestId,
-      executionId: options.executionId,
-      prompt: options.prompt,
-      ...(options.activeTurnBehavior === undefined
-        ? {}
-        : { activeTurnBehavior: options.activeTurnBehavior }),
-    });
+    const request = active.hubAgentRpc
+      ? DaemonAgentMessageRequestSchema.parse({
+          type: "send_agent_message_request",
+          requestId,
+          agentId: options.agentId,
+          text: options.prompt,
+          messageId: options.messageId ?? requestId,
+          ...(options.activeTurnBehavior === undefined
+            ? {}
+            : { activeTurnBehavior: options.activeTurnBehavior }),
+        })
+      : HubExecutionAgentPromptRequestSchema.parse({
+          type: "hub.execution.agent.prompt.request",
+          requestId,
+          executionId: options.executionId,
+          prompt: options.prompt,
+          ...(options.activeTurnBehavior === undefined
+            ? {}
+            : { activeTurnBehavior: options.activeTurnBehavior }),
+        });
     return new Promise<DaemonExecutionPromptResult>((resolve, reject) => {
       const pending = this.pendingFor(daemonId);
       const timer = setTimeout(() => {
@@ -349,6 +381,8 @@ export class ActiveDaemonRegistry {
         kind: "prompt",
         generation: active.generation,
         executionId: options.executionId,
+        protocol: active.hubAgentRpc ? "agent-rpc" : "execution",
+        ...(options.agentId === undefined ? {} : { agentId: options.agentId }),
         resolve: (value) => {
           clearTimeout(timer);
           resolve(value);
@@ -376,7 +410,7 @@ export class ActiveDaemonRegistry {
     }
     const serverInfo = HubDaemonServerInfoEnvelopeSchema.safeParse(value);
     if (serverInfo.success) {
-      this.acceptServerInfo(active, serverInfo.data.message.payload.permissions);
+      this.acceptServerInfo(active, serverInfo.data.message.payload);
       return;
     }
     const envelope = HubExecutionOutboundSchema.safeParse(value);
@@ -391,6 +425,8 @@ export class ActiveDaemonRegistry {
     if (validated.success) return this.receiveAgentValidation(active, validated.data);
     const prompted = HubExecutionAgentPromptResponseSchema.safeParse(message);
     if (prompted.success) return this.receivePrompt(active, prompted.data);
+    const messaged = DaemonAgentMessageResponseSchema.safeParse(message);
+    if (messaged.success) return this.receiveAgentMessage(active, messaged.data);
     const update = HubExecutionAgentUpdateSchema.safeParse(message);
     if (update.success) {
       const event = {
@@ -415,11 +451,16 @@ export class ActiveDaemonRegistry {
     this.notifySubscribers(active.daemon.id, event);
   }
 
-  private acceptServerInfo(active: ActiveSocket, permissions: readonly string[]): void {
-    if (!samePermissions(permissions, active.daemon.permissions)) {
+  private acceptServerInfo(
+    active: ActiveSocket,
+    info: z.infer<typeof HubDaemonServerInfoEnvelopeSchema>["message"]["payload"],
+  ): void {
+    if (!samePermissions(info.permissions, active.daemon.permissions)) {
       active.socket.close(4403, "daemon session permissions do not match enrollment");
       return;
     }
+    active.hubAgentRpc = info.features?.hubAgentRpc === true;
+    active.hubWorkspaceBindings = info.features?.hubWorkspaceBindings === true;
     this.markReady(active);
   }
 
@@ -546,6 +587,7 @@ export class ActiveDaemonRegistry {
     if (
       !pending ||
       pending.kind !== "prompt" ||
+      pending.protocol !== "execution" ||
       pending.generation !== active.generation ||
       pending.executionId !== response.payload.executionId
     ) {
@@ -560,6 +602,27 @@ export class ActiveDaemonRegistry {
       delivered: response.payload.delivered,
       disposition: response.payload.disposition,
     });
+  }
+
+  private receiveAgentMessage(
+    active: ActiveSocket,
+    response: z.infer<typeof DaemonAgentMessageResponseSchema>,
+  ): void {
+    const requests = this.pendingFor(active.daemon.id);
+    const pending = requests.get(response.payload.requestId);
+    if (
+      pending?.kind !== "prompt" ||
+      pending.protocol !== "agent-rpc" ||
+      pending.generation !== active.generation ||
+      pending.agentId !== response.payload.agentId
+    )
+      return;
+    requests.delete(response.payload.requestId);
+    if (response.payload.error !== null) {
+      pending.reject(new Error(response.payload.error));
+      return;
+    }
+    pending.resolve({ delivered: response.payload.accepted, disposition: null });
   }
 
   private receiveCreate(

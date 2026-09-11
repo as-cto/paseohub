@@ -10,6 +10,7 @@ import type {
   AttachmentResolver,
 } from "../attachments/capabilities.js";
 import type { SlackDeliveryStatus } from "../triggers/slack/source/index.js";
+import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 
 export interface TriggerProviderResources {
   configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
@@ -43,8 +44,14 @@ export interface TriggerProviderExecutionControl {
   promptActive(input: {
     projectId: string;
     prompt: string;
+    inputId?: string;
+    turnContext?: { triggerContext: unknown; outputContext: unknown };
     activeTurnBehavior?: "interrupt" | "steer";
-    matches: (work: { outputContext: unknown; triggerRunId: string | null }) => boolean;
+    matches: (work: {
+      outputContext: unknown;
+      triggerRunId: string | null;
+      launchIntent?: LaunchMachineIntent | null;
+    }) => boolean;
   }): Promise<{
     delivered: boolean;
     /**

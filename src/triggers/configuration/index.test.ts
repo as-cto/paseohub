@@ -130,6 +130,36 @@ run:
     ]);
   });
 
+  it("preserves a scoped Linear automation policy in self-contained YAML", () => {
+    const yaml = `
+name: triage-agent
+on:
+  linear.agent_session:
+    connection: acme-linear
+    filters:
+      team: engineering-team-id
+      from_users: [operator-id]
+      allow_automated_sessions: true
+run:
+  target: { daemon: devbox, cwd: /workspace }
+  agent: { provider: codex, mode: full-access }
+  prompt: Handle it
+`;
+    const parsed = parseTriggerDocument(yaml);
+    assert.deepEqual(parseTriggerDocument(serializeTriggerDocument(parsed)), parsed);
+    const compiled = compileTriggerDocument(yaml);
+    assert.deepEqual(compiled.events[0]?.filters, {
+      connection: "acme-linear",
+      team: "engineering-team-id",
+      from_users: ["operator-id"],
+      allow_automated_sessions: true,
+    });
+    assert.throws(
+      () => compileTriggerDocument(yaml.replace("linear.agent_session", "linear.comment_created")),
+      /allow_automated_sessions is only supported for linear\.agent_session/iu,
+    );
+  });
+
   it("rejects a trigger without events at the document boundary", () => {
     assert.throws(
       () =>

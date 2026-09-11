@@ -1,5 +1,6 @@
+import { z } from "zod";
 import assert from "node:assert/strict";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
 import type {
   Database,
   LinearConnectionRecord,
@@ -16,6 +17,47 @@ import {
 } from "./client.js";
 
 describe("Linear connection client", () => {
+  it.each(["graphql", "oauth", "revoke"])(
+    "bounds a stalled %s request so durable delivery can retry",
+    async (endpoint) => {
+      const timeout = AbortSignal.timeout.bind(AbortSignal);
+      const deadline = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => timeout(1));
+      const request: typeof fetch = async (_url, init) => {
+        const signal = init?.signal;
+        assert.ok(signal);
+        return new Promise<Response>((_resolve, reject) => {
+          if (signal.aborted) reject(new Error("request aborted"));
+          else
+            signal.addEventListener("abort", () => reject(new Error("request aborted")), {
+              once: true,
+            });
+        });
+      };
+      try {
+        const connectionClient = createLinearConnectionClient({
+          clientId: "client",
+          clientSecret: "secret",
+          publicBaseUrl: "https://hub.test",
+          fetch: request,
+        });
+        const api = createLinearApiClient({
+          connectionForLinearOrganization: async () => linearConnection(),
+          withLinearConnectionRefresh: withinLinearRefresh(linearConnection(), async () => {}),
+          connectionClient,
+          fetch: request,
+        });
+        let operation: Promise<unknown>;
+        if (endpoint === "graphql")
+          operation = api.readIssue({ linearOrganizationId: "linear-org", issueId: "issue" });
+        else if (endpoint === "oauth") operation = connectionClient.exchangeCode("code");
+        else operation = connectionClient.revoke("token");
+        await assert.rejects(operation, /request aborted/u);
+        assert.equal(deadline.mock.calls[0]?.[0], 20_000);
+      } finally {
+        deadline.mockRestore();
+      }
+    },
+  );
   it("uses an OAuth callback URL and records the installed workspace identity", async () => {
     const requests: Array<{ url: string; body: string }> = [];
     const client = createLinearConnectionClient({
@@ -434,6 +476,151 @@ describe("Linear connection client", () => {
       signal: "select",
       signalMetadata: { options: [{ label: "main", value: "main" }] },
     });
+  });
+
+  it("preserves the auth signal and target user in the actual GraphQL request", async () => {
+    const { api, requests } = recordingApi({ data: { agentActivityCreate: { success: true } } });
+    const input = {
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      content: { type: "elicitation" as const, body: "Connect the project account." },
+      signal: "auth" as const,
+      signalMetadata: {
+        url: "https://connect.composio.dev/link/example",
+        userId: "ceo",
+        providerName: "GitHub",
+      },
+    };
+    await api.createAgentActivity(input);
+    assert.deepEqual(graphqlRequest(requests[0]!).variables, {
+      agentSessionId: input.agentSessionId,
+      content: input.content,
+      signal: input.signal,
+      signalMetadata: input.signalMetadata,
+    });
+  });
+
+  it("reads the current delegate independently of the accountable human assignee", async () => {
+    const { api, requests } = recordingApi({
+      data: {
+        issue: {
+          id: "issue-1",
+          title: "Product feedback",
+          labels: { nodes: [] },
+          assignee: { id: "studio-reviewer" },
+          delegate: { id: "p-agent" },
+        },
+      },
+    });
+    const issue = await api.readIssue({ linearOrganizationId: "linear-org", issueId: "issue-1" });
+    assert.equal(issue?.assigneeId, "studio-reviewer");
+    assert.equal(issue?.delegateId, "p-agent");
+    assert.match(graphqlRequest(requests[0]!).query, /delegate \{ id \}/u);
+  });
+
+  it("reads an existing native session on the root before a comment bridge creates one", async () => {
+    const { api, requests } = recordingApi({
+      data: {
+        comment: {
+          id: "reply",
+          children: { nodes: [] },
+          parent: {
+            id: "root",
+            user: { id: "ceo" },
+            children: { nodes: [] },
+            agentSession: {
+              id: "session-1",
+              appUser: { id: "p-agent" },
+              createdAt: "2026-09-09T12:00:01.000Z",
+            },
+          },
+          issue: { agentSessions: { nodes: [{ comment: { id: "root" } }] } },
+        },
+      },
+    });
+    assert.deepEqual(
+      await api.readCommentThread({ linearOrganizationId: "linear-org", commentId: "reply" }),
+      {
+        rootId: "root",
+        authorIds: ["ceo"],
+        agentSessionRootIds: ["root"],
+        agentSession: {
+          id: "session-1",
+          appUserId: "p-agent",
+          createdAt: "2026-09-09T12:00:01.000Z",
+        },
+      },
+    );
+    assert.match(
+      graphqlRequest(requests[0]!).query,
+      /agentSession \{ id createdAt appUser \{ id \} \}/u,
+    );
+  });
+
+  it("creates a native session using the documented root-comment input type", async () => {
+    const { api, requests } = recordingApi({
+      data: {
+        agentSessionCreateOnComment: {
+          success: true,
+          agentSession: { id: "native-session" },
+        },
+      },
+    });
+    assert.deepEqual(
+      await api.createAgentSessionOnComment({
+        linearOrganizationId: "linear-org",
+        commentId: "root",
+      }),
+      { id: "native-session" },
+    );
+    const request = graphqlRequest(requests[0]!);
+    assert.match(request.query, /\$input: AgentSessionCreateOnComment!/u);
+    assert.deepEqual(request.variables, { input: { commentId: "root" } });
+  });
+
+  it("rejects an unsuccessful native session mutation", async () => {
+    const { api } = recordingApi({
+      data: {
+        agentSessionCreateOnComment: {
+          success: false,
+          agentSession: null,
+        },
+      },
+    });
+    await assert.rejects(() =>
+      api.createAgentSessionOnComment({ linearOrganizationId: "linear-org", commentId: "root" }),
+    );
+  });
+
+  it("replaces the native plan and appends PR links without replacing the Paseo session link", async () => {
+    const { api, requests } = recordingApi({ data: { agentSessionUpdate: { success: true } } });
+    const plan = [{ content: "Apply feedback", status: "inProgress" as const }];
+    await api.updateAgentSessionPlan({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      plan,
+    });
+    assert.deepEqual(graphqlRequest(requests[0]!).variables, { id: "session-1", plan });
+    assert.match(graphqlRequest(requests[0]!).query, /plan: \$plan/u);
+    await api.updateAgentSessionExternalUrls({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      externalUrls: [{ label: "PR", url: "https://github.com/acme/repo/pull/42" }],
+    });
+    assert.match(graphqlRequest(requests[1]!).query, /addedExternalUrls: \$externalUrls/u);
+  });
+
+  it("propagates plan delivery rejection to output accounting", async () => {
+    const { api } = recordingApi({ data: { agentSessionUpdate: { success: false } } });
+    await assert.rejects(
+      () =>
+        api.updateAgentSessionPlan({
+          linearOrganizationId: "linear-org",
+          agentSessionId: "session-1",
+          plan: [],
+        }),
+      /plan was not accepted/u,
+    );
   });
 
   it("threads a comment under its parent only when a parent is given", async () => {
@@ -898,3 +1085,128 @@ function graphqlRequest(value: string): { query: string; variables: unknown } {
   }
   return { query: parsed.query, variables: "variables" in parsed ? parsed.variables : undefined };
 }
+
+function recordingApi(response: unknown) {
+  const requests: string[] = [];
+  const connection = linearConnection();
+  const api = createLinearApiClient({
+    connectionForLinearOrganization: async () => connection,
+    withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+    connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+    fetch: async (_url, init) => {
+      requests.push(readableBody(init?.body));
+      return json(response);
+    },
+  });
+  return { api, requests };
+}
+
+describe("Linear issue session reconciliation", () => {
+  function sessionApi(request: typeof fetch) {
+    return createLinearApiClient({
+      connectionForLinearOrganization: async () => linearConnection(),
+      withLinearConnectionRefresh: withinLinearRefresh(linearConnection(), async () => {}),
+      connectionClient: createLinearConnectionClient({
+        clientId: "client",
+        clientSecret: "secret",
+        publicBaseUrl: "https://hub.test",
+        fetch: request,
+      }),
+      fetch: request,
+    });
+  }
+
+  it("reads every page including archived sessions before returning and preserves exact marker URLs", async () => {
+    const cursors: unknown[] = [];
+    const api = sessionApi(async (_url, init) => {
+      const body = z
+        .object({ query: z.string(), variables: z.object({ after: z.string().nullable() }) })
+        .parse(JSON.parse(readableBody(init?.body)));
+      assert.match(body.query, /includeArchived: true/u);
+      assert.match(body.query, /externalLinks/u);
+      cursors.push(body.variables.after);
+      const second = body.variables.after === "cursor-1";
+      return json({
+        data: {
+          issue: {
+            agentSessions: {
+              nodes: [
+                {
+                  id: second ? "matching" : "unrelated",
+                  appUser: { id: "app" },
+                  externalLinks: second
+                    ? [{ label: "Paseo Hub", url: "https://hub.test/#linear-event=exact" }]
+                    : [],
+                },
+              ],
+              pageInfo: { hasNextPage: !second, endCursor: second ? null : "cursor-1" },
+            },
+          },
+        },
+      });
+    });
+    assert.ok(typeof api.readIssueSessions === "function");
+    const sessions = await api.readIssueSessions({
+      linearOrganizationId: "linear-org",
+      issueId: "issue",
+    });
+    assert.deepEqual(cursors, [null, "cursor-1"]);
+    assert.equal(sessions[1]?.externalUrls[0]?.url, "https://hub.test/#linear-event=exact");
+  });
+
+  it.each(["missing", "repeating", "limit"])(
+    "rejects %s pagination instead of returning a partial list",
+    async (mode) => {
+      let requests = 0;
+      const api = sessionApi(async () => {
+        requests += 1;
+        let endCursor: string | null = `cursor-${requests}`;
+        if (mode === "missing") endCursor = null;
+        if (mode === "repeating") endCursor = "same";
+        return json({
+          data: {
+            issue: {
+              agentSessions: {
+                nodes: [],
+                pageInfo: {
+                  hasNextPage: true,
+                  endCursor,
+                },
+              },
+            },
+          },
+        });
+      });
+      assert.ok(typeof api.readIssueSessions === "function");
+      await assert.rejects(
+        api.readIssueSessions({ linearOrganizationId: "linear-org", issueId: "issue" }),
+        /pagination/u,
+      );
+      const expectedRequests: Record<string, number> = { missing: 1, repeating: 2, limit: 100 };
+      assert.equal(requests, expectedRequests[mode]);
+    },
+  );
+
+  it("uses the public issue creation API and attaches its marker in that same mutation", async () => {
+    const externalUrls = [{ label: "Paseo Hub", url: "https://hub.test/#linear-event=marker" }];
+    const api = sessionApi(async (_url, init) => {
+      const body = z
+        .object({ query: z.string(), variables: z.unknown() })
+        .parse(JSON.parse(readableBody(init?.body)));
+      assert.match(body.query, /AgentSessionCreateOnIssue!/u);
+      assert.deepEqual(body.variables, { input: { issueId: "issue", externalUrls } });
+      return json({
+        data: { agentSessionCreateOnIssue: { success: true, agentSession: { id: "native" } } },
+      });
+    });
+    assert.ok(typeof api.createAgentSessionOnIssue === "function");
+    assert.deepEqual(
+      await api.createAgentSessionOnIssue({
+        linearOrganizationId: "linear-org",
+        issueId: "issue",
+        externalUrls,
+      }),
+      { id: "native" },
+    );
+  });
+});

@@ -1,6 +1,6 @@
 import type { DurableProviderEvent } from "../db/types.js";
 import type { JsonValue } from "../config/compiler.js";
-import type { WorktreeTarget } from "../config/index.js";
+import type { WorktreeTarget, CompiledTriggerConfig } from "../config/index.js";
 import type { InvocationParseResult } from "./invocation.js";
 import type { ProviderEventDropReasonCode } from "./drop-reason.js";
 import type { HubExecutionAgentStreamEvent } from "../hub/protocol.js";
@@ -167,6 +167,18 @@ export interface TriggerProvider<
    * branch, instead of each cutting a fresh copy of the default branch.
    */
   workKeyFor?(triggerContext: TriggerContext): string | undefined;
+  /** Permanent provider identity used when the workflow opts in to workspace reuse. */
+  workspaceKeyFor?(triggerContext: TriggerContext): string | undefined;
+  /** Retry a saved, unstarted single-step run against live work. True requires a durable input ACK. */
+  continuePendingRun?(input: {
+    organizationId: string;
+    projectId: string;
+    revisionId: string;
+    trigger: CompiledTriggerConfig;
+    triggerContext: TriggerContext;
+    outputContext: OutputContext;
+    prompt: string;
+  }): Promise<boolean>;
   onDispatchAccepted?(
     triggerContext: TriggerContext,
     outputContext: OutputContext,

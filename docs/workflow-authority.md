@@ -3,6 +3,9 @@
 Workflow authority is authored on an individual step. It is not a trigger option,
 agent option, sandbox setting, or Paseo daemon feature.
 
+For the separate decision of who may start a Linear session, see
+[Linear session launch authority](linear-session-authority.md).
+
 ## Generic connection values
 
 Step environment values may explicitly request a named value from a configured

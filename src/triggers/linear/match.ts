@@ -84,11 +84,15 @@ export function matchLinearTriggers(
   connectionId?: string | null,
   appUserId?: string | null,
 ): MatchedLinearTrigger[] {
-  return config.triggers.flatMap((trigger) => {
+  const matches = config.triggers.flatMap((trigger) => {
     if (!matchesLinearEvent(trigger.on, event)) return [];
     if (!matchesTriggerFilter(trigger, event, connectionId, appUserId)) return [];
     return [{ event, trigger }];
   });
+  // A delegated comment has a native session owner. Do not also run its legacy comment rule.
+  return matches.some((match) => match.trigger.on === "linear.delegated_comment")
+    ? matches.filter((match) => match.trigger.on === "linear.delegated_comment")
+    : matches;
 }
 
 export function matchesIssueScope(
@@ -120,6 +124,13 @@ export function matchesIssueScope(
 }
 
 function matchesLinearEvent(eventName: string, event: NormalizedLinearEvent): boolean {
+  if (eventName === "linear.delegated_issue_updated") {
+    return (
+      event.type === "issue" &&
+      event.action === "update" &&
+      (event.changes ?? []).some(({ field }) => field !== "delegateId")
+    );
+  }
   if (eventName === "linear.issue_entered_scope") {
     return event.type === "issue" && (event.action === "create" || event.action === "update");
   }
@@ -133,7 +144,9 @@ function matchesLinearEvent(eventName: string, event: NormalizedLinearEvent): bo
   }
   if (eventName === "linear.agent_session") return event.type === "agent_session";
   return (
-    eventName === "linear.comment_created" && event.type === "comment" && event.action === "create"
+    (eventName === "linear.comment_created" || eventName === "linear.delegated_comment") &&
+    event.type === "comment" &&
+    event.action === "create"
   );
 }
 
@@ -151,26 +164,67 @@ function matchesTriggerFilter(
     );
   }
   const issue = event.type === "issue" ? event.issue : event.issue;
-  if (issue === null || !matchesIssueScope(issue, trigger.filters, connectionId)) return false;
-  // `linear.issue_assigned` asks WHO THE ISSUE WENT TO, not who moved it. A triage rule assigns
-  // with no actor at all (`actor: null`), so requiring one drops every automated assignment —
-  // silently, and forever. Observed on SEN-106: the rule delegated and assigned, Linear showed
-  // "started work", and nothing ever reached the agent.
-  //
-  // The scope is carried by the filters that do apply here: the team, the labels, and the
-  // assignee. `from_users`, when a bundle sets it, still narrows further — this only stops an
-  // ABSENT actor from being a rejection, exactly as `linear.issue_entered_scope` already does.
-  const actorMatches =
-    trigger.on === "linear.issue_assigned"
-      ? matchesActorIfPresent(event, trigger.filters?.from_users, appUserId)
-      : matchesActor(event, trigger.filters?.from_users, appUserId);
-  if (!actorMatches) return false;
+  if (issue === null || !matchesLinearWorkAuthority(trigger, event, issue, connectionId, appUserId))
+    return false;
+  if (
+    trigger.on === "linear.delegated_comment" &&
+    !matchesDelegatedComment(event, issue, appUserId)
+  )
+    return false;
   if (event.type === "comment" && !matchesComment(event, trigger.filters, appUserId)) {
     return false;
   }
   if (event.type === "agent_session" && !matchesText(event.parserMessage, trigger.filters)) {
     return false;
   }
+  return true;
+}
+
+type LinearAuthorityEvent = Pick<NormalizedLinearEvent, "type" | "action" | "actor">;
+
+/** The same work authority is checked at admission and after a queued event waits. */
+export function matchesLinearWorkAuthority(
+  trigger: MatchedTriggerDefinition,
+  event: LinearAuthorityEvent,
+  issue: NormalizedLinearIssue,
+  connectionId?: string | null,
+  appUserId?: string | null,
+): boolean {
+  if (!matchesIssueScope(issue, trigger.filters, connectionId)) return false;
+  if (!matchesRequiredDelegate(trigger, event, issue, appUserId)) return false;
+  // Assignment rules may have no actor. Team/label/assignee scope still applies, and an
+  // actor that is present must satisfy from_users, as at the original admission boundary.
+  return trigger.on === "linear.issue_assigned"
+    ? matchesActorIfPresent(event, trigger.filters?.from_users, appUserId)
+    : matchesActor(event, trigger.filters?.from_users, appUserId) ||
+        matchesAutomatedSession(event, trigger.filters);
+}
+
+function matchesRequiredDelegate(
+  trigger: MatchedTriggerDefinition,
+  event: LinearAuthorityEvent,
+  issue: NormalizedLinearIssue,
+  appUserId: string | null | undefined,
+): boolean {
+  if (trigger.on !== "linear.delegated_issue_updated" && trigger.filters?.require_delegate !== true)
+    return true;
+  return appUserId != null && issue.delegateId === appUserId && event.actor?.id !== appUserId;
+}
+
+function matchesDelegatedComment(
+  event: NormalizedLinearEvent,
+  issue: NormalizedLinearIssue,
+  appUserId: string | null | undefined,
+): boolean {
+  if (
+    event.type !== "comment" ||
+    typeof appUserId !== "string" ||
+    event.actor === null ||
+    event.actor.id === appUserId ||
+    issue.delegateId !== appUserId ||
+    (event.comment.parentId !== null && event.threadIsAgentSession !== false)
+  )
+    return false;
   return true;
 }
 
@@ -205,11 +259,27 @@ function enteredConfiguredScope(
 }
 
 function matchesActorIfPresent(
-  event: NormalizedLinearEvent,
+  event: LinearAuthorityEvent,
   allowed: readonly string[] | undefined,
   appUserId?: string | null,
 ): boolean {
   return allowed === undefined || allowed.length === 0 || matchesActor(event, allowed, appUserId);
+}
+
+/** Issue scope is checked first; automation never borrows a human's identity. */
+function matchesAutomatedSession(
+  event: LinearAuthorityEvent,
+  filter: TriggerFilter | undefined,
+): boolean {
+  return (
+    event.type === "agent_session" &&
+    event.action === "created" &&
+    event.actor === null &&
+    filter?.allow_automated_sessions === true &&
+    (filter.from_users?.length ?? 0) > 0 &&
+    filter.team !== undefined &&
+    filter.connectionId !== undefined
+  );
 }
 
 /**
@@ -224,11 +294,14 @@ function matchesActorIfPresent(
  * left to whoever writes the bundle.
  */
 function matchesActor(
-  event: NormalizedLinearEvent,
+  event: LinearAuthorityEvent,
   allowed: readonly string[] | undefined,
   appUserId?: string | null,
 ): boolean {
-  if (allowed === undefined || allowed.length === 0 || event.actor === null) return false;
+  if (allowed === undefined || allowed.length === 0) return false;
+  if (event.actor === null) {
+    return event.type === "agent_session" && event.action === "created" && allowed.includes("*");
+  }
   if (allowed.includes(event.actor.id)) return true;
   if (!allowed.includes("*")) return false;
   return typeof appUserId !== "string" || event.actor.id !== appUserId;

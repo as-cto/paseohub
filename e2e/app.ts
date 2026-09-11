@@ -24,53 +24,101 @@ export const test = base.extend<{
   projectExternal: ProjectExternalFacts;
   billing: boolean;
   providerScenario: BrowserProviderScenario;
+  sourceDaemonMode: "none" | "registration" | "execution-fixture";
+  sourceDaemon: SourcePaseo | undefined;
 }>({
   // Set with `test.use({ billing: true })` to configure the primary app with the fixture Stripe
   // catalog — the money test in billing-subscription.spec.ts needs a billing-configured instance.
   billing: [false, { option: true }],
   providerScenario: ["connected" as BrowserProviderScenario, { option: true }],
-  hub: async (
-    { browser, browserName, page, context, billing, providerScenario },
-    provide,
-    testInfo,
-  ) => {
-    if (browserName !== "chromium") {
-      throw new Error(`unsupported Phase 0 browser: ${browserName}`);
-    }
-    const applications = new BuiltApplications();
-    try {
-      await page.addInitScript(() => {
-        const request = window.fetch;
-        window.fetch = function (input, init) {
-          if (this !== undefined && this !== window) throw new TypeError("Illegal invocation");
-          return request.call(window, input, init);
-        };
-      });
-      const primary = await applications.start({
-        databaseProfile: "fresh",
+  sourceDaemonMode: ["none", { option: true }],
+  sourceDaemon: [
+    async ({ sourceDaemonMode }, provide) => {
+      if (sourceDaemonMode === "none") {
+        await provide(undefined);
+        return;
+      }
+      const applications = new BuiltApplications();
+      try {
+        await provide(
+          await applications.startSourcePaseo(sourceDaemonMode === "execution-fixture"),
+        );
+      } finally {
+        await applications.stop();
+      }
+    },
+    // Source packaging/install belongs to setup, independently of UI assertion deadlines.
+    { timeout: 300_000 },
+  ],
+  // Give isolated database/application setup its own bounded budget. It must not consume
+  // the time reserved for the browser assertions (https://playwright.dev/docs/test-fixtures#fixture-timeout).
+  hub: [
+    async (
+      {
+        browser,
+        browserName,
+        page,
+        context,
         billing,
         providerScenario,
-      });
-      await provide(
-        new PaseoHub(
-          primary,
-          browser,
-          page,
-          context.request,
-          (options) => applications.start(options),
-          () => applications.startSourcePaseo(),
-        ),
-      );
-      if (testInfo.status !== testInfo.expectedStatus) {
-        await testInfo.attach("application.log", {
-          body: primary.logs(),
-          contentType: "text/plain",
-        });
+        sourceDaemon,
+        sourceDaemonMode,
+      },
+      provide,
+      testInfo,
+    ) => {
+      if (browserName !== "chromium") {
+        throw new Error(`unsupported Phase 0 browser: ${browserName}`);
       }
-    } finally {
-      await applications.stop();
-    }
-  },
+      const applications = new BuiltApplications();
+      try {
+        await page.addInitScript(() => {
+          const request = window.fetch;
+          window.fetch = function (input, init) {
+            if (this !== undefined && this !== window) throw new TypeError("Illegal invocation");
+            return request.call(window, input, init);
+          };
+        });
+        const primary = await applications.start({
+          databaseProfile: "fresh",
+          billing,
+          providerScenario,
+        });
+        await provide(
+          new PaseoHub(
+            primary,
+            browser,
+            page,
+            context.request,
+            (options) => applications.start(options),
+            async (deterministicExecution) => {
+              if (sourceDaemon) {
+                if (
+                  (deterministicExecution === true) !==
+                  (sourceDaemonMode === "execution-fixture")
+                ) {
+                  throw new Error(
+                    "Source daemon fixture does not match the requested execution mode",
+                  );
+                }
+                return sourceDaemon;
+              }
+              return applications.startSourcePaseo(deterministicExecution);
+            },
+          ),
+        );
+        if (testInfo.status !== testInfo.expectedStatus) {
+          await testInfo.attach("application.log", {
+            body: primary.logs(),
+            contentType: "text/plain",
+          });
+        }
+      } finally {
+        await applications.stop();
+      }
+    },
+    { timeout: 120_000 },
+  ],
   projectExternal: async ({ hub, request }, provide) => {
     await provide(new ProjectExternalFacts(hub.primaryApplication(), request));
   },
@@ -200,8 +248,50 @@ class BuiltApplications {
     );
   }
 
-  async startSourcePaseo(): Promise<SourcePaseo> {
-    const source = await SourcePaseo.start();
+  async startSourcePaseo(deterministicExecution = false): Promise<SourcePaseo> {
+    const source = await SourcePaseo.start(
+      deterministicExecution
+        ? {
+            config: ({ packagesRoot, paseoHome, daemonHost }) => ({
+              version: 1,
+              daemon: {
+                listen: daemonHost,
+                relay: { enabled: false },
+                mcp: { enabled: false, injectIntoAgents: false },
+                cors: { allowedOrigins: [] },
+              },
+              agents: {
+                providers: {
+                  claude: { enabled: false },
+                  codex: { enabled: false },
+                  copilot: { enabled: false },
+                  opencode: { enabled: false },
+                  pi: { enabled: false },
+                  "hub-e2e": {
+                    extends: "acp",
+                    label: "Hub E2E",
+                    command: [
+                      process.execPath,
+                      join(process.cwd(), "src/e2e/harness/acp-agent.mjs"),
+                    ],
+                    env: {
+                      NODE_OPTIONS: "",
+                      HUB_E2E_ACP_SDK: join(
+                        packagesRoot,
+                        "node_modules/@agentclientprotocol/sdk/dist/acp.js",
+                      ),
+                      HUB_E2E_ACP_RECORD_FILE: join(paseoHome, "metering-agent.jsonl"),
+                      HUB_E2E_COMPLETE_GATE: join(paseoHome, "completion-gate"),
+                      HUB_E2E_COMPLETION_JOBS: join(paseoHome, "completion-jobs"),
+                    },
+                  },
+                },
+              },
+              features: { dictation: { enabled: false }, voiceMode: { enabled: false } },
+            }),
+          }
+        : {},
+    );
     this.sourcePaseos.push(source);
     return source;
   }

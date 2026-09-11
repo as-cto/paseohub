@@ -9,9 +9,13 @@ interface Denial {
   code: string;
 }
 
+type SteerResult = Denial | { type: "send_agent_message_response"; accepted: boolean };
+
 export class HubFaultProxy {
   private readonly server: Server;
   private readonly sockets = new WebSocketServer({ noServer: true });
+  private readonly negotiatedProtocols = new WeakMap<IncomingMessage, string>();
+  private readonly upstreamSockets = new Set<WebSocket>();
   private daemonSocket: WebSocket | undefined;
   private hubSocket: WebSocket | undefined;
   private loseCreateResponse = false;
@@ -19,7 +23,8 @@ export class HubFaultProxy {
   private readonly droppedCreateResponse = new Promise<void>((resolve) => {
     this.createResponseDropped = resolve;
   });
-  private denial: ((value: Denial) => void) | undefined;
+  private rpcObserver: { requestId: string; resolve: (value: SteerResult) => void } | undefined;
+  private ordinaryAgentRpc = false;
   private readonly createsByExecution = new Map<string, number>();
   private readonly agentIdsByExecution = new Map<string, Set<string>>();
   private readonly createdAgentsByExecution = new Map<
@@ -37,6 +42,10 @@ export class HubFaultProxy {
       void this.forwardHttp(request, response);
     });
     this.server.on("upgrade", (request, socket, head) => this.upgrade(request, socket, head));
+    this.sockets.on("headers", (headers, request) => {
+      const protocol = this.negotiatedProtocols.get(request);
+      if (protocol) headers.push(`x-paseo-session-protocol: ${protocol}`);
+    });
   }
 
   static async start(targetOrigin: string, port: number): Promise<HubFaultProxy> {
@@ -63,32 +72,49 @@ export class HubFaultProxy {
     });
   }
 
-  async requestForbiddenSteer(agentId: string): Promise<Denial> {
-    return this.requestDenied({
+  supportsOrdinaryAgentRpc(): boolean {
+    return this.ordinaryAgentRpc;
+  }
+
+  async requestOrdinarySteer(agentId: string): Promise<SteerResult> {
+    return this.requestObserved({
       type: "send_agent_message_request",
       requestId: "hub-e2e-unrelated-steer",
       agentId,
-      text: "outside Hub scope",
+      text: "isolated contract probe",
+      messageId: "hub-e2e-unrelated-arrival",
+      activeTurnBehavior: "steer",
     });
   }
 
   private async requestDenied(message: Record<string, unknown>): Promise<Denial> {
+    const response = await this.requestObserved(message);
+    if (response.type !== "rpc_error") throw new Error("Expected an authorization denial");
+    return response;
+  }
+
+  private async requestObserved(message: Record<string, unknown>): Promise<SteerResult> {
     const socket = this.daemonSocket;
     if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("Daemon is not connected");
-    this.events.push(`denial observer armed request=${String(message["requestId"])}`);
-    const observed = new Promise<Denial>((resolve, reject) => {
-      const timeout = setTimeout(
-        () =>
-          reject(
-            new Error(
-              `Authorization denial was not observed\nFault proxy evidence:\n${this.evidence()}`,
-            ),
+    const requestId = readString(message, "requestId");
+    if (!requestId || this.rpcObserver)
+      throw new Error("Expected one identified RPC probe at a time");
+    this.events.push(`RPC observer armed request=${requestId}`);
+    const observed = new Promise<SteerResult>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.rpcObserver = undefined;
+        reject(
+          new Error(
+            `RPC probe response was not observed\nFault proxy evidence:\n${this.evidence()}`,
           ),
-        10_000,
-      );
-      this.denial = (value) => {
-        clearTimeout(timeout);
-        resolve(value);
+        );
+      }, 10_000);
+      this.rpcObserver = {
+        requestId,
+        resolve: (value) => {
+          clearTimeout(timeout);
+          resolve(value);
+        },
       };
     });
     socket.send(
@@ -142,7 +168,7 @@ export class HubFaultProxy {
 
   async stop(): Promise<void> {
     for (const socket of this.sockets.clients) socket.terminate();
-    this.hubSocket?.terminate();
+    for (const socket of this.upstreamSockets) socket.terminate();
     await new Promise<void>((resolve) => this.sockets.close(() => resolve()));
     this.server.closeIdleConnections();
     this.server.closeAllConnections();
@@ -174,51 +200,68 @@ export class HubFaultProxy {
   }
 
   private upgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
-    this.sockets.handleUpgrade(request, socket, head, (daemonSocket) => {
-      const generation = ++this.connectionGeneration;
-      this.events.push(
-        `${generation}: daemon accepted ${
-          request.url ?? "/"
-        } daemon=${String(request.headers["x-paseo-daemon-id"])}`,
-      );
-      const target = new URL(request.url ?? "/", this.targetOrigin);
-      target.protocol = "ws:";
-      const hubSocket = new WebSocket(target.toString(), {
-        headers: forwardedHeaders(request),
+    const generation = ++this.connectionGeneration;
+    const target = new URL(request.url ?? "/", this.targetOrigin);
+    target.protocol = target.protocol === "https:" ? "wss:" : "ws:";
+    const hubSocket = new WebSocket(target.toString(), {
+      headers: forwardedHeaders(request),
+    });
+    this.upstreamSockets.add(hubSocket);
+    this.hubSocket = hubSocket;
+    let daemonSocket: WebSocket | undefined;
+    socket.on("error", () => hubSocket.terminate());
+    socket.on("close", () => hubSocket.terminate());
+    // Negotiate upstream first: acknowledging the daemon early loses Hub's protocol
+    // response header, leaving the two peers speaking different wire formats.
+    hubSocket.once("upgrade", (response) => {
+      if (response.headers["x-paseo-session-protocol"] === "1") {
+        this.negotiatedProtocols.set(request, "1");
+      }
+    });
+    hubSocket.once("unexpected-response", (_request, response) => {
+      const status = response.statusCode ?? 502;
+      this.events.push(`${generation}: hub rejected upgrade ${status}`);
+      socket.end(`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      response.destroy();
+      hubSocket.terminate();
+    });
+    hubSocket.on("open", () => {
+      this.events.push(`${generation}: hub opened`);
+      this.sockets.handleUpgrade(request, socket, head, (accepted) => {
+        daemonSocket = accepted;
+        this.daemonSocket = accepted;
+        this.events.push(
+          `${generation}: daemon accepted ${request.url ?? "/"} protocol=${this.negotiatedProtocols.get(request) ?? "legacy"}`,
+        );
+        accepted.on("message", (data) => {
+          if (this.observeDaemonMessage(data)) return;
+          if (hubSocket.readyState === WebSocket.OPEN) hubSocket.send(data);
+        });
+        accepted.on("close", (code, reason) => {
+          this.events.push(`${generation}: daemon closed ${code} ${reason.toString()}`);
+          hubSocket.terminate();
+        });
+        accepted.on("error", (error) => {
+          this.events.push(`${generation}: daemon error ${error.message}`);
+          hubSocket.terminate();
+        });
       });
-      this.daemonSocket = daemonSocket;
-      this.hubSocket = hubSocket;
-      const queued: RawData[] = [];
-      daemonSocket.on("message", (data) => {
-        if (this.observeDaemonMessage(data)) return;
-        if (hubSocket.readyState === WebSocket.OPEN) hubSocket.send(data);
-        else queued.push(data);
-      });
-      hubSocket.on("open", () => {
-        this.events.push(`${generation}: hub opened`);
-        for (const data of queued) hubSocket.send(data);
-      });
-      hubSocket.on("message", (data) => {
-        const raw = readText(data);
-        this.observeHubMessage(raw);
-        if (daemonSocket.readyState === WebSocket.OPEN) daemonSocket.send(raw);
-      });
-      daemonSocket.on("close", (code, reason) => {
-        this.events.push(`${generation}: daemon closed ${code} ${reason.toString()}`);
-        hubSocket.terminate();
-      });
-      hubSocket.on("close", (code, reason) => {
-        this.events.push(`${generation}: hub closed ${code} ${reason.toString()}`);
-        daemonSocket.terminate();
-      });
-      daemonSocket.on("error", (error) => {
-        this.events.push(`${generation}: daemon error ${error.message}`);
-        hubSocket.terminate();
-      });
-      hubSocket.on("error", (error) => {
-        this.events.push(`${generation}: hub error ${error.message}`);
-        daemonSocket.terminate();
-      });
+    });
+    hubSocket.on("message", (data) => {
+      const raw = readText(data);
+      this.observeHubMessage(raw);
+      if (daemonSocket?.readyState === WebSocket.OPEN) daemonSocket.send(raw);
+    });
+    hubSocket.on("close", (code, reason) => {
+      this.upstreamSockets.delete(hubSocket);
+      this.events.push(`${generation}: hub closed ${code} ${reason.toString()}`);
+      if (daemonSocket) daemonSocket.terminate();
+      else socket.destroy();
+    });
+    hubSocket.on("error", (error) => {
+      this.events.push(`${generation}: hub error ${error.message}`);
+      if (daemonSocket) daemonSocket.terminate();
+      else socket.destroy();
     });
   }
 
@@ -235,11 +278,15 @@ export class HubFaultProxy {
     const raw = readText(data);
     const message = sessionMessage(parseRecord(raw));
     this.recordDaemonEvidence(message);
-    this.observeDenial(message);
+    this.observeRpcProbe(message);
     return this.observeCreateResponse(message);
   }
 
   private recordDaemonEvidence(message: Record<string, unknown> | undefined): void {
+    const status = message?.["type"] === "status" ? recordAt(message, "payload") : undefined;
+    if (status?.["status"] === "server_info") {
+      this.ordinaryAgentRpc = recordAt(status, "features")?.["hubAgentRpc"] === true;
+    }
     if (
       typeof message?.["type"] === "string" &&
       (message["type"].startsWith("hub.") || message["type"] === "rpc_error")
@@ -258,17 +305,27 @@ export class HubFaultProxy {
     }
   }
 
-  private observeDenial(message: Record<string, unknown> | undefined): void {
-    if (message?.["type"] === "rpc_error") {
-      const payload = recordAt(message, "payload");
-      const requestType = payload && readString(payload, "requestType");
-      const code = payload && readString(payload, "code");
-      this.events.push(`denial observed handler=${String(this.denial !== undefined)}`);
-      if (requestType && code) {
-        this.denial?.({ type: "rpc_error", requestType, code });
-        this.denial = undefined;
-      }
+  private observeRpcProbe(message: Record<string, unknown> | undefined): void {
+    if (!message || !this.rpcObserver) return;
+    const payload = recordAt(message, "payload");
+    if (payload?.["requestId"] !== this.rpcObserver.requestId) return;
+    if (message["type"] === "rpc_error") {
+      const requestType = readString(payload, "requestType");
+      const code = readString(payload, "code");
+      if (!requestType || !code) return;
+      this.rpcObserver.resolve({ type: "rpc_error", requestType, code });
+    } else if (
+      message["type"] === "send_agent_message_response" &&
+      typeof payload["accepted"] === "boolean"
+    ) {
+      this.rpcObserver.resolve({
+        type: "send_agent_message_response",
+        accepted: payload["accepted"],
+      });
+    } else {
+      return;
     }
+    this.rpcObserver = undefined;
   }
 
   private observeCreateResponse(message: Record<string, unknown> | undefined): boolean {

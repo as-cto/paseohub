@@ -30,9 +30,13 @@ export interface OutputExecutionInput {
   toolType: string;
   args: Record<string, unknown>;
   outputContext: unknown;
+  /** Trusted event snapshot captured atomically with the output attempt, never a tool argument. */
+  triggerContext?: unknown;
 }
 
-export type OutputExecutor = (input: OutputExecutionInput) => Promise<void>;
+/** Durable executors may acknowledge their canonical attempt in the same transaction as delivery. */
+export type OutputExecutionResult = void | { deliveryAcknowledged: true };
+export type OutputExecutor = (input: OutputExecutionInput) => Promise<OutputExecutionResult>;
 
 export interface OutputCapability {
   readonly type: string;
@@ -141,12 +145,12 @@ export class OutputExecutorRegistry {
     return capability !== undefined && (capability.available?.(outputContext) ?? true);
   }
 
-  async execute(input: OutputExecutionInput): Promise<void> {
+  async execute(input: OutputExecutionInput): Promise<OutputExecutionResult> {
     const capability = this.capabilities.get(input.toolType);
     if (capability === undefined) {
       throw new Error(`no output executor registered for ${input.toolType}`);
     }
-    await capability.execute(input);
+    return capability.execute(input);
   }
 }
 

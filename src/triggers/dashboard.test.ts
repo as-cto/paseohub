@@ -2,11 +2,111 @@ import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import type { AuthServer } from "../auth/server.js";
 import { createMemoryDatabase } from "../db/memory.js";
-import { enrollTestDaemon, TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
+import {
+  createActiveProjectConfiguration,
+  enrollTestDaemon,
+  TEST_DAEMON_SLUG,
+} from "../test-utils/project-configuration.js";
 import { TriggerDashboard } from "./dashboard.js";
 import { OrganizationTriggerStore } from "./store.js";
 
 describe("trigger dashboard read model", () => {
+  it("shows active project routes with no organization trigger, without exposing other organizations or archived projects", async () => {
+    const database = createMemoryDatabase({
+      memberships: [
+        {
+          userId: "user-1",
+          organizationId: "org-1",
+          organizationName: "Acme",
+          organizationSlug: "acme",
+          membershipId: "membership-1",
+          role: "member",
+        },
+      ],
+    });
+    const config = {
+      environments: [
+        {
+          name: "issue",
+          kind: "daemon",
+          daemon: "project-runner",
+          cwd: "/project",
+          worktree: {
+            mode: "branch-off",
+            base: "main",
+            newBranch: "${{ paseo.work.id }}",
+            reuseWorkspace: true,
+          },
+        },
+      ],
+      triggers: [
+        {
+          name: "comment",
+          on: "linear.delegated_comment",
+          max_runtime: "1h",
+          filters: { connection: "linear", team: "team", from_users: ["human"] },
+          steps: [
+            {
+              id: "work",
+              environment: "issue",
+              max_runtime: "1h",
+              idle_timeout: "5m",
+              agent: { provider: "codex" },
+              prompt: [{ text: "Handle the issue" }],
+            },
+          ],
+        },
+      ],
+    };
+    const active = await createActiveProjectConfiguration(database, config, {
+      organizationId: "org-1",
+      projectSlug: "senspace",
+    });
+    const archived = await createActiveProjectConfiguration(database, config, {
+      organizationId: "org-1",
+      projectSlug: "archived",
+    });
+    await database.archiveProject("org-1", archived.project.id, "user-1");
+    await createActiveProjectConfiguration(database, config, {
+      organizationId: "other-org",
+      projectSlug: "private",
+    });
+    const receipt = await database.persistManualEvent({
+      organizationId: "org-1",
+      projectId: active.project.id,
+      source: "manual.run",
+      deliveryId: "project-event",
+      payload: {},
+      receivedAt: new Date(),
+    });
+    assert.equal(receipt.status, "accepted");
+    if (receipt.status !== "accepted") throw new Error("receipt missing");
+    await database.createAcceptedTriggerRun({
+      organizationId: "org-1",
+      projectId: active.project.id,
+      configurationRevisionId: active.revision.id,
+      providerEventReceiptId: receipt.event.providerEventReceiptId,
+      configuredTriggerName: "comment",
+      prompt: "Comment",
+      inputs: {},
+      triggerContext: {},
+      outputContext: {},
+      deadlineAt: new Date("2099-01-01"),
+      stepIds: ["work"],
+    });
+    const snapshot = await new TriggerDashboard(database, accountAuth()).snapshot(
+      new Request("https://hub.test/o/acme/triggers"),
+      "acme",
+    );
+    assert.deepEqual(snapshot.triggers, []);
+    assert.equal(snapshot.canManage, false);
+    assert.equal(snapshot.projectRoutes.length, 1);
+    assert.equal(snapshot.projectRoutes[0]!.project.slug, "senspace");
+    assert.equal(snapshot.projectRoutes[0]!.revision.id, active.revision.id);
+    assert.equal(snapshot.projectRoutes[0]!.targets[0]!.daemon, "project-runner");
+    assert.equal(snapshot.activity.length, 1);
+  });
+
   it("describes the provider and latest run on the organization trigger list", async () => {
     const database = createMemoryDatabase({
       memberships: [

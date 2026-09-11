@@ -13,6 +13,13 @@ migration finishes before provider events are accepted and is safe to retry afte
 - Multi-step execution behavior through an internal `legacy_multistep` revision when it cannot be
   represented safely as one run
 
+Filter conversion copies all fields admitted by the self-contained trigger schema, including
+Linear `team`, `replies_only`, `thread_with_app`, and `allow_automated_sessions`. Only resolved
+connection/resource IDs are removed; the authored connection is retained at the event level.
+An unsupported filter stops migration instead of disappearing. Dropping an authorization or
+thread filter can either block startup or broaden execution, so migration tests compare the
+compiled filters before and after conversion.
+
 ## Intentional losses
 
 These affect authoring or presentation, not what the active trigger is allowed to do:

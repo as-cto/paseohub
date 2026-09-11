@@ -6,6 +6,7 @@ import { ProjectCommandError } from "../projects/command-error.js";
 import { parseCompiledHubConfig } from "../config/compiler.js";
 import { projectTriggerForm } from "./configuration/editor.js";
 import { OrganizationTriggerStore } from "./store.js";
+import { readProjectRoutes } from "./project-routes.js";
 
 export class TriggerDashboard {
   constructor(
@@ -18,18 +19,27 @@ export class TriggerDashboard {
       organizationSlug,
     });
     const store = new OrganizationTriggerStore(this.database, tenant.organization.id);
-    const [triggers, daemons, connections] = await Promise.all([
+    const [triggers, daemons, connections, projectRoutes] = await Promise.all([
       store.list(),
       this.database.listDaemonsForOrganization(tenant.organization.id),
       this.database.organizationConnectionUsage(tenant.organization.id),
+      readProjectRoutes(this.database, tenant.organization.id),
     ]);
-    const activity = (
+    const organizationActivity = (
       await Promise.all(triggers.map((trigger) => this.activityForTrigger(trigger)))
     )
       .flat()
       .sort((left, right) => right.receivedAt.localeCompare(left.receivedAt))
       .slice(0, 100);
+    const activity = [
+      ...new Map(
+        [...organizationActivity, ...projectRoutes.activity].map((run) => [run.id, run]),
+      ).values(),
+    ]
+      .sort((left, right) => right.receivedAt.localeCompare(left.receivedAt))
+      .slice(0, 100);
     return {
+      projectRoutes: projectRoutes.routes,
       organization: tenant.organization,
       canManage: capabilitiesFor(tenant.membership.role).manageResources,
       triggers: await Promise.all(

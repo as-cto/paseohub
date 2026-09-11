@@ -2,9 +2,34 @@ import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import type { LinearApiClient } from "../../providers/linear/client.js";
 import { compileJsonSchema } from "../../workflows/json-schema.js";
-import { createLinearReplyExecutor, linearReplyOutputTool } from "./reply.js";
+import {
+  createLinearReplyExecutor,
+  linearReplyOutputTool,
+  createLinearProgressExecutor,
+  linearProgressOutputTool,
+  createLinearPlanExecutor,
+  linearPlanOutputTool,
+  linearSessionOutputAvailable,
+  LINEAR_REPLY_OUTPUT_TYPE,
+  LINEAR_PROGRESS_OUTPUT_TYPE,
+  LINEAR_PLAN_OUTPUT_TYPE,
+} from "./reply.js";
 
 describe("Linear reply output", () => {
+  it("rejects a blank final report before publishing", async () => {
+    const client = new RecordingLinearClient();
+    await assert.rejects(
+      createLinearReplyExecutor({ client })({
+        agentExecutionId: "execution",
+        toolType: "linear.reply",
+        args: { content: " \n " },
+        outputContext: sessionContext(),
+      }),
+      /cannot be blank/u,
+    );
+    assert.equal(client.comments.length, 0);
+    assert.equal(client.activities.length, 0);
+  });
   it("posts the workflow outcome onto its triggering issue", async () => {
     const client = new RecordingLinearClient();
     const execute = createLinearReplyExecutor({ client });
@@ -214,8 +239,10 @@ describe("Linear reply output", () => {
     assert.equal(linearReplyOutputTool.name, "reply");
     assert.deepEqual(Object.keys(linearReplyOutputTool.inputSchema.properties ?? {}), [
       "content",
+      "outcome",
       "kind",
       "options",
+      "auth",
     ]);
     assert.deepEqual(linearReplyOutputTool.inputSchema.required, ["content"]);
   });
@@ -260,6 +287,179 @@ describe("Linear reply output", () => {
     );
     assert.deepEqual(client.comments, []);
   });
+
+  it("preserves a readable label separately from the selected value", async () => {
+    const client = new RecordingLinearClient();
+    await createLinearReplyExecutor({ client })({
+      agentExecutionId: "execution-1",
+      toolType: LINEAR_REPLY_OUTPUT_TYPE,
+      args: {
+        content: "Which result?",
+        kind: "question",
+        options: [
+          { label: "Comfort improvement", value: "comfort" },
+          { label: "Duplicate", value: "comfort" },
+          "Other",
+        ],
+      },
+      outputContext: sessionContext(),
+    });
+    assert.deepEqual(client.activities[0]?.signalMetadata, {
+      options: [
+        { label: "Comfort improvement", value: "comfort" },
+        { label: "Other", value: "Other" },
+      ],
+    });
+  });
+
+  it("offers a native account connection with optional target user, without invalid ephemeral flag", async () => {
+    const client = new RecordingLinearClient();
+    const auth = {
+      url: "https://connect.composio.dev/link/project-account",
+      userId: "ceo",
+      providerName: "GitHub",
+    };
+    await createLinearReplyExecutor({ client })({
+      agentExecutionId: "execution-1",
+      toolType: LINEAR_REPLY_OUTPUT_TYPE,
+      args: { content: "Connect the project account.", kind: "auth", auth },
+      outputContext: sessionContext(),
+    });
+    assert.deepEqual(client.activities, [
+      {
+        linearOrganizationId: "linear-org",
+        agentSessionId: "session-1",
+        content: { type: "elicitation", body: "Connect the project account." },
+        signal: "auth",
+        signalMetadata: auth,
+      },
+    ]);
+  });
+
+  it("reports a native error instead of claiming completion", async () => {
+    const client = new RecordingLinearClient();
+    await createLinearReplyExecutor({ client })({
+      agentExecutionId: "execution-1",
+      toolType: LINEAR_REPLY_OUTPUT_TYPE,
+      args: { content: "The provider could not deliver the change.", kind: "error" },
+      outputContext: sessionContext(),
+    });
+    assert.equal(client.activities[0]?.content.type, "error");
+  });
+
+  it("rejects missing, insecure or malformed authentication before delivery", async () => {
+    for (const auth of [
+      undefined,
+      { url: "http://example.com/auth" },
+      { url: "javascript:alert(1)" },
+      { url: "https://user:password@example.com/auth" },
+      { url: "https://" },
+    ]) {
+      const client = new RecordingLinearClient();
+      await assert.rejects(() =>
+        createLinearReplyExecutor({ client })({
+          agentExecutionId: "execution-1",
+          toolType: LINEAR_REPLY_OUTPUT_TYPE,
+          args: { content: "Connect.", kind: "auth", auth },
+          outputContext: sessionContext(),
+        }),
+      );
+      assert.equal(client.activities.length, 0);
+      assert.equal(client.comments.length, 0);
+    }
+  });
+
+  it("keeps progress and plans separate from required final replies", async () => {
+    const client = new RecordingLinearClient();
+    const input = { agentExecutionId: "execution-1", outputContext: sessionContext() };
+    await createLinearProgressExecutor({ client })({
+      ...input,
+      toolType: LINEAR_PROGRESS_OUTPUT_TYPE,
+      args: { content: "Checking the requested improvement." },
+    });
+    const steps = [
+      { content: "Verify behavior", status: "inProgress" },
+      { content: "Apply feedback", status: "pending" },
+    ];
+    await createLinearPlanExecutor({ client })({
+      ...input,
+      toolType: LINEAR_PLAN_OUTPUT_TYPE,
+      args: { steps },
+    });
+    assert.deepEqual(client.activities, [
+      {
+        linearOrganizationId: "linear-org",
+        agentSessionId: "session-1",
+        content: { type: "thought", body: "Checking the requested improvement." },
+        ephemeral: true,
+      },
+    ]);
+    assert.deepEqual(client.plans, [
+      { linearOrganizationId: "linear-org", agentSessionId: "session-1", plan: steps },
+    ]);
+    assert.equal(client.comments.length, 0);
+    assert.notEqual(LINEAR_PROGRESS_OUTPUT_TYPE, LINEAR_REPLY_OUTPUT_TYPE);
+    assert.notEqual(LINEAR_PLAN_OUTPUT_TYPE, LINEAR_REPLY_OUTPUT_TYPE);
+  });
+
+  it("requires a native session for progress and plans", async () => {
+    const client = new RecordingLinearClient();
+    const outputContext = { ...sessionContext(), agentSessionId: null };
+    assert.equal(linearSessionOutputAvailable(outputContext), false);
+    assert.equal(linearSessionOutputAvailable(sessionContext()), true);
+    await assert.rejects(() =>
+      createLinearProgressExecutor({ client })({
+        agentExecutionId: "execution-1",
+        toolType: LINEAR_PROGRESS_OUTPUT_TYPE,
+        args: { content: "Checking" },
+        outputContext,
+      }),
+    );
+    await assert.rejects(() =>
+      createLinearPlanExecutor({ client })({
+        agentExecutionId: "execution-1",
+        toolType: LINEAR_PLAN_OUTPUT_TYPE,
+        args: { steps: [] },
+        outputContext,
+      }),
+    );
+    assert.equal(client.activities.length, 0);
+    assert.equal(client.plans.length, 0);
+  });
+
+  it("exposes only valid native terminal kinds and optional progress/plan shapes", () => {
+    const reply = compileJsonSchema(linearReplyOutputTool.inputSchema).validate;
+    assert.equal(
+      reply({
+        content: "Connect",
+        kind: "auth",
+        auth: { url: "https://connect.example.com/link" },
+      }),
+      true,
+    );
+    assert.equal(reply({ content: "Connect", kind: "auth" }), false);
+    assert.equal(
+      reply({ content: "Connect", kind: "auth", auth: { url: "http://example.com" } }),
+      false,
+    );
+    assert.equal(reply({ content: "Working", kind: "progress" }), false);
+    assert.equal(
+      reply({
+        content: "Choose",
+        kind: "question",
+        options: [{ label: "Comfort", value: "comfort" }],
+      }),
+      true,
+    );
+    assert.equal(
+      compileJsonSchema(linearProgressOutputTool.inputSchema).validate({ content: "Working" }),
+      true,
+    );
+    const plan = compileJsonSchema(linearPlanOutputTool.inputSchema).validate;
+    assert.equal(plan({ steps: [{ content: "Check", status: "completed" }] }), true);
+    assert.equal(plan({ steps: [{ content: "Check", status: "done" }] }), false);
+    assert.equal(plan({ steps: [] }), true);
+  });
 });
 
 function sessionContext() {
@@ -279,6 +479,7 @@ class RecordingLinearClient implements LinearApiClient {
     parentId?: string;
   }> = [];
   activities: Parameters<LinearApiClient["createAgentActivity"]>[0][] = [];
+  plans: Parameters<LinearApiClient["updateAgentSessionPlan"]>[0][] = [];
   externalUrls: Parameters<LinearApiClient["updateAgentSessionExternalUrls"]>[0][] = [];
 
   async readIssue(): Promise<undefined> {
@@ -312,6 +513,14 @@ class RecordingLinearClient implements LinearApiClient {
   ): Promise<void> {
     this.externalUrls.push(input);
   }
+  async updateAgentSessionPlan(
+    input: Parameters<LinearApiClient["updateAgentSessionPlan"]>[0],
+  ): Promise<void> {
+    this.plans.push(input);
+  }
+  async createAgentSessionOnComment(): Promise<{ id: string }> {
+    throw new Error("Reply delivery must not create a session");
+  }
 }
 
 describe("Linear session external URLs", () => {
@@ -322,7 +531,7 @@ describe("Linear session external URLs", () => {
     await execute({
       agentExecutionId: "execution-1",
       toolType: "linear.reply",
-      args: { content: "Fait : https://github.com/pstudi0/P-OS/pull/128 (ne pas fusionner)." },
+      args: { content: "Fait : https://github.com/acme/project/pull/128 (ne pas fusionner)." },
       outputContext: {
         provider: "linear",
         linearOrganizationId: "linear-org",
@@ -336,7 +545,7 @@ describe("Linear session external URLs", () => {
         linearOrganizationId: "linear-org",
         agentSessionId: "session-1",
         externalUrls: [
-          { label: "pstudi0/P-OS#128", url: "https://github.com/pstudi0/P-OS/pull/128" },
+          { label: "acme/project#128", url: "https://github.com/acme/project/pull/128" },
         ],
       },
     ]);

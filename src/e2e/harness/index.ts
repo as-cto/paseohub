@@ -108,6 +108,7 @@ interface ManagedChild {
 
 interface HubE2EOptions {
   realAgent?: boolean;
+  namedProviderConfigurationOnly?: boolean;
 }
 
 export interface SourceCliBundleDeploymentEvidence {
@@ -180,7 +181,11 @@ export class HubE2E {
       status = await this.requireSource().connectWithCredential(
         this.requireProxy().origin,
         MACHINE_KEY,
+        ["hub.execute"],
       );
+      if (status["permissions"] !== "hub.execute") {
+        throw new Error("Source fixture daemon did not grant the requested hub.execute permission");
+      }
     } catch (error) {
       const enrollmentState = await this.requirePool().query<{
         enrollment_tokens: string;
@@ -207,9 +212,12 @@ export class HubE2E {
     }, "daemon to become connected");
   }
 
-  async status(): Promise<{ state: string }> {
+  async status(): Promise<{ state: string; diagnostics: string }> {
     const status = await this.requireSource().status();
-    return { state: requiredString(status, "state") };
+    return {
+      state: requiredString(status, "state"),
+      diagnostics: `Daemon status error: ${JSON.stringify(status["error"] ?? "none")}\n${this.failureArtifacts()}`,
+    };
   }
 
   async deployCurrentProjectBundleWithSourceCli(): Promise<SourceCliBundleDeploymentEvidence> {
@@ -900,8 +908,12 @@ export class HubE2E {
     return this.requireProxy().requestForbiddenOperation();
   }
 
-  requestForbiddenSteer(agentId: string) {
-    return this.requireProxy().requestForbiddenSteer(agentId);
+  requestOrdinarySteer(agentId: string) {
+    return this.requireProxy().requestOrdinarySteer(agentId);
+  }
+
+  daemonSupportsOrdinaryAgentRpc(): boolean {
+    return this.requireProxy().supportsOrdinaryAgentRpc();
   }
 
   async isUnrelatedAgentVisible(agentId: string): Promise<boolean> {
@@ -924,6 +936,10 @@ export class HubE2E {
 
   daemonAttemptedRelayConnection(): boolean {
     return this.source?.attemptedRelayConnection() ?? false;
+  }
+
+  daemonRelayConnectionEvidence(): string[] {
+    return this.requireSource().relayConnectionEvidence();
   }
 
   async disconnect(): Promise<void> {
@@ -1277,7 +1293,9 @@ export class HubE2E {
     return startChild({
       name: "hub",
       command: process.execPath,
-      args: ["--import", "tsx", "src/e2e/harness/hub-child.ts"],
+      // The required Hub build also produces this harness. Avoid re-transpiling its entire
+      // dependency graph inside the readiness deadline; the companion daemon is source-built.
+      args: ["dist/e2e/harness/hub-child.js"],
       cwd: HUB_ROOT,
       root: this.root,
       env: {
@@ -1321,6 +1339,12 @@ export class HubE2E {
         : {
             agents: {
               providers: {
+                // The authored-bundle test validates these providers without dispatching an agent.
+                claude: { enabled: this.options.namedProviderConfigurationOnly === true },
+                codex: { enabled: this.options.namedProviderConfigurationOnly === true },
+                copilot: { enabled: false },
+                opencode: { enabled: false },
+                pi: { enabled: false },
                 "hub-e2e": {
                   extends: "acp",
                   label: "Hub E2E",

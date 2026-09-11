@@ -1,6 +1,10 @@
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
-import { missingRequiredOutputs } from "../execution-capabilities/required-outputs.js";
-import type { AgentExecutionRecord } from "./types.js";
+import {
+  currentTurnOutputEmissions,
+  isCurrentTurnAttempt,
+  missingRequiredOutputs,
+} from "../execution-capabilities/required-outputs.js";
+import type { AgentExecutionRecord, WorkflowAgentCompletionInput } from "./types.js";
 
 /**
  * An execution that already delivered an output and then went quiet has done
@@ -15,24 +19,70 @@ import type { AgentExecutionRecord } from "./types.js";
  */
 export function completesAtIdleDeadline(execution: {
   outputEmissions: AgentExecutionRecord["outputEmissions"];
+  outputDeliveryAttempts?: AgentExecutionRecord["outputDeliveryAttempts"];
   launchIntent: Pick<
     LaunchMachineIntent,
     "outputSchema" | "allowOutputs" | "keepAliveBetweenTurns"
   > | null;
   hubActionAcknowledgements?: Pick<
     AgentExecutionRecord["hubActionAcknowledgements"],
-    "finishExecutionCall"
+    "finishExecutionCall" | "turn"
   >;
 }): boolean {
   if (execution.launchIntent?.outputSchema !== undefined) return false;
-  // A conversation counts its outputs per turn, so its counters are back to zero the moment a
-  // turn ends and prove nothing about the turns before. Its acknowledged `finish_execution` does:
-  // an agent that answered and then heard nothing more has finished, not timed out.
+  // Completion belongs to the current input. A previous answer or a delayed finish event
+  // cannot turn a later unanswered request into a successful conversation.
   if (execution.launchIntent?.keepAliveBetweenTurns === true) {
-    return execution.hubActionAcknowledgements?.finishExecutionCall?.status === "completed";
+    return (
+      missingRequiredOutputs(execution).length === 0 &&
+      Object.values(currentTurnOutputEmissions(execution)).some((count) => count > 0) &&
+      execution.hubActionAcknowledgements?.finishExecutionCall?.status === "completed"
+    );
   }
   return (
     missingRequiredOutputs(execution).length === 0 &&
     Object.values(execution.outputEmissions).some((count) => count > 0)
+  );
+}
+
+/** A completed conversation can yield to queued work before its optional keep-alive expires. */
+export function hasCompletedIdleConversationTurn(execution: AgentExecutionRecord): boolean {
+  const { terminalAt, idleAt, finishExecutionCall, turn, inputDeliveries } =
+    execution.hubActionAcknowledgements;
+  if (
+    execution.status !== "running" ||
+    execution.launchIntent?.keepAliveBetweenTurns !== true ||
+    execution.hubAction !== null ||
+    execution.idleDeadlineAt === null ||
+    !completesAtIdleDeadline(execution) ||
+    terminalAt === null ||
+    idleAt === null ||
+    finishExecutionCall?.status !== "completed"
+  )
+    return false;
+  const startedAt = turn?.startedAt ?? execution.startedAt;
+  if (
+    finishExecutionCall.observedAt < startedAt ||
+    terminalAt < finishExecutionCall.observedAt ||
+    idleAt < finishExecutionCall.observedAt
+  )
+    return false;
+  return (
+    !Object.values(inputDeliveries ?? {}).includes("pending") &&
+    !Object.values(execution.outputDeliveryAttempts).some(
+      (attempt) => isCurrentTurnAttempt(execution, attempt) && attempt.status === "pending",
+    )
+  );
+}
+
+export function matchesIdleTurnCompletionCondition(
+  execution: AgentExecutionRecord,
+  condition: WorkflowAgentCompletionInput["idleTurnCondition"],
+): boolean {
+  return (
+    condition === undefined ||
+    (execution.workflowStepRunId !== null &&
+      (execution.hubActionAcknowledgements.turn?.id ?? null) === condition.turnId &&
+      hasCompletedIdleConversationTurn(execution))
   );
 }

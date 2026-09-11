@@ -10,7 +10,8 @@ export class OrganizationTriggers {
   }
 
   async expectEmpty() {
-    await expect(this.page.getByText("No triggers", { exact: true })).toBeVisible();
+    const table = this.page.getByRole("table", { name: "Organization triggers", exact: true });
+    await expect(table.getByText("No organization triggers", { exact: true })).toBeVisible();
   }
 
   async startNew() {

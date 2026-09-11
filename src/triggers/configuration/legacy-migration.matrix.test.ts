@@ -60,6 +60,9 @@ filters:
   guild: paseo
   workspace: acme
   project: linear-project
+  team: linear-team
+  replies_only: true
+  thread_with_app: true
   states: [started]
   exclude_labels: [wontfix]
   assignees: [maintainer]
@@ -120,6 +123,43 @@ describe("legacy migration compatibility matrix", () => {
     assert.match(trigger.yaml, /select: \$\{\{ paseo\.inputs\.agent \}\}/u);
     assert.match(trigger.yaml, /network_access: false/u);
     assert.doesNotMatch(trigger.yaml, /include:|partials:|steps:|environments:/u);
+  });
+
+  it.each([
+    ["linear.issue_assigned", "  from_users: [operator]\n"],
+    ["linear.issue_entered_scope", ""],
+    [
+      "linear.comment_created",
+      "  from_users: [operator]\n  replies_only: true\n  thread_with_app: true\n",
+    ],
+    ["linear.agent_session", "  from_users: [operator]\n  allow_automated_sessions: true\n"],
+  ])("preserves all launch boundaries when migrating team-scoped %s", (on, authority) => {
+    const files: HubBundleFile[] = [
+      { path: ".paseo/hub.yml", content: exhaustiveHub },
+      {
+        path: ".paseo/workflows/team.yml",
+        content: `
+name: team-work
+on: ${on}
+max_runtime: 1h
+filters:
+  connection: acme-linear
+  team: engineering-team
+${authority}steps:
+  - id: work
+    environment: runner
+    max_runtime: 1h
+    idle_timeout: 5m
+    agent: codex
+    prompt: [{ text: work }]
+`,
+      },
+    ];
+    const before = compileHubBundle(files).configuration.triggers[0]!;
+    const migrated = migrateLegacyBundle({ files });
+    assert.equal(migrated[0]?.format, "single_run");
+    if (migrated[0]?.format !== "single_run") return;
+    assert.deepEqual(migrated[0].compiled.events[0]?.filters, before.filters);
   });
 
   it("explodes the checked-in real project fixture without dropping a workflow", () => {

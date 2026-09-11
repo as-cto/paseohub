@@ -16,6 +16,7 @@ import {
 // answers for it, and so was a message steered into the agent already running for its session;
 // none of them ever was "unrouted".
 const HANDLED_DROP_REASON_CODES: readonly ProviderEventDropReasonCode[] = [
+  "linear_intake_applied",
   "agent_session_stopped",
   "superseded_by_agent_session",
   "steered_into_live_session",

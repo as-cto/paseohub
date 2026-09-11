@@ -19,7 +19,12 @@ import { createMemoryDatabase } from "../db/memory.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { createFetchServer } from "../http/node-server.js";
 import { registerResponseLifecycle, takeResponseLifecycle } from "../http/response-lifecycle.js";
-import { OutputExecutorRegistry, replyOutputTool, type OutputCapability } from "./outputs.js";
+import {
+  OutputExecutorRegistry,
+  replyOutputTool,
+  type OutputCapability,
+  type OutputExecutor,
+} from "./outputs.js";
 import {
   OUTPUT_DELIVERY_FAILED_REASON,
   failedRequiredOutputDeliveries,
@@ -189,6 +194,70 @@ describe("execution capability MCP boundary", () => {
       (await fixture.database.findAgentExecutionById(fixture.executionId))?.outputEmissions,
       { "slack.reply": 3 },
     );
+  });
+
+  it("refuses an output whose input changed before its attempt was reserved", async () => {
+    const fixture = await capabilityFixture();
+    const lock = fixture.database.withAdvisoryLock.bind(fixture.database);
+    let switched = false;
+    fixture.database.withAdvisoryLock = <T>(key: string, operation: () => Promise<T>) =>
+      lock(key, async () => {
+        if (!switched && key === `execution.prompt:${fixture.executionId}`) {
+          switched = true;
+          await fixture.database.beginAgentExecutionTurn(
+            fixture.executionId,
+            new Date(),
+            "new-input",
+            {
+              triggerContext: {},
+              outputContext: { ...slackOutputContext, threadTs: "new-thread" },
+            },
+          );
+        }
+        return operation();
+      });
+    const response = await fixture.call("tools/call", {
+      name: "reply",
+      arguments: { content: "Old answer" },
+    });
+    assert.equal(ToolResultSchema.parse(response.result).isError, true);
+    assert.equal(fixture.outbound.length, 0);
+    assert.equal(
+      Object.keys(
+        (await fixture.database.findAgentExecutionById(fixture.executionId))!
+          .outputDeliveryAttempts,
+      ).length,
+      0,
+    );
+    const current = await fixture.call("tools/call", {
+      name: "reply",
+      arguments: { content: "Latest answer" },
+    });
+    assert.equal(ToolResultSchema.parse(current.result).isError, undefined);
+    assert.deepEqual(fixture.outbound[0]?.outputContext, {
+      ...slackOutputContext,
+      threadTs: "new-thread",
+    });
+  });
+
+  it("does not acknowledge an output twice when its durable executor already recorded it", async () => {
+    let fixture: Awaited<ReturnType<typeof capabilityFixture>>;
+    fixture = await capabilityFixture(async (input) => {
+      assert.ok(input.attemptId);
+      await fixture.database.completeAgentExecutionOutput(
+        input.agentExecutionId,
+        input.attemptId,
+        new Date(),
+      );
+      return { deliveryAcknowledged: true };
+    });
+    const complete = vi.spyOn(fixture.database, "completeAgentExecutionOutput");
+    const response = await fixture.call("tools/call", {
+      name: "reply",
+      arguments: { content: "Delivered" },
+    });
+    assert.equal(ToolResultSchema.parse(response.result).isError, undefined);
+    assert.equal(complete.mock.calls.length, 1);
   });
 
   it("renders the structured execution MCP contract exposed by the server", async () => {
@@ -780,7 +849,7 @@ const slackOutputContext = {
 };
 
 async function capabilityFixture(
-  execute: (() => Promise<void>) | undefined = () => Promise.resolve(),
+  execute: OutputExecutor | undefined = () => Promise.resolve(),
   completionStatus: "succeeded" | "failed" = "succeeded",
   maxReplies: number | null = 1,
   outputSchema?: JsonValue,
@@ -811,7 +880,7 @@ async function capabilityFixture(
     tool: outputTool,
     execute: async (input) => {
       outbound.push(input);
-      await execute();
+      return execute(input);
     },
   });
   for (const capability of additionalCapabilities) outputs.register(capability);

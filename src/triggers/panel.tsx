@@ -28,6 +28,7 @@ import {
   type TriggerFormValue,
 } from "./configuration/editor.js";
 import { saveTrigger, triggerSnapshot, type TriggerSnapshot } from "./functions.js";
+import { ProjectRoutesTable } from "./project-routes-panel.js";
 
 type BrowserTrigger = TriggerSnapshot["triggers"][number];
 type EditorMode = "form" | "yaml";
@@ -57,7 +58,7 @@ export function TriggersPanel() {
     <>
       <PageHeader
         title="Triggers"
-        description="Launch agents on your compute when organization events arrive."
+        description="Published project routes and organization triggers that launch your agents."
       >
         {data.canManage ? (
           <Button asChild>
@@ -72,13 +73,15 @@ export function TriggersPanel() {
           <AlertDescription>{connectionResultCopy(connectionResult)}</AlertDescription>
         </Alert>
       )}
+      <ProjectRoutesTable routes={data.projectRoutes} />
       <DataTable
-        label="Triggers"
+        label="Organization triggers"
         columns={TRIGGER_COLUMNS}
         isEmpty={data.triggers.length === 0}
         empty={{
-          title: "No triggers",
-          description: "Connect a provider and daemon, then create your first trigger.",
+          title: "No organization triggers",
+          description:
+            "Project bundle routes are listed separately above. Use New trigger for an additional organization trigger.",
         }}
       >
         {data.triggers.map((trigger) => (

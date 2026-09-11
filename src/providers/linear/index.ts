@@ -23,10 +23,18 @@ import { logger } from "../../logger.js";
 import { createLinearTriggerProvider } from "../../triggers/linear/provider.js";
 import {
   LINEAR_REPLY_OUTPUT_TYPE,
+  LINEAR_PROGRESS_OUTPUT_TYPE,
+  LINEAR_PLAN_OUTPUT_TYPE,
   createLinearReplyExecutor,
+  createLinearProgressExecutor,
+  createLinearPlanExecutor,
   linearReplyOutputTool,
+  linearProgressOutputTool,
+  linearPlanOutputTool,
+  linearSessionOutputAvailable,
 } from "../../triggers/linear/reply.js";
 import { createLinearWebhookSource } from "../../triggers/linear/webhook.js";
+import { createLinearReplyReporter } from "../../triggers/linear/reporting.js";
 import type { ProviderConnectionRegistration, ProviderRegistration } from "../registration.js";
 import {
   createLinearApiClient,
@@ -111,16 +119,12 @@ export function createLinearRegistration(
   const accept =
     database === null
       ? () => Promise.reject(new DatabaseUnavailableError())
-      : (
-          input: Omit<
-            Parameters<Database["acceptLinearEvent"]>[0],
-            "providerApplicationId" | "providerConfigurationVersion"
-          >,
-        ) =>
+      : (input: Omit<Parameters<Database["acceptLinearEvent"]>[0], "providerApplicationId">) =>
           database.acceptLinearEvent({
             ...input,
             providerApplicationId: configuration.clientId,
-            providerConfigurationVersion: options.configurationVersion ?? 0,
+            providerConfigurationVersion:
+              input.providerConfigurationVersion ?? options.configurationVersion ?? 0,
           });
   const webhook = createLinearWebhookSource({
     signingSecret: configuration.webhookSecret,
@@ -128,6 +132,11 @@ export function createLinearRegistration(
     ...(database === null
       ? {}
       : {
+          inbox: {
+            database,
+            applicationId: configuration.clientId,
+            configurationVersion: options.configurationVersion ?? 0,
+          },
           canHydrateIssue: async (linearOrganizationId) => {
             const connection = await database.findLinearConnection(linearOrganizationId);
             return connection !== undefined && !linearConnectionRequiresReauthorization(connection);
@@ -149,6 +158,10 @@ export function createLinearRegistration(
       requests: [{ name: "linear.events", handle: (request) => webhook.handle(request) }],
     };
   }
+  const reporter =
+    api === undefined
+      ? undefined
+      : createLinearReplyReporter({ database, client: api, applicationId: configuration.clientId });
   const connection =
     options.auth === null
       ? linearConnectionStatus(true)
@@ -176,26 +189,63 @@ export function createLinearRegistration(
       ({ configurationStoreForProject, executions }) =>
         createLinearTriggerProvider({
           configurationStoreForProject,
-          ...(api === undefined ? {} : { client: api }),
+          ...linearTriggerServices(api, options.publicBaseUrl, reporter),
           connectionForLinearOrganization: ({ organizationId, linearOrganizationId }) =>
             database.findLinearConnectionForOrganization(organizationId, linearOrganizationId),
           database,
           ...(executions === undefined ? {} : { executions }),
         }),
     ],
-    sources: [webhook],
-    outputs:
-      api === undefined
-        ? []
-        : [
-            {
-              type: LINEAR_REPLY_OUTPUT_TYPE,
-              tool: linearReplyOutputTool,
-              available: outputContextProvider("linear"),
-              execute: createLinearReplyExecutor({ client: api }),
-            },
-          ],
+    sources: reporter === undefined ? [webhook] : [webhook, reporter.source],
+    outputs: linearOutputs(api, database, reporter),
     requests: [{ name: "linear.events", handle: (request) => webhook.handle(request) }],
+  };
+}
+
+function linearOutputs(
+  api: LinearApiClient | undefined,
+  database: Database,
+  reporter: ReturnType<typeof createLinearReplyReporter> | undefined,
+): ProviderRegistration["outputs"] {
+  return api === undefined
+    ? []
+    : [
+        {
+          type: LINEAR_REPLY_OUTPUT_TYPE,
+          tool: linearReplyOutputTool,
+          available: outputContextProvider("linear"),
+          execute: createLinearReplyExecutor({
+            client: api,
+            database,
+            ...(reporter === undefined ? {} : { reporter }),
+          }),
+        },
+        {
+          type: LINEAR_PROGRESS_OUTPUT_TYPE,
+          tool: linearProgressOutputTool,
+          available: linearSessionOutputAvailable,
+          execute: createLinearProgressExecutor({ client: api }),
+        },
+        {
+          type: LINEAR_PLAN_OUTPUT_TYPE,
+          tool: linearPlanOutputTool,
+          available: linearSessionOutputAvailable,
+          execute: createLinearPlanExecutor({ client: api }),
+        },
+      ];
+}
+
+function linearTriggerServices(
+  api: LinearApiClient | undefined,
+  publicBaseUrl: string | undefined,
+  reporter: ReturnType<typeof createLinearReplyReporter> | undefined,
+) {
+  return {
+    ...(publicBaseUrl === undefined ? {} : { publicBaseUrl }),
+    ...(reporter === undefined
+      ? {}
+      : { reportMissingTerminalOutcome: reporter.reportMissingTerminalOutcome }),
+    ...(api === undefined ? {} : { client: api }),
   };
 }
 

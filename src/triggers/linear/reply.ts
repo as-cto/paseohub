@@ -1,7 +1,15 @@
 import { z } from "zod";
-import type { OutputExecutor, OutputToolDefinition } from "../../execution-capabilities/outputs.js";
+import type {
+  OutputExecutor,
+  OutputToolDefinition,
+  OutputExecutionInput,
+} from "../../execution-capabilities/outputs.js";
 import type { LinearApiClient } from "../../providers/linear/client.js";
 import { reportFailure } from "../../failures/index.js";
+import type { Database } from "../../db/types.js";
+import { createLinearReplyReporter, type LinearReplyReporter } from "./reporting.js";
+import type { LinearReplyPayload, LinearFinalOutcome } from "../../db/linear-replies.js";
+import { LinearIssueFinalizationContextSchema } from "./finalization.js";
 
 /**
  * Output type of the Linear reply tool. Shared by the provider registration
@@ -9,11 +17,82 @@ import { reportFailure } from "../../failures/index.js";
  * emission count to decide whether a session still needs an explicit close).
  */
 export const LINEAR_REPLY_OUTPUT_TYPE = "linear.reply";
+// These nonterminal outputs must never satisfy a required `linear.reply`.
+export const LINEAR_PROGRESS_OUTPUT_TYPE = "linear.progress";
+export const LINEAR_PLAN_OUTPUT_TYPE = "linear.plan";
 
-const LinearReplyArgsSchema = z.object({
-  content: z.string().min(1),
-  kind: z.enum(["response", "question"]).default("response"),
-  options: z.array(z.string().min(1)).optional(),
+const LinearChoiceSchema = z.union([
+  z.string().min(1),
+  z.object({ label: z.string().min(1), value: z.string().min(1) }),
+]);
+const LinearAuthSchema = z.object({
+  url: z
+    .string()
+    .url()
+    .refine((value) => {
+      const url = new URL(value);
+      return url.protocol === "https:" && url.username === "" && url.password === "";
+    }, "Authentication requires an HTTPS URL without embedded credentials"),
+  userId: z.string().min(1).optional(),
+  providerName: z.string().min(1).optional(),
+});
+
+const LinearReplyArgsSchema = z
+  .object({
+    content: z
+      .string()
+      .min(1)
+      .refine((content) => content.trim().length > 0, "A final reply cannot be blank"),
+    kind: z.enum(["response", "question", "auth", "error"]).default("response"),
+    options: z.array(LinearChoiceSchema).min(1).optional(),
+    auth: LinearAuthSchema.optional(),
+    outcome: z
+      .object({
+        kind: z.enum([
+          "ready_for_review",
+          "completed",
+          "needs_input",
+          "blocked",
+          "interrupted",
+          "no_action",
+        ]),
+        validation: z.string().trim().min(1),
+        nextAction: z.string().trim().min(1),
+        assigneeId: z.string().min(1).optional(),
+      })
+      .optional(),
+  })
+  .superRefine((args, ctx) => {
+    if (args.kind === "auth" && args.auth === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["auth"],
+        message: "An auth reply requires a Connect Link",
+      });
+    }
+    if (args.kind !== "auth" && args.auth !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["auth"],
+        message: "Authentication metadata requires kind auth",
+      });
+    }
+    if (args.kind === "auth" && args.options !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["options"],
+        message: "An auth reply cannot also offer choices",
+      });
+    }
+  });
+const LinearProgressArgsSchema = z.object({ content: z.string().min(1) });
+const LinearPlanArgsSchema = z.object({
+  steps: z.array(
+    z.object({
+      content: z.string().min(1),
+      status: z.enum(["pending", "inProgress", "completed", "canceled"]),
+    }),
+  ),
 });
 const LinearReplyOutputContextSchema = z.object({
   provider: z.literal("linear"),
@@ -22,6 +101,8 @@ const LinearReplyOutputContextSchema = z.object({
   agentSessionId: z.string().min(1).nullable(),
   // Optional: executions recorded before threading existed carry no root comment.
   threadRootCommentId: z.string().min(1).nullable().optional(),
+  publishIssueComment: z.boolean().optional(),
+  finalizeIssue: LinearIssueFinalizationContextSchema.optional(),
 });
 
 /**
@@ -38,79 +119,187 @@ export const linearReplyOutputTool: OutputToolDefinition = {
   description:
     "Sends a reply to the conversation that triggered this execution. " +
     'Use kind "question" when you need an answer before continuing: post the question, then call ' +
-    "finish_execution. The user's answer arrives as a NEW execution; do not wait for it here. " +
-    "Provide options to offer fixed choices (the user may still answer freely).",
+    "finish_execution. The user's answer arrives as a later input; do not wait for it here. " +
+    "Provide options to offer fixed choices (the user may still answer freely). " +
+    'Use kind "auth" with auth.url from the connection provider when account linking is needed, ' +
+    'or kind "error" to report a failure. Use the separate progress tool for work in progress; ' +
+    "a response completes the session. Include outcome to record the result, validation and next action. " +
+    "Issue status and assignee updates require an explicitly configured finalization policy.",
   inputSchema: {
     type: "object",
     properties: {
       content: { type: "string", minLength: 1 },
-      kind: { type: "string", enum: ["response", "question"] },
+      outcome: {
+        type: "object",
+        properties: {
+          kind: {
+            type: "string",
+            enum: [
+              "ready_for_review",
+              "completed",
+              "needs_input",
+              "blocked",
+              "interrupted",
+              "no_action",
+            ],
+          },
+          validation: { type: "string", minLength: 1 },
+          nextAction: { type: "string", minLength: 1 },
+          assigneeId: { type: "string", minLength: 1 },
+        },
+        required: ["kind", "validation", "nextAction"],
+        additionalProperties: false,
+      },
+      kind: { type: "string", enum: ["response", "question", "auth", "error"] },
       options: {
         type: "array",
-        items: { type: "string", minLength: 1 },
+        items: {
+          anyOf: [
+            { type: "string", minLength: 1 },
+            {
+              type: "object",
+              properties: {
+                label: { type: "string", minLength: 1 },
+                value: { type: "string", minLength: 1 },
+              },
+              required: ["label", "value"],
+              additionalProperties: false,
+            },
+          ],
+        },
         minItems: 1,
       },
+      auth: {
+        type: "object",
+        properties: {
+          url: { type: "string", pattern: "^https://", minLength: 9 },
+          userId: { type: "string", minLength: 1 },
+          providerName: { type: "string", minLength: 1 },
+        },
+        required: ["url"],
+        additionalProperties: false,
+      },
     },
+    required: ["content"],
+    additionalProperties: false,
+    anyOf: [
+      {
+        properties: { kind: { const: "auth" }, auth: {} },
+        required: ["kind", "auth"],
+        not: { properties: { options: {} }, required: ["options"] },
+      },
+      {
+        properties: { kind: { enum: ["response", "question", "error"] } },
+        not: { properties: { auth: {} }, required: ["auth"] },
+      },
+    ],
+  },
+};
+
+export const linearProgressOutputTool: OutputToolDefinition = {
+  name: "progress",
+  description:
+    "Posts a brief progress update to the native Linear session without completing it. " +
+    "This does not satisfy the required final reply. Do not send progress while waiting for a user answer or authentication.",
+  inputSchema: {
+    type: "object",
+    properties: { content: { type: "string", minLength: 1 } },
     required: ["content"],
     additionalProperties: false,
   },
 };
 
+export const linearPlanOutputTool: OutputToolDefinition = {
+  name: "plan",
+  description:
+    "Replaces the native Linear session checklist with the complete list of steps. " +
+    "Update step statuses as work advances. This does not complete the session or satisfy the required reply.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      steps: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            content: { type: "string", minLength: 1 },
+            status: { type: "string", enum: ["pending", "inProgress", "completed", "canceled"] },
+          },
+          required: ["content", "status"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["steps"],
+    additionalProperties: false,
+  },
+};
+
+export function linearSessionOutputAvailable(outputContext: unknown): boolean {
+  const parsed = LinearReplyOutputContextSchema.safeParse(outputContext);
+  return parsed.success && parsed.data.agentSessionId !== null;
+}
+
+export function createLinearProgressExecutor(options: { client: LinearApiClient }): OutputExecutor {
+  return async (input) => {
+    const args = LinearProgressArgsSchema.parse(input.args);
+    const context = LinearReplyOutputContextSchema.parse(input.outputContext);
+    if (context.agentSessionId === null)
+      throw new Error("Linear progress requires a native session");
+    await options.client.createAgentActivity({
+      linearOrganizationId: context.linearOrganizationId,
+      agentSessionId: context.agentSessionId,
+      content: { type: "thought", body: args.content },
+      ephemeral: true,
+    });
+  };
+}
+
+export function createLinearPlanExecutor(options: { client: LinearApiClient }): OutputExecutor {
+  return async (input) => {
+    const args = LinearPlanArgsSchema.parse(input.args);
+    const context = LinearReplyOutputContextSchema.parse(input.outputContext);
+    if (context.agentSessionId === null) throw new Error("Linear plans require a native session");
+    await options.client.updateAgentSessionPlan({
+      linearOrganizationId: context.linearOrganizationId,
+      agentSessionId: context.agentSessionId,
+      plan: args.steps,
+    });
+  };
+}
+
 /**
  * Replies through the native agent session when present, otherwise through an issue comment,
  * threaded under the triggering comment's root when the context carries one.
  */
-export function createLinearReplyExecutor(options: { client: LinearApiClient }): OutputExecutor {
+export function createLinearReplyExecutor(options: {
+  client: LinearApiClient;
+  database?: Database;
+  reporter?: LinearReplyReporter;
+}): OutputExecutor {
+  const reporter =
+    options.reporter ??
+    (options.database === undefined
+      ? undefined
+      : createLinearReplyReporter({ client: options.client, database: options.database }));
   return async function executeLinearReply(input) {
-    const args = LinearReplyArgsSchema.parse(input.args);
+    const args = replyWithOutcome(LinearReplyArgsSchema.parse(input.args));
     const context = LinearReplyOutputContextSchema.parse(input.outputContext);
+    if (context.publishIssueComment === true) {
+      if (reporter === undefined)
+        throw new Error("Publishing a durable issue report requires the Linear reply journal");
+      const result = await publishDurableReply(reporter, input, context, args);
+      await attachReplyLinks(options.client, context, args.content, result.connectionId);
+      return { deliveryAcknowledged: true };
+    }
     if (context.agentSessionId !== null) {
-      const choices = questionChoices(args);
-      const sessionId = context.agentSessionId;
       await options.client.createAgentActivity({
         linearOrganizationId: context.linearOrganizationId,
         agentSessionId: context.agentSessionId,
-        content: {
-          type: args.kind === "question" ? "elicitation" : "response",
-          body: args.content,
-        },
-        ...(choices.length === 0
-          ? {}
-          : {
-              signal: "select",
-              signalMetadata: {
-                options: choices.map((choice) => ({
-                  label: choice,
-                  value: choice,
-                })),
-              },
-            }),
+        ...nativeReplyActivity(args, args.content),
       });
-      // Linear renders a pull request attached to the session, uses it for its PR features, and
-      // treats the link as proof the session is alive. The URL is in the reply either way; this
-      // makes it a field rather than a sentence. A failure here is not the agent's problem: the
-      // answer was delivered, so it is reported and swallowed.
-      const links = pullRequestLinks(args.content);
-      if (links.length > 0) {
-        try {
-          await options.client.updateAgentSessionExternalUrls({
-            linearOrganizationId: context.linearOrganizationId,
-            agentSessionId: sessionId,
-            externalUrls: links,
-          });
-        } catch (error: unknown) {
-          reportFailure(
-            error,
-            {
-              operation: "linear.session.external-urls",
-              component: "triggers",
-              provider: "linear",
-            },
-            { diagnostic: { agentSessionId: sessionId } },
-          );
-        }
-      }
-      return;
+      await attachReplyLinks(options.client, context, args.content);
+      return undefined;
     }
     await options.client.createComment({
       linearOrganizationId: context.linearOrganizationId,
@@ -120,7 +309,97 @@ export function createLinearReplyExecutor(options: { client: LinearApiClient }):
         ? { parentId: context.threadRootCommentId }
         : {}),
     });
+    return undefined;
   };
+}
+
+function replyWithOutcome(
+  args: z.infer<typeof LinearReplyArgsSchema>,
+): z.infer<typeof LinearReplyArgsSchema> {
+  if (args.outcome === undefined) return args;
+  return {
+    ...args,
+    content: `${args.content}\n\nValidation: ${args.outcome.validation}\n\nNext action: ${args.outcome.nextAction}`,
+  };
+}
+
+function nativeReplyActivity(
+  args: z.infer<typeof LinearReplyArgsSchema>,
+  body: string,
+): LinearReplyPayload["activity"] {
+  const activity: LinearReplyPayload["activity"] = {
+    content: {
+      type: args.kind === "question" || args.kind === "auth" ? "elicitation" : args.kind,
+      body,
+    },
+  };
+  if (args.auth !== undefined) {
+    activity.signal = "auth";
+    activity.signalMetadata = {
+      url: args.auth.url,
+      ...(args.auth.userId === undefined ? {} : { userId: args.auth.userId }),
+      ...(args.auth.providerName === undefined ? {} : { providerName: args.auth.providerName }),
+    };
+  } else {
+    const choices = questionChoices(args);
+    if (choices.length > 0) {
+      activity.signal = "select";
+      activity.signalMetadata = { options: choices };
+    }
+  }
+  return activity;
+}
+
+function publishDurableReply(
+  reporter: LinearReplyReporter,
+  input: OutputExecutionInput,
+  context: z.infer<typeof LinearReplyOutputContextSchema>,
+  args: z.infer<typeof LinearReplyArgsSchema>,
+) {
+  let outcome: LinearFinalOutcome | undefined;
+  if (args.outcome !== undefined)
+    outcome = {
+      kind: args.outcome.kind,
+      validation: args.outcome.validation,
+      nextAction: args.outcome.nextAction,
+      ...(args.outcome.assigneeId === undefined ? {} : { assigneeId: args.outcome.assigneeId }),
+    };
+  const body = commentBody(args);
+  return reporter.publish({
+    executionId: input.agentExecutionId,
+    ...(input.triggerContext === undefined ? {} : { triggerContext: input.triggerContext }),
+    ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+    context,
+    body,
+    activity: nativeReplyActivity(args, body),
+    ...(outcome === undefined ? {} : { outcome }),
+  });
+}
+
+/** Session link enrichment is best effort; the complete URL remains in both final bodies. */
+async function attachReplyLinks(
+  client: LinearApiClient,
+  context: z.infer<typeof LinearReplyOutputContextSchema>,
+  content: string,
+  expectedConnectionId?: string,
+): Promise<void> {
+  if (context.agentSessionId === null) return;
+  const links = pullRequestLinks(content);
+  if (links.length === 0) return;
+  try {
+    await client.updateAgentSessionExternalUrls({
+      linearOrganizationId: context.linearOrganizationId,
+      agentSessionId: context.agentSessionId,
+      externalUrls: links,
+      ...(expectedConnectionId === undefined ? {} : { expectedConnectionId }),
+    });
+  } catch (error: unknown) {
+    reportFailure(
+      error,
+      { operation: "linear.session.external-urls", component: "triggers", provider: "linear" },
+      { diagnostic: { agentSessionId: context.agentSessionId } },
+    );
+  }
 }
 
 /**
@@ -144,13 +423,24 @@ function pullRequestLinks(content: string): Array<{ label: string; url: string }
 
 /** Issue comments have no elicitation: a question with choices lists them in Markdown instead. */
 function commentBody(args: z.infer<typeof LinearReplyArgsSchema>): string {
+  if (args.auth !== undefined) {
+    return `${args.content}\n\n[Connect account](<${args.auth.url}>)`;
+  }
   const choices = questionChoices(args);
   return choices.length === 0
     ? args.content
-    : `${args.content}\n\n${choices.map((choice) => `- ${choice}`).join("\n")}`;
+    : `${args.content}\n\n${choices.map((choice) => `- ${choice.label}`).join("\n")}`;
 }
 
 /** Only a question carries choices; a duplicated choice would render twice in Linear's select. */
-function questionChoices(args: z.infer<typeof LinearReplyArgsSchema>): string[] {
-  return args.kind === "question" ? [...new Set(args.options ?? [])] : [];
+function questionChoices(
+  args: z.infer<typeof LinearReplyArgsSchema>,
+): Array<{ label: string; value: string }> {
+  if (args.kind !== "question") return [];
+  const choices = new Map<string, { label: string; value: string }>();
+  for (const option of args.options ?? []) {
+    const choice = typeof option === "string" ? { label: option, value: option } : option;
+    if (!choices.has(choice.value)) choices.set(choice.value, choice);
+  }
+  return [...choices.values()];
 }

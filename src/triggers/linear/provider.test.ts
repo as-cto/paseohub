@@ -393,6 +393,13 @@ describe("Linear trigger provider", () => {
       issueId: "issue-1",
       agentSessionId: "session-1",
       threadRootCommentId: null,
+      turnKey: JSON.stringify([
+        "linear-connection",
+        "linear-org",
+        "session-1",
+        "session",
+        "session-1",
+      ]),
     });
     assert.deepEqual(client.activityReads, []);
 
@@ -485,6 +492,62 @@ describe("Linear trigger provider", () => {
         },
       },
     ]);
+  });
+
+  it("acknowledges and closes an automated actorless session without issue labels", async () => {
+    const configuration = agentSessionConfiguration();
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      createMemoryDatabase(),
+      {
+        ...configuration,
+        triggers: [
+          {
+            ...configuration.triggers[0]!,
+            filters: { team: "team-1", from_users: ["*"] },
+          },
+        ],
+      },
+      { organizationId: "hub-org" },
+    );
+    const client = new RecordingHistoryClient({ complete: true, comments: [] });
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      client,
+    });
+    const base = agentSessionEvent({ action: "created", actor: null });
+    const matches = await provider.match(
+      externalAgentSession(project.id, revision.id, {
+        ...base,
+        issue: { ...base.issue!, projectId: null, assigneeId: "operator", labelIds: [] },
+      }),
+    );
+    assert.equal(matches.length, 1);
+    const match = matches[0];
+    if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+    assert.equal(match.outputContext.agentSessionId, "session-1");
+    const accepted = await provider.onDispatchAccepted?.(match.triggerContext, match.outputContext);
+    const completed = await provider.onAgentExecutionCompleted?.(
+      match.triggerContext,
+      match.outputContext,
+      { status: "succeeded", outputEmissions: {} },
+      accepted ?? undefined,
+    );
+    await provider.onAgentExecutionCompleted?.(
+      match.triggerContext,
+      match.outputContext,
+      { status: "succeeded", outputEmissions: {} },
+      completed ?? undefined,
+    );
+    assert.deepEqual(
+      client.createdActivities.map((activity) => ({
+        session: activity.agentSessionId,
+        type: activity.content.type,
+      })),
+      [
+        { session: "session-1", type: "thought" },
+        { session: "session-1", type: "response" },
+      ],
+    );
   });
 
   it("closes an agent session explicitly when the workflow ends without a reply", async () => {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
 import { z } from "zod";
 import type { OrganizationAccessValue } from "../../auth/organization-access.js";
 import type { AuthServer } from "../../auth/server.js";
@@ -43,11 +43,11 @@ describe("Linear registration", () => {
     });
 
     assert.equal(registration.connection.name, "linear");
-    assert.equal(registration.sources.length, 1);
+    assert.equal(registration.sources.length, 2); // Webhook intake and durable report recovery.
     assert.equal(registration.triggerProviders.length, 1);
     assert.deepEqual(
       registration.outputs.map((output) => output.type),
-      ["linear.reply"],
+      ["linear.reply", "linear.progress", "linear.plan"],
     );
     assert.deepEqual(
       registration.requests.map((request) => request.name),
@@ -320,6 +320,10 @@ describe("Linear registration", () => {
       createComment: async () => {},
       createAgentActivity: async () => {},
       updateAgentSessionExternalUrls: async () => undefined,
+      updateAgentSessionPlan: async () => undefined,
+      createAgentSessionOnComment: async () => {
+        throw new Error("under-scoped token must not create sessions");
+      },
     };
     const registration = createLinearRegistration({
       database,
@@ -330,12 +334,16 @@ describe("Linear registration", () => {
       apiClient,
     });
 
-    const response = await registration.requests[0]!.handle(linearCommentRequest());
-
-    assert.equal(response.status, 200);
-    assert.equal(issueReads, 0);
-    assert.equal(accepts, 1);
-    assert.equal(acceptedProjectId, undefined);
+    await registration.sources[0]!.start(async () => undefined);
+    try {
+      const response = await registration.requests[0]!.handle(linearCommentRequest());
+      assert.equal(response.status, 200);
+      await vi.waitFor(() => assert.equal(accepts, 1));
+      assert.equal(issueReads, 0);
+      assert.equal(acceptedProjectId, undefined);
+    } finally {
+      await registration.sources[0]!.stop();
+    }
   });
 });
 

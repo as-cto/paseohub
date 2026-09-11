@@ -4,13 +4,18 @@ import { HubE2E } from "./harness/index.js";
 import { currentProjectConfigurationFiles } from "../test-utils/current-project-configuration.js";
 
 const describeHubE2E = process.env["RUN_HUB_E2E"] === "1" ? describe : describe.skip;
+const AUTHORED_BUNDLE_TEST =
+  "validates and installs the exact authored bundle through the source-built CLI";
 
 describeHubE2E("Paseo Hub cross-repository contract", () => {
   let hub: HubE2E;
 
-  beforeEach(async () => {
-    hub = await HubE2E.start();
-  }, 120_000);
+  beforeEach(async ({ task }) => {
+    hub = await HubE2E.start({
+      namedProviderConfigurationOnly: task.name === AUTHORED_BUNDLE_TEST,
+    });
+    // Packing and installing source-built packages is setup, not the workflow deadline.
+  }, 300_000);
 
   afterEach(async () => {
     const shutdown = await hub?.stop();
@@ -22,7 +27,8 @@ describeHubE2E("Paseo Hub cross-repository contract", () => {
     const enrollment = await hub.connect();
     await hub.daemonIsConnected();
 
-    assert.equal((await hub.status()).state, "connected");
+    const status = await hub.status();
+    assert.equal(status.state, "connected", status.diagnostics);
     assert.match(
       enrollment.daemonId,
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
@@ -30,61 +36,65 @@ describeHubE2E("Paseo Hub cross-repository contract", () => {
     await hub.disconnect();
   }, 120_000);
 
-  it("validates and installs the exact authored bundle through the source-built CLI", async () => {
-    await hub.connect();
-    await hub.daemonIsConnected();
+  it(
+    AUTHORED_BUNDLE_TEST,
+    async () => {
+      await hub.connect();
+      await hub.daemonIsConnected();
 
-    const evidence = await hub.deployCurrentProjectBundleWithSourceCli();
-    const expectedFiles = (await currentProjectConfigurationFiles()).toSorted((left, right) =>
-      left.path.localeCompare(right.path),
-    );
-    const configuration = evidence.effectiveConfiguration;
+      const evidence = await hub.deployCurrentProjectBundleWithSourceCli();
+      const expectedFiles = (await currentProjectConfigurationFiles()).toSorted((left, right) =>
+        left.path.localeCompare(right.path),
+      );
+      const configuration = evidence.effectiveConfiguration;
 
-    assert.deepEqual(evidence.dryRun, {
-      projectSlug: "default",
-      valid: true,
-      workflows: 4,
-      origin: evidence.origin,
-    });
-    assert.equal(evidence.revisionsAfterDryRun, evidence.revisionsBeforeDryRun);
-    assert.equal(evidence.revisionsAfterInstall, evidence.revisionsBeforeDryRun + 1);
-    assert.deepEqual(evidence.install, {
-      projectSlug: "default",
-      versionId: evidence.install["versionId"],
-      version: evidence.revisionsAfterInstall,
-      active: true,
-      workflows: 4,
-      origin: evidence.origin,
-    });
-    assert.deepEqual(evidence.authoredFiles, expectedFiles);
-    assert.deepEqual(configuration.environments, [
-      {
-        name: "hub",
-        cwd: "/workspace/hub",
-        daemonId: configuration.environments[0]?.daemonId,
-      },
-      {
-        name: "paseo",
-        cwd: "/workspace/paseo",
-        daemonId: configuration.environments[1]?.daemonId,
-      },
-    ]);
-    assert.equal(configuration.slackWorkerEnvironment, "${{ values.selected_environment }}");
-    assert.equal(configuration.slackAgentSelector, "${{ values.selected_agent }}");
-    assert.deepEqual(configuration.codexOptions, {
-      sandbox_workspace_write: {
-        writable_roots: ["/var/cache/npm"],
-        network_access: false,
-      },
-    });
-    assert.deepEqual(configuration.classifierPartial, {
-      kind: "partial",
-      path: ".paseo/workflows/partials/classify.md",
-      content:
-        "Choose one configured repository environment and one complete named agent configuration.\n",
-      contentHash: "dcfb1a4600e287c40ff4da4c38c98ac86a7f5508458b560dde9151aec03f6bf6",
-    });
-  }, 180_000);
+      assert.deepEqual(evidence.dryRun, {
+        projectSlug: "default",
+        valid: true,
+        workflows: 4,
+        origin: evidence.origin,
+      });
+      assert.equal(evidence.revisionsAfterDryRun, evidence.revisionsBeforeDryRun);
+      assert.equal(evidence.revisionsAfterInstall, evidence.revisionsBeforeDryRun + 1);
+      assert.deepEqual(evidence.install, {
+        projectSlug: "default",
+        versionId: evidence.install["versionId"],
+        version: evidence.revisionsAfterInstall,
+        active: true,
+        workflows: 4,
+        origin: evidence.origin,
+      });
+      assert.deepEqual(evidence.authoredFiles, expectedFiles);
+      assert.deepEqual(configuration.environments, [
+        {
+          name: "hub",
+          cwd: "/workspace/hub",
+          daemonId: configuration.environments[0]?.daemonId,
+        },
+        {
+          name: "paseo",
+          cwd: "/workspace/paseo",
+          daemonId: configuration.environments[1]?.daemonId,
+        },
+      ]);
+      assert.equal(configuration.slackWorkerEnvironment, "${{ values.selected_environment }}");
+      assert.equal(configuration.slackAgentSelector, "${{ values.selected_agent }}");
+      assert.deepEqual(configuration.codexOptions, {
+        sandbox_workspace_write: {
+          writable_roots: ["/var/cache/npm"],
+          network_access: false,
+        },
+      });
+      assert.deepEqual(configuration.classifierPartial, {
+        kind: "partial",
+        path: ".paseo/workflows/partials/classify.md",
+        content:
+          "Choose one configured repository environment and one complete named agent configuration.\n",
+        contentHash: "dcfb1a4600e287c40ff4da4c38c98ac86a7f5508458b560dde9151aec03f6bf6",
+      });
+    },
+    180_000,
+  );
 
   it("connects a real daemon and completes an isolated manual run without relay authority", async () => {
     const enrollment = await hub.connect();
@@ -98,9 +108,9 @@ describeHubE2E("Paseo Hub cross-repository contract", () => {
     const capabilityRun = await hub.runCapabilityTrigger("capability-delivery");
     const capability = await hub.completedCapabilityRun(capabilityRun.executionId);
     const denial = await hub.requestForbiddenOperation();
-    const steerDenial = await hub.requestForbiddenSteer(unrelatedAgent);
+    const steer = await hub.requestOrdinarySteer(unrelatedAgent);
 
-    assert.equal(connected.state, "connected");
+    assert.equal(connected.state, "connected", connected.diagnostics);
     assert.deepEqual(completed, {
       prompt: "Deploy requested for phase-five-operator",
       output: "phase-five:requested",
@@ -127,16 +137,27 @@ describeHubE2E("Paseo Hub cross-repository contract", () => {
       requestType: "daemon.get_status.request",
       code: "access_denied",
     });
-    assert.deepEqual(steerDenial, {
-      type: "rpc_error",
-      requestType: "send_agent_message_request",
-      code: "access_denied",
-    });
+    // 0.8's advertised ordinary-agent API gives hub.execute daemon-wide agent authority.
+    // Older companions keep the private, owned-execution contract. Test the advertised boundary.
+    assert.deepEqual(
+      steer,
+      hub.daemonSupportsOrdinaryAgentRpc()
+        ? { type: "send_agent_message_response", accepted: true }
+        : {
+            type: "rpc_error",
+            requestType: "send_agent_message_request",
+            code: "access_denied",
+          },
+    );
     assert.deepEqual(hub.relayEvidence(), {
       enabled: false,
       configuredOptions: [],
     });
-    assert.equal(hub.daemonAttemptedRelayConnection(), false);
+    assert.equal(
+      hub.daemonAttemptedRelayConnection(),
+      false,
+      hub.daemonRelayConnectionEvidence().join("\n"),
+    );
 
     await hub.disconnect();
     assert.equal((await hub.status()).state, "not_connected");

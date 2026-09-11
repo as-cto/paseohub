@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
+import { createMemoryDatabase } from "../../db/memory.js";
 import type { DurableProviderEvent, ProviderEventAcceptance } from "../../db/types.js";
 import {
   NormalizedLinearAgentSessionEventSchema,
@@ -16,6 +17,145 @@ const SECRET = "linear-webhook-secret";
 const NOW = 1_700_000_000_000;
 
 describe("Linear webhook", () => {
+  it("acknowledges durable admission before blocked hydration and dispatch, then deduplicates signature replays", async () => {
+    const database = createMemoryDatabase({ now: () => new Date(NOW) });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let dispatches = 0;
+    const endpoint = createLinearWebhookSource({
+      signingSecret: SECRET,
+      now: () => NOW,
+      inbox: { database, applicationId: "app", configurationVersion: 7 },
+      resolveIssue: async () => {
+        await blocked;
+        return projectlessIssueDetails();
+      },
+      accept: async (input) => {
+        assert.equal(input.providerConfigurationVersion, 7);
+        return acceptedEvent(input);
+      },
+    });
+    await endpoint.start(async () => {
+      dispatches++;
+    });
+    try {
+      assert.equal((await endpoint.handle(request(commentEnvelope(), "Comment"))).status, 200);
+      const [admitted] = await database.listPendingLinearWebhooks("app", new Date(NOW), 10);
+      assert.ok(admitted);
+      assert.equal(dispatches, 0);
+      assert.deepEqual(admitted.payload, commentEnvelope());
+      assert.equal(
+        (
+          await endpoint.handle(
+            request(commentEnvelope(), "Comment", { deliveryId: "replayed-delivery" }),
+          )
+        ).status,
+        200,
+      );
+      release();
+      await vi.waitFor(async () =>
+        assert.ok((await database.findLinearWebhook(admitted.id))?.completedAt),
+      );
+      assert.equal(dispatches, 1);
+      assert.equal((await endpoint.handle(request(commentEnvelope(), "Comment"))).status, 200);
+      assert.equal(dispatches, 1);
+    } finally {
+      release();
+      await endpoint.stop();
+    }
+  });
+
+  it("recovers admitted work after restart and persists transient handoff retry", async () => {
+    let now = NOW;
+    const database = createMemoryDatabase({ now: () => new Date(now) });
+    const options = {
+      signingSecret: SECRET,
+      now: () => now,
+      inbox: { database, applicationId: "app", configurationVersion: 1 },
+      accept: async (
+        input: Parameters<Parameters<typeof createLinearWebhookSource>[0]["accept"]>[0],
+      ) => acceptedEvent(input),
+    };
+    const admission = createLinearWebhookSource(options);
+    assert.equal((await admission.handle(request(issueEnvelope()))).status, 200);
+    const [row] = await database.listPendingLinearWebhooks("app", new Date(now), 10);
+    assert.ok(row);
+    const firstWorker = createLinearWebhookSource(options);
+    await firstWorker.start(async () => {
+      throw new Error("temporary provider failure");
+    });
+    await vi.waitFor(async () =>
+      assert.equal((await database.findLinearWebhook(row.id))?.attempts, 1),
+    );
+    await firstWorker.stop();
+    const failed = await database.findLinearWebhook(row.id);
+    assert.equal(failed?.completedAt, null);
+    assert.ok(failed?.lastError);
+    assert.equal((await database.listPendingLinearWebhooks("app", new Date(now), 10)).length, 0);
+    now += 2000;
+    let recovered = 0;
+    const recoveredWorker = createLinearWebhookSource(options);
+    await recoveredWorker.start(async () => {
+      recovered++;
+    });
+    try {
+      await vi.waitFor(async () =>
+        assert.ok((await database.findLinearWebhook(row.id))?.completedAt),
+      );
+      assert.equal(recovered, 1);
+      assert.equal((await database.findLinearWebhook(row.id))?.attempts, 2);
+    } finally {
+      await recoveredWorker.stop();
+    }
+  });
+
+  it("returns a retryable error if verified admission cannot be persisted", async () => {
+    const database = createMemoryDatabase();
+    database.admitLinearWebhook = async () => {
+      throw new Error("database unavailable");
+    };
+    const endpoint = createLinearWebhookSource({
+      signingSecret: SECRET,
+      now: () => NOW,
+      inbox: { database, applicationId: "app", configurationVersion: 1 },
+      accept: async () => {
+        throw new Error("must not dispatch without durable admission");
+      },
+    });
+    assert.equal((await endpoint.handle(request(issueEnvelope()))).status, 503);
+  });
+
+  it("serializes recovery by two source workers so they dispatch one admitted webhook once", async () => {
+    const database = createMemoryDatabase({ now: () => new Date(NOW) });
+    const options = {
+      signingSecret: SECRET,
+      now: () => NOW,
+      inbox: { database, applicationId: "app", configurationVersion: 1 },
+      accept: async (
+        input: Parameters<Parameters<typeof createLinearWebhookSource>[0]["accept"]>[0],
+      ) => acceptedEvent(input),
+    };
+    const first = createLinearWebhookSource(options);
+    const second = createLinearWebhookSource(options);
+    await first.handle(request(issueEnvelope()));
+    const [row] = await database.listPendingLinearWebhooks("app", new Date(NOW), 10);
+    assert.ok(row);
+    let dispatches = 0;
+    const handle = async () => {
+      dispatches++;
+    };
+    await Promise.all([first.start(handle), second.start(handle)]);
+    try {
+      await vi.waitFor(async () =>
+        assert.ok((await database.findLinearWebhook(row.id))?.completedAt),
+      );
+    } finally {
+      await Promise.all([first.stop(), second.stop()]);
+    }
+    assert.equal(dispatches, 1);
+  });
   it("verifies the exact raw body and its signed replay timestamp", () => {
     const body = new TextEncoder().encode('{"title":"héllo"}');
     const signature = sign(body);
@@ -70,9 +210,11 @@ describe("Linear webhook", () => {
           teamId: "team-1",
           stateId: "ready",
           assigneeId: "user-2",
+          delegateId: null,
           labelIds: ["label-1"],
         },
         updatedFrom: {},
+        changes: [],
         occurredAt: new Date(NOW).toISOString(),
       },
       receivedAt: new Date(NOW),
@@ -280,6 +422,69 @@ describe("Linear webhook", () => {
     assert.equal(event.issue?.assigneeId, "app-user");
     assert.deepEqual(event.issue?.labelIds, ["label-1"]);
   });
+
+  it.each(["created", "prompted"])(
+    "accepts and dispatches a signed %s agent session without an actor or labels",
+    async (action) => {
+      const accepted: Array<
+        Parameters<Parameters<typeof createLinearWebhookSource>[0]["accept"]>[0]
+      > = [];
+      const dispatched: DurableProviderEvent[] = [];
+      const endpoint = createLinearWebhookSource({
+        signingSecret: SECRET,
+        now: () => NOW,
+        canHydrateIssue: async () => true,
+        resolveIssue: async () => ({ ...projectlessIssueDetails(), labelIds: [] }),
+        accept: async (input) => {
+          accepted.push(input);
+          return acceptedEvent(input);
+        },
+      });
+      await endpoint.start(async (event) => {
+        dispatched.push(event);
+      });
+      const envelope = agentSessionEnvelope();
+      const response = await endpoint.handle(
+        request(
+          {
+            ...envelope,
+            action,
+            agentSession: {
+              ...envelope.agentSession,
+              creator: null,
+              comment: { id: "comment-1", body: "Please investigate", user: null },
+              issue: compactProjectlessTeamIssue(),
+            },
+            ...(action === "prompted"
+              ? {
+                  agentActivity: {
+                    id: "activity-1",
+                    createdAt: new Date(NOW).toISOString(),
+                    user: null,
+                    content: { type: "prompt", body: "Please continue" },
+                  },
+                }
+              : {}),
+          },
+          "AgentSessionEvent",
+        ),
+      );
+
+      assert.equal(response.status, 200);
+      assert.equal(accepted.length, 1);
+      assert.equal(accepted[0]?.source, "linear.agent_session");
+      assert.equal(accepted[0]?.teamId, "team-1");
+      assert.equal(accepted[0]?.projectId, undefined);
+      const event = NormalizedLinearAgentSessionEventSchema.parse(accepted[0]?.payload);
+      assert.equal(event.action, action);
+      assert.equal(event.actor, null);
+      assert.equal(event.agentSession.id, "session-1");
+      assert.deepEqual(event.issue?.labelIds, []);
+      assert.equal(dispatched.length, 1);
+      assert.equal(dispatched[0]?.source, "linear.agent_session");
+      assert.deepEqual(dispatched[0]?.payload, event);
+    },
+  );
 
   it("hydrates a compact projectless team Agent Session before matching", async () => {
     const accepted: Array<
@@ -529,6 +734,7 @@ function projectlessIssueDetails() {
     teamId: "team-1",
     stateId: "ready",
     assigneeId: "user-2",
+    delegateId: null,
     labelIds: ["label-1"],
   };
 }

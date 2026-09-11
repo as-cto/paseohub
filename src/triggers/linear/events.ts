@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { LinearIssueDetails } from "../../providers/linear/client.js";
+import { LINEAR_WORK_FIELDS, linearIssueChanges } from "./issue-changes.js";
 
 const LinearIdSchema = z.string().min(1);
 const LinearActorSchema = z.object({ id: LinearIdSchema, name: z.string().optional() });
@@ -13,6 +14,7 @@ const LinearIssueSchema = z.object({
   teamId: LinearIdSchema.nullable(),
   stateId: LinearIdSchema.nullable(),
   assigneeId: LinearIdSchema.nullable(),
+  delegateId: LinearIdSchema.nullable().optional(),
   labelIds: z.array(LinearIdSchema),
 });
 const LinearIssuePreviousSchema = z.object({
@@ -31,6 +33,19 @@ export const NormalizedLinearIssueEventSchema = z.object({
   actor: LinearActorSchema.nullable(),
   issue: LinearIssueSchema,
   updatedFrom: LinearIssuePreviousSchema,
+  /** Original Issue/create evidence; never hydrated from a later version of the issue. */
+  sourceStateId: LinearIdSchema.nullable().optional(),
+  sourceIssueUpdatedAt: z.string().datetime().optional(),
+  sourceActorIsBot: z.boolean().optional(),
+  changes: z
+    .array(
+      z.object({
+        field: z.enum(LINEAR_WORK_FIELDS),
+        before: z.union([z.string(), z.number(), z.array(z.string()), z.null()]),
+        after: z.union([z.string(), z.number(), z.array(z.string()), z.null()]),
+      }),
+    )
+    .optional(),
   occurredAt: z.string().datetime().optional(),
 });
 
@@ -71,6 +86,7 @@ export const NormalizedLinearAgentSessionEventSchema = z.object({
   agentSession: z.object({
     id: LinearIdSchema,
     appUserId: LinearIdSchema,
+    externalUrls: z.array(z.object({ label: z.string(), url: z.string().url() })).optional(),
     issueId: LinearIdSchema,
     status: z.string().min(1),
     url: z.string().url().optional(),
@@ -197,7 +213,9 @@ function readEnvelope(
   // so deferred history can exclude the trigger and all later comments. If neither entity nor
   // event time is supplied, context materialization safely leaves history unavailable.
   const occurredAt = firstDefined(
-    kind === "comment" ? readDate(data["createdAt"]) : undefined,
+    kind === "comment"
+      ? readDate(data[action === "create" ? "createdAt" : "updatedAt"])
+      : undefined,
     readDate(payload["createdAt"]),
   );
   return {
@@ -224,6 +242,18 @@ function normalizeIssueEvent(
     actor: normalizeActor(envelope.payload["actor"]),
     issue,
     updatedFrom: normalizePreviousIssue(envelope.payload["updatedFrom"]),
+    ...(envelope.action === "create" && readDate(envelope.data["updatedAt"]) !== undefined
+      ? {
+          sourceStateId: relatedId(envelope.data, "stateId", "state", null),
+          ...(readDate(envelope.data["updatedAt"]) === undefined
+            ? {}
+            : { sourceIssueUpdatedAt: readDate(envelope.data["updatedAt"]) }),
+        }
+      : {}),
+    ...(envelope.action === "create" && isBotActor(envelope.payload["actor"])
+      ? { sourceActorIsBot: true }
+      : {}),
+    changes: linearIssueChanges(envelope.data, envelope.payload["updatedFrom"]),
     ...(envelope.occurredAt === undefined ? {} : { occurredAt: envelope.occurredAt }),
   });
 }
@@ -272,6 +302,9 @@ function normalizeAgentSessionEvent(
   const turn = normalizeAgentSessionTurn({ action, payload, session, issue, promptContext });
   if (turn === undefined) return undefined;
   const url = readString(session["url"]);
+  const externalUrls = z
+    .array(z.object({ label: z.string(), url: z.string().url() }))
+    .safeParse(session["externalUrls"] ?? session["externalLinks"]);
   const rootCommentId = firstDefined(
     readString(asRecord(session["comment"])?.["id"]),
     readString(session["commentId"]),
@@ -281,10 +314,11 @@ function normalizeAgentSessionEvent(
     action,
     id: turn.activity?.id ?? sessionId,
     organizationId,
-    actor: turn.actor,
+    actor: turn.actor ?? null,
     agentSession: {
       id: sessionId,
       appUserId,
+      ...(externalUrls.success ? { externalUrls: externalUrls.data } : {}),
       issueId,
       status,
       ...(url === undefined ? {} : { url }),
@@ -464,11 +498,21 @@ function normalizeIssue(
     title,
     description: nullableValue(data, "description", hydrated?.description ?? null),
     ...optionalProperty("url", url),
+    ...normalizeIssueRelations(data, hydrated),
+    labelIds: firstDefined(readLabelIds(data), hydrated?.labelIds) ?? [],
+  };
+}
+
+function normalizeIssueRelations(
+  data: Record<string, unknown>,
+  hydrated: LinearIssueDetails | undefined,
+): Pick<NormalizedLinearIssue, "projectId" | "teamId" | "stateId" | "assigneeId" | "delegateId"> {
+  return {
     projectId: relatedId(data, "projectId", "project", hydrated?.projectId ?? null),
     teamId: relatedId(data, "teamId", "team", hydrated?.teamId ?? null),
     stateId: relatedId(data, "stateId", "state", hydrated?.stateId ?? null),
     assigneeId: relatedId(data, "assigneeId", "assignee", hydrated?.assigneeId ?? null),
-    labelIds: firstDefined(readLabelIds(data), hydrated?.labelIds) ?? [],
+    delegateId: relatedId(data, "delegateId", "delegate", hydrated?.delegateId ?? null),
   };
 }
 
@@ -542,6 +586,16 @@ function readPreviousRelatedId(
   return firstDefined(
     readNullableId(previous, directKey),
     previous[relationKey] === null ? null : readNullableId(asRecord(previous[relationKey]), "id"),
+  );
+}
+
+function isBotActor(value: unknown): boolean {
+  const actor = asRecord(value);
+  return (
+    actor?.["app"] === true ||
+    actor?.["isBot"] === true ||
+    actor?.["type"] === "application" ||
+    actor?.["type"] === "bot"
   );
 }
 

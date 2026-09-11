@@ -12,6 +12,7 @@ import type {
   SlackProviderApplicationConfiguration,
 } from "../index.js";
 import { DynamicProviderRuntime } from "./runtime-owner.js";
+import { compileJsonSchema } from "../../workflows/json-schema.js";
 
 describe("dynamic provider runtime", () => {
   it.each([
@@ -627,8 +628,87 @@ describe("dynamic provider runtime", () => {
         connectionRegistration(configuration.provider, providerConfigurationId(configuration)),
     });
 
-    assert.deepEqual(replyToolProperties(runtime, "linear"), ["content", "kind", "options"]);
+    assert.deepEqual(replyToolProperties(runtime, "linear"), [
+      "auth",
+      "content",
+      "kind",
+      "options",
+      "outcome",
+    ]);
     assert.deepEqual(replyToolProperties(runtime, "slack"), ["content"]);
+    const outputs = runtime
+      .registrations()
+      .find((entry) => entry.connection.name === "linear")!.outputs;
+    assert.deepEqual(
+      outputs.map((output) => [output.type, output.tool.name]),
+      [
+        ["linear.reply", "reply"],
+        ["linear.progress", "progress"],
+        ["linear.plan", "plan"],
+      ],
+    );
+    const reply = compileJsonSchema(outputs[0]!.tool.inputSchema).validate;
+    assert.equal(
+      reply({
+        content: "Connect",
+        kind: "auth",
+        auth: { url: "https://connect.example.com/link" },
+      }),
+      true,
+    );
+    assert.equal(reply({ content: "Error", kind: "error" }), true);
+    assert.equal(reply({ content: "Working", kind: "progress" }), false);
+    const sessionContext = {
+      provider: "linear",
+      linearOrganizationId: "linear-org",
+      issueId: "issue",
+      agentSessionId: "session",
+    };
+    assert.equal(outputs[1]!.available?.(sessionContext), true);
+    assert.equal(outputs[1]!.available?.({ ...sessionContext, agentSessionId: null }), false);
+    assert.equal(outputs[2]!.available?.(sessionContext), true);
+  });
+
+  it("routes native progress and plan outputs through the active Linear registration", async () => {
+    const used: string[] = [];
+    const runtime = new DynamicProviderRuntime({
+      database: createMemoryDatabase(),
+      auth: testAuth(),
+      applicationBaseUrl: "https://hub.test",
+      registrationFactory: () => ({
+        ...connectionRegistration("linear", "app"),
+        outputs: ["progress", "plan"].map((name) => ({
+          type: `linear.${name}`,
+          tool: { name, description: name, inputSchema: { type: "object" as const } },
+          execute: async () => {
+            used.push(name);
+          },
+        })),
+      }),
+    });
+    const candidate = await runtime.prepare(
+      "linear",
+      providerConfiguration("linear", "app"),
+      "https://hub.test",
+      { provider: "linear", id: "app", name: "Agent" },
+      1,
+    );
+    await candidate.start();
+    candidate.publish();
+    const outputs = runtime
+      .registrations()
+      .find((entry) => entry.connection.name === "linear")!.outputs;
+    for (const type of ["linear.progress", "linear.plan"]) {
+      await outputs
+        .find((output) => output.type === type)!
+        .execute({
+          agentExecutionId: "execution",
+          toolType: type,
+          args: {},
+          outputContext: {},
+        });
+    }
+    assert.deepEqual(used, ["progress", "plan"]);
   });
 });
 

@@ -69,9 +69,16 @@ describe("Linear trigger matching", () => {
     // A triage rule assigns with `actor: null`. An actor allowlist rejects that by construction,
     // which is how SEN-106 was delegated, shown as "started work", and never reached the agent.
     const config = configuration();
-    const byRule = { ...issue({ action: "update", updatedFrom: { assigneeId: null } }), actor: null };
+    const byRule = {
+      ...issue({ action: "update", updatedFrom: { assigneeId: null } }),
+      actor: null,
+    };
 
-    assert.equal(matchLinearTriggers(config, byRule).length, 0, "allowlisted trigger still refuses");
+    assert.equal(
+      matchLinearTriggers(config, byRule).length,
+      0,
+      "allowlisted trigger still refuses",
+    );
 
     const source = configuration();
     const opened = source.triggers.find((trigger) => trigger.name === "assignment");
@@ -305,6 +312,155 @@ describe("Linear trigger matching", () => {
       );
       assert.equal(
         matchLinearTriggers(scopedConfig, event, "22222222-2222-4222-8222-222222222222").length,
+        0,
+      );
+    }
+  });
+
+  it("accepts actorless automated session creation only under an explicit scoped wildcard", () => {
+    const trigger = {
+      name: "automated-session",
+      on: "linear.agent_session",
+      filters: { connectionId: "connection-1", team: "team-1", from_users: ["*"] },
+    };
+    const config = { triggers: [trigger] };
+    const base = agentSessionEvent();
+    const event = agentSessionEvent({
+      action: "created",
+      actor: null,
+      agentActivity: null,
+      issue: { ...base.issue!, projectId: null, assigneeId: "operator", labelIds: [] },
+    });
+    assert.equal(matchLinearTriggers(config, event, "connection-1", "app-user").length, 1);
+    assert.equal(matchLinearTriggers(config, event, "other-connection", "app-user").length, 0);
+    assert.equal(
+      matchLinearTriggers(
+        config,
+        { ...event, issue: { ...event.issue!, teamId: "other-team" } },
+        "connection-1",
+      ).length,
+      0,
+    );
+    assert.equal(
+      matchLinearTriggers(config, { ...event, action: "prompted" }, "connection-1").length,
+      0,
+    );
+    for (const from_users of [["operator"], []]) {
+      assert.equal(
+        matchLinearTriggers(
+          { triggers: [{ ...trigger, filters: { ...trigger.filters, from_users } }] },
+          event,
+          "connection-1",
+        ).length,
+        0,
+      );
+    }
+    for (const on of ["linear.comment_created", "linear.issue_assigned"]) {
+      const other =
+        on === "linear.comment_created"
+          ? { ...commentEvent(), actor: null }
+          : { ...issue({ action: "update", updatedFrom: { assigneeId: null } }), actor: null };
+      assert.equal(
+        matchLinearTriggers({ triggers: [{ ...trigger, on }] }, other, "connection-1").length,
+        0,
+      );
+    }
+    assert.equal(
+      matchLinearTriggers(
+        config,
+        { ...event, actor: { id: "app-user" } },
+        "connection-1",
+        "app-user",
+      ).length,
+      0,
+    );
+  });
+
+  it("allows automated creation explicitly while preserving scope and human authorization", () => {
+    const filters = {
+      connectionId: "connection-1",
+      team: "team-1",
+      project: "project-1",
+      states: ["ready"],
+      assignees: ["operator"],
+      labels: ["approved"],
+      exclude_labels: ["no-paseo"],
+      from_users: ["operator"],
+      allow_automated_sessions: true,
+    };
+    const trigger = { name: "automated-session", on: "linear.agent_session", filters };
+    const event = agentSessionEvent({
+      action: "created",
+      actor: null,
+      agentActivity: null,
+      issue: {
+        ...agentSessionEvent().issue!,
+        assigneeId: "operator",
+        labelIds: ["approved"],
+      },
+    });
+    const config = { triggers: [trigger] };
+    assert.equal(matchLinearTriggers(config, event, "connection-1").length, 1);
+    assert.equal(matchLinearTriggers(config, event, "other-connection").length, 0);
+    for (const issueOverride of [
+      { teamId: "other-team" },
+      { projectId: "other-project" },
+      { stateId: "backlog" },
+      { assigneeId: "other-user" },
+      { labelIds: [] },
+      { labelIds: ["approved", "no-paseo"] },
+    ]) {
+      assert.equal(
+        matchLinearTriggers(
+          config,
+          { ...event, issue: { ...event.issue!, ...issueOverride } },
+          "connection-1",
+        ).length,
+        0,
+      );
+    }
+    for (const filterOverride of [
+      { allow_automated_sessions: false },
+      { allow_automated_sessions: undefined },
+      { connectionId: undefined },
+      { team: undefined },
+      { from_users: [] },
+      { contains: "an explicit invocation marker" },
+    ]) {
+      assert.equal(
+        matchLinearTriggers(
+          { triggers: [{ ...trigger, filters: { ...filters, ...filterOverride } }] },
+          event,
+          "connection-1",
+        ).length,
+        0,
+      );
+    }
+    assert.equal(
+      matchLinearTriggers(config, { ...event, action: "prompted" }, "connection-1").length,
+      0,
+    );
+    assert.equal(matchLinearTriggers(config, { ...event, issue: null }, "connection-1").length, 0);
+    for (const action of ["created", "prompted"] as const) {
+      for (const actorId of ["operator", "untrusted", event.agentSession.appUserId]) {
+        assert.equal(
+          matchLinearTriggers(config, { ...event, action, actor: { id: actorId } }, "connection-1")
+            .length,
+          actorId === "operator" ? 1 : 0,
+        );
+      }
+    }
+    for (const on of ["linear.comment_created", "linear.issue_assigned"]) {
+      const other =
+        on === "linear.comment_created"
+          ? { ...commentEvent(), actor: null, issue: event.issue }
+          : {
+              ...issue({ action: "update", updatedFrom: { assigneeId: null } }),
+              actor: null,
+              issue: event.issue!,
+            };
+      assert.equal(
+        matchLinearTriggers({ triggers: [{ ...trigger, on }] }, other, "connection-1").length,
         0,
       );
     }

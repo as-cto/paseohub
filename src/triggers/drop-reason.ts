@@ -1,4 +1,13 @@
 export const PROVIDER_EVENT_DROP_REASON_CODES = [
+  "linear_intake_applied",
+  "linear_intake_ignored",
+  "linear_intake_ambiguous",
+  "linear_issue_not_delegated",
+  "linear_app_event_ignored",
+  "linear_no_work_change",
+  "linear_issue_outside_scope",
+  "linear_actor_not_authorized",
+
   "no_project_route",
   "no_trigger_for_source",
   "trigger_filters_rejected",
@@ -11,6 +20,21 @@ export const PROVIDER_EVENT_DROP_REASON_CODES = [
 export type ProviderEventDropReasonCode = (typeof PROVIDER_EVENT_DROP_REASON_CODES)[number];
 
 const SUMMARIES: Readonly<Record<ProviderEventDropReasonCode, string>> = {
+  linear_intake_applied:
+    "The issue entered the configured Triage intake; no agent launch matched this event.",
+  linear_intake_ignored:
+    "The configured Triage intake skipped this issue; its journal or intake log records the reason.",
+  linear_intake_ambiguous:
+    "The Triage mutation outcome is uncertain. It will not be sent again without reconciliation.",
+  linear_issue_not_delegated: "The issue is not currently delegated to this Linear agent.",
+  linear_app_event_ignored:
+    "This event was emitted by the agent itself; it does not start another agent.",
+  linear_no_work_change:
+    "This update contains no supported work change; it does not start an agent.",
+  linear_issue_outside_scope:
+    "The issue does not match the configured team, project or issue filters.",
+  linear_actor_not_authorized: "The event author is not authorized by this project trigger.",
+
   no_project_route: "No project route is configured for this event.",
   no_trigger_for_source: "No configured trigger handles this event.",
   trigger_filters_rejected: "The event did not pass the configured trigger filters.",
@@ -36,6 +60,14 @@ export function isProviderEventDropReasonCode(value: string): value is ProviderE
  * `unrouted-provider-events.test.ts` freezes both sides to this list.
  */
 export const UNROUTED_PROVIDER_EVENT_DROP_REASON_CODES = [
+  "linear_intake_ignored",
+  "linear_intake_ambiguous",
+  "linear_issue_not_delegated",
+  "linear_app_event_ignored",
+  "linear_no_work_change",
+  "linear_issue_outside_scope",
+  "linear_actor_not_authorized",
+
   "no_project_route",
   "no_trigger_for_source",
   "trigger_filters_rejected",

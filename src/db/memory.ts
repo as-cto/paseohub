@@ -1,6 +1,54 @@
+import {
+  linearTriageIntakeKey,
+  type LinearTriageIntakeRecord,
+  type LinearTriageIntakeClaim,
+  type LinearTriageIntakeKey,
+  type LinearTriageIntakeSettlement,
+} from "./linear-triage-intakes.js";
+import {
+  linearIssueSessionBridgeKey,
+  type LinearIssueSessionBridgeClaim,
+  type LinearIssueSessionBridgeKey,
+  type LinearIssueSessionBridgeScope,
+  type LinearIssueSessionBridgeRecord,
+} from "./linear-issue-session-bridges.js";
+import {
+  assertWorkspacePlacement,
+  workspacePlacementKey,
+  type WorkspacePlacementClaim,
+  type WorkspacePlacementRecord,
+} from "./workspace-placements.js";
+import { linearDispatchKey } from "./linear-dispatch.js";
+import { matchingLinearReplyConnection } from "../triggers/linear/reply-authority.js";
+import type { ReserveLinearFinalization, LinearIssueFinalization } from "./linear-finalizations.js";
+import { nextTurnOutputContext } from "./turn-output-context.js";
+import {
+  acknowledgeLinearReplyExecution,
+  newLinearReply,
+  terminalLinearReplyAttempt,
+  linearReplyTurnKey,
+  type LinearReplyDelivery,
+  type ReserveLinearReply,
+} from "./linear-replies.js";
+import type { LinearWebhookInboxRecord } from "./types.js";
+import { linearCommentBridgeKey } from "./linear-comment-bridges.js";
+import type {
+  LinearCommentBridgeClaim,
+  LinearCommentBridgeKey,
+  LinearCommentBridgeRecord,
+} from "./types.js";
 import { randomUUID } from "node:crypto";
 import type { AgentExecutionStatus, MachineStatus } from "./schema.js";
-import { completesAtIdleDeadline } from "./idle-completion.js";
+import { completesAtIdleDeadline, matchesIdleTurnCompletionCondition } from "./idle-completion.js";
+import {
+  linearIssueExecutionKey,
+  executionStillOwnsWork,
+  ISSUE_EXECUTION_RETRY_MS,
+} from "./linear-issue-serialization.js";
+import {
+  currentTurnOutputEmissions,
+  isCurrentTurnAttempt,
+} from "../execution-capabilities/required-outputs.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import {
@@ -157,11 +205,461 @@ export function createMemoryDatabase(options: MemoryDatabaseOptions = {}): Datab
 }
 
 class MemoryDatabase implements Database {
+  private readonly workspacePlacements = new Map<string, WorkspacePlacementRecord>();
+
+  async claimWorkspacePlacement(input: WorkspacePlacementClaim): Promise<WorkspacePlacementRecord> {
+    const key = workspacePlacementKey(input);
+    let record = this.workspacePlacements.get(key);
+    if (record === undefined) {
+      record = { ...input, createdAt: this.now() };
+      this.workspacePlacements.set(key, record);
+    }
+    assertWorkspacePlacement(record, input);
+    return structuredClone(record);
+  }
+  private readonly linearWebhookInbox = new Map<string, LinearWebhookInboxRecord>();
+
+  async admitLinearWebhook(input: Parameters<Database["admitLinearWebhook"]>[0]) {
+    const prior = [...this.linearWebhookInbox.values()].find(
+      (row) =>
+        row.applicationId === input.applicationId &&
+        (row.deliveryId === input.deliveryId || row.signatureHash === input.signatureHash),
+    );
+    if (prior !== undefined) return prior;
+    const row: LinearWebhookInboxRecord = {
+      ...input,
+      id: randomUUID(),
+      nextAttemptAt: this.now(),
+      attempts: 0,
+      completedAt: null,
+      lastError: null,
+    };
+    this.linearWebhookInbox.set(row.id, row);
+    return row;
+  }
+  async listPendingLinearWebhooks(applicationId: string, now: Date, limit: number) {
+    return [...this.linearWebhookInbox.values()]
+      .filter(
+        (row) =>
+          row.applicationId === applicationId &&
+          row.completedAt === null &&
+          row.nextAttemptAt <= now,
+      )
+      .sort((a, b) => a.receivedAt.getTime() - b.receivedAt.getTime())
+      .slice(0, limit);
+  }
+  async findLinearWebhook(id: string) {
+    return this.linearWebhookInbox.get(id);
+  }
+  async settleLinearWebhook(id: string, outcome: Parameters<Database["settleLinearWebhook"]>[1]) {
+    const row = this.linearWebhookInbox.get(id);
+    if (row === undefined) throw new Error("verified Linear webhook not found");
+    this.linearWebhookInbox.set(id, {
+      ...row,
+      attempts: row.attempts + 1,
+      ...("completedAt" in outcome
+        ? { completedAt: outcome.completedAt, lastError: null }
+        : { nextAttemptAt: outcome.retryAt, lastError: outcome.error.slice(0, 2000) }),
+    });
+  }
+  private readonly linearTriageIntakes = new Map<string, LinearTriageIntakeRecord>();
+  async findLinearTriageIntake(key: LinearTriageIntakeKey) {
+    const record = this.linearTriageIntakes.get(linearTriageIntakeKey(key));
+    return record === undefined ? undefined : structuredClone(record);
+  }
+  async claimLinearTriageIntake(input: LinearTriageIntakeClaim) {
+    const key = linearTriageIntakeKey(input);
+    let record = this.linearTriageIntakes.get(key);
+    if (record === undefined) {
+      const { now: _now, ...source } = input;
+      record = {
+        ...structuredClone(source),
+        status: "reserved",
+        reason: null,
+        attemptStartedAt: null,
+      };
+    } else if (
+      !["applied", "ignored"].includes(record.status) &&
+      record.leaseExpiresAt <= input.now
+    ) {
+      record = { ...record, leaseId: input.leaseId, leaseExpiresAt: input.leaseExpiresAt };
+    }
+    this.linearTriageIntakes.set(key, record);
+    return {
+      record: structuredClone(record),
+      claimed: !["applied", "ignored"].includes(record.status) && record.leaseId === input.leaseId,
+    };
+  }
+  async startLinearTriageIntake(key: LinearTriageIntakeKey, leaseId: string, now: Date) {
+    const id = linearTriageIntakeKey(key);
+    const record = this.linearTriageIntakes.get(id);
+    if (
+      record === undefined ||
+      record.leaseId !== leaseId ||
+      record.leaseExpiresAt <= now ||
+      record.status !== "reserved" ||
+      record.attemptStartedAt !== null
+    )
+      return false;
+    this.linearTriageIntakes.set(id, { ...record, status: "attempted", attemptStartedAt: now });
+    return true;
+  }
+  async settleLinearTriageIntake(
+    key: LinearTriageIntakeKey,
+    leaseId: string,
+    outcome: LinearTriageIntakeSettlement,
+  ) {
+    const id = linearTriageIntakeKey(key);
+    const record = this.linearTriageIntakes.get(id);
+    if (record === undefined) throw new Error("Linear intake reservation is missing");
+    if (
+      !["applied", "ignored"].includes(record.status) &&
+      (record.leaseId === leaseId ||
+        (outcome.status === "applied" && record.attemptStartedAt !== null))
+    ) {
+      this.linearTriageIntakes.set(id, { ...record, ...outcome });
+    }
+    return structuredClone(this.linearTriageIntakes.get(id)!);
+  }
+
+  private readonly linearIssueSessionBridges = new Map<string, LinearIssueSessionBridgeRecord>();
+
+  async claimLinearIssueSessionBridge(input: LinearIssueSessionBridgeClaim) {
+    const key = linearIssueSessionBridgeKey(input);
+    let bridge = this.linearIssueSessionBridges.get(key);
+    if (bridge === undefined) {
+      const { now: _now, ...initial } = input;
+      bridge = { ...initial, sessionId: null, creationStartedAt: null };
+    } else if (bridge.sessionId === null && bridge.leaseExpiresAt <= input.now) {
+      bridge = { ...bridge, leaseId: input.leaseId, leaseExpiresAt: input.leaseExpiresAt };
+    }
+    this.linearIssueSessionBridges.set(key, bridge);
+    return {
+      bridge: structuredClone(bridge),
+      claimed: bridge.sessionId === null && bridge.leaseId === input.leaseId,
+    };
+  }
+
+  async findLinearIssueSessionBridge(key: LinearIssueSessionBridgeKey) {
+    const bridge = this.linearIssueSessionBridges.get(linearIssueSessionBridgeKey(key));
+    return bridge === undefined ? undefined : structuredClone(bridge);
+  }
+
+  async bindLinearIssueSessionBridge(key: LinearIssueSessionBridgeKey, sessionId: string) {
+    const id = linearIssueSessionBridgeKey(key);
+    const bridge = this.linearIssueSessionBridges.get(id);
+    if (bridge === undefined) throw new Error("Linear issue session reservation is missing");
+    if (bridge.sessionId !== null && bridge.sessionId !== sessionId)
+      throw new Error("Linear issue event has conflicting native session identities");
+    const bound = { ...bridge, sessionId };
+    this.linearIssueSessionBridges.set(id, bound);
+    return structuredClone(bound);
+  }
+  async startLinearIssueSessionBridgeCreation(
+    key: LinearIssueSessionBridgeKey,
+    leaseId: string,
+    now: Date,
+  ) {
+    const id = linearIssueSessionBridgeKey(key);
+    const bridge = this.linearIssueSessionBridges.get(id);
+    if (
+      bridge === undefined ||
+      bridge.leaseId !== leaseId ||
+      bridge.leaseExpiresAt <= now ||
+      bridge.sessionId !== null ||
+      bridge.creationStartedAt !== null
+    )
+      return false;
+    this.linearIssueSessionBridges.set(id, { ...bridge, creationStartedAt: now });
+    return true;
+  }
+  async findLinearIssueSessionBridgeBySession(
+    scope: LinearIssueSessionBridgeScope,
+    sessionId: string,
+  ) {
+    return this.findLinearIssueSessionBridgeByIdentity(scope, "sessionId", sessionId);
+  }
+  async findLinearIssueSessionBridgeByMarker(
+    scope: LinearIssueSessionBridgeScope,
+    markerUrl: string,
+  ) {
+    return this.findLinearIssueSessionBridgeByIdentity(scope, "markerUrl", markerUrl);
+  }
+  private findLinearIssueSessionBridgeByIdentity(
+    scope: LinearIssueSessionBridgeScope,
+    field: "sessionId" | "markerUrl",
+    value: string,
+  ) {
+    const matches = [...this.linearIssueSessionBridges.values()].filter(
+      (bridge) =>
+        bridge.organizationId === scope.organizationId &&
+        bridge.projectId === scope.projectId &&
+        bridge.connectionId === scope.connectionId &&
+        bridge.linearOrganizationId === scope.linearOrganizationId &&
+        bridge.issueId === scope.issueId &&
+        bridge.appUserId === scope.appUserId &&
+        bridge[field] === value,
+    );
+    if (matches.length > 1) throw new Error("Linear issue session has multiple reservations");
+    return matches[0] === undefined ? undefined : structuredClone(matches[0]);
+  }
+  private readonly linearCommentBridges = new Map<string, LinearCommentBridgeRecord>();
+
+  async claimLinearCommentBridge(input: LinearCommentBridgeClaim) {
+    const key = linearCommentBridgeKey(input);
+    let bridge = this.linearCommentBridges.get(key);
+    if (bridge === undefined) {
+      const { now: _now, ...initial } = input;
+      bridge = { ...initial, sessionId: null, creationStartedAt: null };
+    } else if (bridge.sessionId === null && bridge.leaseExpiresAt <= input.now) {
+      bridge = { ...bridge, leaseId: input.leaseId, leaseExpiresAt: input.leaseExpiresAt };
+    }
+    this.linearCommentBridges.set(key, bridge);
+    return {
+      bridge: structuredClone(bridge),
+      claimed: bridge.sessionId === null && bridge.leaseId === input.leaseId,
+    };
+  }
+
+  async findLinearCommentBridge(key: LinearCommentBridgeKey) {
+    const bridge = this.linearCommentBridges.get(linearCommentBridgeKey(key));
+    return bridge === undefined ? undefined : structuredClone(bridge);
+  }
+
+  async bindLinearCommentBridge(key: LinearCommentBridgeKey, sessionId: string) {
+    const id = linearCommentBridgeKey(key);
+    const bridge = this.linearCommentBridges.get(id);
+    if (bridge === undefined) throw new Error("Linear bridge reservation is missing");
+    const bound = { ...bridge, sessionId: bridge.sessionId ?? sessionId };
+    this.linearCommentBridges.set(id, bound);
+    return structuredClone(bound);
+  }
+  async startLinearCommentBridgeCreation(key: LinearCommentBridgeKey, leaseId: string, now: Date) {
+    const id = linearCommentBridgeKey(key);
+    const bridge = this.linearCommentBridges.get(id);
+    if (
+      bridge === undefined ||
+      bridge.leaseId !== leaseId ||
+      bridge.leaseExpiresAt <= now ||
+      bridge.sessionId !== null ||
+      bridge.creationStartedAt !== null
+    )
+      return false;
+    this.linearCommentBridges.set(id, { ...bridge, creationStartedAt: now });
+    return true;
+  }
   private readonly providerEventReceipts = new Map<string, ProviderEventReceiptRecord>();
   private readonly providerEventReceiptIdsByDelivery = new Map<string, string>();
   private readonly providerEventReceiptIdsBySignature = new Map<string, string>();
   private readonly machines = new Map<string, MachineRecord>();
   private readonly agentExecutions = new Map<string, AgentExecutionRecord>();
+  private readonly linearReplies = new Map<string, LinearReplyDelivery>();
+  private readonly linearFinalizations = new Map<string, LinearIssueFinalization>();
+  async reserveLinearFinalization(
+    input: ReserveLinearFinalization,
+  ): Promise<LinearIssueFinalization> {
+    const existing = this.linearFinalizations.get(input.replyId);
+    if (existing !== undefined) return structuredClone(existing);
+    const record: LinearIssueFinalization = {
+      ...input,
+      status: "pending",
+      startedAt: null,
+      completedAt: null,
+      detail: null,
+    };
+    this.linearFinalizations.set(input.replyId, record);
+    return structuredClone(record);
+  }
+  async findLinearFinalization(replyId: string): Promise<LinearIssueFinalization | undefined> {
+    const record = this.linearFinalizations.get(replyId);
+    return record === undefined ? undefined : structuredClone(record);
+  }
+  async startLinearFinalization(replyId: string, now: Date): Promise<boolean> {
+    const record = this.linearFinalizations.get(replyId);
+    if (record === undefined || record.status !== "pending" || record.startedAt !== null)
+      return false;
+    this.linearFinalizations.set(replyId, { ...record, startedAt: now });
+    return true;
+  }
+  async completeLinearFinalization(
+    replyId: string,
+    status: Exclude<LinearIssueFinalization["status"], "pending">,
+    detail: string,
+    now: Date,
+  ): Promise<void> {
+    const record = this.linearFinalizations.get(replyId);
+    if (record?.status === "pending")
+      this.linearFinalizations.set(replyId, { ...record, status, detail, completedAt: now });
+  }
+  async beginTerminalLinearReplyAttempt(
+    executionId: string,
+    expectedTurnKey: string,
+    now: Date,
+  ): Promise<AgentExecutionOutputAttempt | undefined> {
+    const execution = this.agentExecutions.get(executionId);
+    if (execution === undefined) return undefined;
+    const attempt = terminalLinearReplyAttempt(execution, expectedTurnKey, now);
+    if (attempt === undefined) return undefined;
+    this.agentExecutions.set(executionId, {
+      ...execution,
+      outputDeliveryAttempts: { ...execution.outputDeliveryAttempts, [attempt.id]: attempt },
+    });
+    return structuredClone(attempt);
+  }
+  async listTerminalLinearReplyCandidates(applicationId: string, limit: number): Promise<string[]> {
+    const found: string[] = [];
+    for (const execution of this.agentExecutions.values()) {
+      const context = execution.outputContext;
+      if (
+        typeof context !== "object" ||
+        context === null ||
+        Reflect.get(context, "publishIssueComment") !== true ||
+        Reflect.get(context, "provider") !== "linear" ||
+        (execution.status !== "failed" && execution.status !== "succeeded")
+      )
+        continue;
+      const linearOrganizationId: unknown = Reflect.get(context, "linearOrganizationId");
+      const issueId: unknown = Reflect.get(context, "issueId");
+      if (typeof linearOrganizationId !== "string" || typeof issueId !== "string") continue;
+      const connection = await this.findLinearConnectionForOrganization(
+        execution.organizationId,
+        linearOrganizationId,
+      );
+      if (
+        connection?.providerApplicationId !== applicationId ||
+        connection.id !==
+          matchingLinearReplyConnection(execution.triggerContext, {
+            linearOrganizationId,
+            issueId,
+          }) ||
+        (await this.findLinearReply(
+          execution.id,
+          linearReplyTurnKey(execution.hubActionAcknowledgements.turn?.id),
+        )) !== undefined
+      )
+        continue;
+      found.push(execution.id);
+      if (found.length === limit) break;
+    }
+    return found;
+  }
+  async reserveLinearReply(input: ReserveLinearReply): Promise<LinearReplyDelivery> {
+    const prior = [...this.linearReplies.values()].find(
+      (entry) => entry.executionId === input.executionId && entry.turnKey === input.turnKey,
+    );
+    if (prior !== undefined) return structuredClone(prior);
+    const record = newLinearReply(input);
+    this.linearReplies.set(record.id, record);
+    return structuredClone(record);
+  }
+  async findLinearReply(
+    executionId: string,
+    turnKey: string,
+  ): Promise<LinearReplyDelivery | undefined> {
+    const record = [...this.linearReplies.values()].find(
+      (entry) => entry.executionId === executionId && entry.turnKey === turnKey,
+    );
+    return record === undefined ? undefined : structuredClone(record);
+  }
+  async listPendingLinearReplies(
+    applicationId: string,
+    now: Date,
+    limit: number,
+  ): Promise<LinearReplyDelivery[]> {
+    return [...this.linearReplies.values()]
+      .filter(
+        (entry) =>
+          entry.payload.applicationId === applicationId &&
+          entry.completedAt === null &&
+          entry.supersededAt === null &&
+          !["refused", "ambiguous"].includes(
+            this.linearFinalizations.get(entry.id)?.status ?? "",
+          ) &&
+          entry.nextAttemptAt <= now &&
+          (entry.leaseExpiresAt === null || entry.leaseExpiresAt <= now),
+      )
+      .sort((a, b) => a.nextAttemptAt.getTime() - b.nextAttemptAt.getTime())
+      .slice(0, limit)
+      .map((entry) => structuredClone(entry));
+  }
+  async claimLinearReply(
+    id: string,
+    leaseId: string,
+    now: Date,
+    leaseExpiresAt: Date,
+  ): Promise<LinearReplyDelivery | undefined> {
+    const record = this.linearReplies.get(id);
+    if (
+      record === undefined ||
+      record.completedAt !== null ||
+      record.supersededAt !== null ||
+      (record.leaseExpiresAt !== null && record.leaseExpiresAt > now)
+    )
+      return undefined;
+    const claimed = { ...record, leaseId, leaseExpiresAt, attempts: record.attempts + 1 };
+    this.linearReplies.set(id, claimed);
+    return structuredClone(claimed);
+  }
+  async confirmLinearReplyDestination(
+    id: string,
+    destination: "comment" | "activity",
+    now: Date,
+  ): Promise<void> {
+    const record = this.linearReplies.get(id);
+    if (record !== undefined)
+      this.linearReplies.set(id, {
+        ...record,
+        ...(destination === "comment"
+          ? { commentConfirmedAt: record.commentConfirmedAt ?? now }
+          : { activityConfirmedAt: record.activityConfirmedAt ?? now }),
+      });
+  }
+  async retryLinearReply(
+    id: string,
+    leaseId: string,
+    nextAttemptAt: Date,
+    error: string,
+  ): Promise<void> {
+    const record = this.linearReplies.get(id);
+    if (
+      record !== undefined &&
+      record.leaseId === leaseId &&
+      record.completedAt === null &&
+      record.supersededAt === null
+    )
+      this.linearReplies.set(id, {
+        ...record,
+        nextAttemptAt,
+        lastError: error,
+        leaseId: null,
+        leaseExpiresAt: null,
+      });
+  }
+  async supersedeLinearReply(id: string, now: Date): Promise<void> {
+    const record = this.linearReplies.get(id);
+    if (record !== undefined && record.completedAt === null && record.commentConfirmedAt !== null)
+      this.linearReplies.set(id, {
+        ...record,
+        supersededAt: now,
+        lastError: "Native response superseded by a newer turn",
+        leaseId: null,
+        leaseExpiresAt: null,
+      });
+  }
+  async acknowledgeLinearReply(id: string, now: Date): Promise<void> {
+    const record = this.linearReplies.get(id);
+    if (record === undefined) throw new Error("Linear reply journal is missing");
+    const execution = this.agentExecutions.get(record.executionId);
+    if (execution === undefined) throw new Error("Linear reply execution is missing");
+    this.agentExecutions.set(execution.id, acknowledgeLinearReplyExecution(record, execution, now));
+    this.linearReplies.set(id, {
+      ...record,
+      completedAt: record.completedAt ?? now,
+      lastError: null,
+      leaseId: null,
+      leaseExpiresAt: null,
+    });
+  }
   private readonly triggerRuns = new Map<string, TriggerRunRecord>();
   private readonly triggerRunIdsByProviderEventReceipt = new Map<
     string,
@@ -237,6 +735,18 @@ class MemoryDatabase implements Database {
   async createAcceptedTriggerRun(
     input: CreateAcceptedTriggerRunInput,
   ): Promise<{ run: AcceptedTriggerRunRecord; created: boolean }> {
+    const turnKey = linearDispatchKey(input.outputContext);
+    if (turnKey !== undefined) {
+      const duplicate = [...this.triggerRuns.values()].find(
+        (run) =>
+          run.organizationId === input.organizationId &&
+          run.projectId === input.projectId &&
+          run.outcome === "accepted" &&
+          linearDispatchKey(run.outputContext) === turnKey,
+      );
+      if (duplicate?.outcome === "accepted") return { run: duplicate, created: false };
+    }
+
     const projectRuns =
       this.triggerRunIdsByProviderEventReceipt.get(input.providerEventReceiptId) ??
       new Map<string, Map<string, string>>();
@@ -446,6 +956,16 @@ class MemoryDatabase implements Database {
   }
 
   async createWorkflowStepExecution(input: WorkflowStepExecutionInput) {
+    const issueKey = linearIssueExecutionKey(
+      input.execution.projectId,
+      input.execution.triggerContext,
+    );
+    return issueKey === undefined
+      ? this.createWorkflowStepExecutionUnderLock(input)
+      : this.withAdvisoryLock(issueKey, () => this.createWorkflowStepExecutionUnderLock(input));
+  }
+
+  private async createWorkflowStepExecutionUnderLock(input: WorkflowStepExecutionInput) {
     let step = (await this.listWorkflowStepRunsForTriggerRun(input.triggerRunId)).find(
       (candidate) => candidate.stepId === input.stepId && candidate.ordinal === input.ordinal,
     );
@@ -471,6 +991,28 @@ class MemoryDatabase implements Database {
         execution: undefined,
         created: false,
       };
+    }
+    const issueKey = linearIssueExecutionKey(
+      input.execution.projectId,
+      input.execution.triggerContext,
+    );
+    if (
+      issueKey !== undefined &&
+      [...this.agentExecutions.values()].some(
+        (execution) =>
+          execution.id !== input.executionId &&
+          executionStillOwnsWork(execution) &&
+          linearIssueExecutionKey(execution.projectId, execution.triggerContext) === issueKey,
+      )
+    ) {
+      const deferredUntil = new Date(startedAt.getTime() + ISSUE_EXECUTION_RETRY_MS);
+      this.workflowWakeups.set(run.id, {
+        triggerRunId: run.id,
+        availableAt: deferredUntil,
+        leaseExpiresAt: null,
+        leasedBeforeClaim: false,
+      });
+      return { stepRun: step, execution: undefined, created: false, deferredUntil };
     }
     // Reserve one meter unit before creating the execution, so a denied reservation creates
     // nothing — the in-memory single-threaded model gives the same atomicity the Postgres
@@ -583,17 +1125,10 @@ class MemoryDatabase implements Database {
 
   async completeWorkflowAgentExecution(input: WorkflowAgentCompletionInput) {
     const execution = this.readAgentExecution(input.executionId);
+    if (!matchesIdleTurnCompletionCondition(execution, input.idleTurnCondition))
+      return { execution, transitioned: false };
     if (execution.workflowStepRunId === null) {
-      return this.transitionAgentExecution(execution.id, input.executionStatus, {
-        result: input.result,
-        ...(input.completedByAgent === undefined
-          ? {}
-          : { completedByAgent: input.completedByAgent }),
-        ...(input.deadlineCondition === undefined
-          ? {}
-          : { deadlineCondition: input.deadlineCondition }),
-        ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
-      });
+      return this.transitionWorkflowExecution(input);
     }
     const step = this.workflowStepRuns.get(execution.workflowStepRunId);
     if (step === undefined)
@@ -631,22 +1166,24 @@ class MemoryDatabase implements Database {
 
     const transitioned =
       execution.status === "spawning" || execution.status === "running"
-        ? await this.transitionAgentExecution(execution.id, input.executionStatus, {
-            result: input.result,
-            ...(input.completedByAgent === undefined
-              ? {}
-              : { completedByAgent: input.completedByAgent }),
-            ...(input.deadlineCondition === undefined
-              ? {}
-              : { deadlineCondition: input.deadlineCondition }),
-            ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
-          })
+        ? await this.transitionWorkflowExecution(input)
         : { execution, transitioned: false };
     if (transitioned.transitioned || isTerminalAgentExecutionStatus(execution.status)) {
       this.finishWorkflowStep(step, run, input);
     }
     const terminalRun = this.triggerRuns.get(run.id);
     return transitionWithTerminalRun(transitioned, terminalRun);
+  }
+
+  private transitionWorkflowExecution(input: WorkflowAgentCompletionInput) {
+    return this.transitionAgentExecution(input.executionId, input.executionStatus, {
+      result: input.result,
+      ...(input.completedByAgent === undefined ? {} : { completedByAgent: input.completedByAgent }),
+      ...(input.deadlineCondition === undefined
+        ? {}
+        : { deadlineCondition: input.deadlineCondition }),
+      ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
+    });
   }
 
   private finishWorkflowStep(
@@ -1834,13 +2371,14 @@ class MemoryDatabase implements Database {
     }
     const activeAttempts = Object.values(execution.outputDeliveryAttempts).filter(
       (attempt) =>
+        isCurrentTurnAttempt(execution, attempt) &&
         attempt.outputType === outputType &&
         attempt.status === "pending" &&
         attempt.leaseExpiresAt > startedAt,
     ).length;
     if (
       maxOutputs !== undefined &&
-      (execution.outputEmissions[outputType] ?? 0) + activeAttempts >= maxOutputs
+      (currentTurnOutputEmissions(execution)[outputType] ?? 0) + activeAttempts >= maxOutputs
     ) {
       return undefined;
     }
@@ -1851,6 +2389,9 @@ class MemoryDatabase implements Database {
       startedAt,
       leaseExpiresAt: new Date(startedAt.getTime() + OUTPUT_ATTEMPT_LEASE_MS),
       completedAt: null,
+      ...(execution.hubActionAcknowledgements.turn === undefined
+        ? {}
+        : { turnId: execution.hubActionAcknowledgements.turn.id }),
     };
     this.agentExecutions.set(executionId, {
       ...execution,
@@ -1865,23 +2406,73 @@ class MemoryDatabase implements Database {
   async beginAgentExecutionTurn(
     executionId: string,
     startedAt: Date,
+    inputId?: string,
+    context?: { triggerContext: unknown; outputContext: unknown },
   ): Promise<AgentExecutionRecord | undefined> {
     const execution = this.agentExecutions.get(executionId);
     if (execution === undefined) return undefined;
     if (execution.status !== "spawning" && execution.status !== "running") return undefined;
     const updated: AgentExecutionRecord = {
       ...execution,
-      outputEmissions: {},
-      // Pending attempts belong to the turn that just ended; leaving them would count against the
-      // new turn's allowance and, if one had failed, condemn a turn that has not started.
-      outputDeliveryAttempts: Object.fromEntries(
-        Object.entries(execution.outputDeliveryAttempts).filter(
-          ([, attempt]) => attempt.status === "pending" && attempt.leaseExpiresAt > startedAt,
-        ),
-      ),
+      ...(context === undefined
+        ? {}
+        : {
+            triggerContext: context.triggerContext,
+            outputContext: nextTurnOutputContext(execution.outputContext, context.outputContext),
+          }),
+      idleDeadlineAt: null,
+      hubActionAcknowledgements: {
+        ...execution.hubActionAcknowledgements,
+        terminalAt: null,
+        idleAt: null,
+        finishExecutionCall: null,
+        turn: { id: randomUUID(), startedAt },
+        ...(inputId === undefined
+          ? {}
+          : {
+              inputDeliveries: {
+                ...execution.hubActionAcknowledgements.inputDeliveries,
+                [inputId]: "pending" as const,
+              },
+            }),
+      },
     };
     this.agentExecutions.set(executionId, updated);
     return updated;
+  }
+
+  async recordAgentExecutionInputDelivery(
+    executionId: string,
+    inputId: string,
+    delivered: boolean,
+  ): Promise<void> {
+    const execution = this.agentExecutions.get(executionId);
+    if (execution === undefined) throw new Error("agent execution not found");
+    const inputDeliveries = { ...execution.hubActionAcknowledgements.inputDeliveries };
+    if (delivered) inputDeliveries[inputId] = "delivered";
+    else delete inputDeliveries[inputId];
+    this.agentExecutions.set(executionId, {
+      ...execution,
+      hubActionAcknowledgements: { ...execution.hubActionAcknowledgements, inputDeliveries },
+    });
+  }
+
+  async findAgentExecutionInputDelivery(
+    projectId: string,
+    inputId: string,
+    initialTurnKey?: string,
+  ): Promise<{ executionId: string; status: "pending" | "delivered" } | undefined> {
+    for (const execution of this.agentExecutions.values()) {
+      if (execution.projectId !== projectId) continue;
+      if (
+        initialTurnKey !== undefined &&
+        linearDispatchKey(execution.outputContext) === initialTurnKey
+      )
+        return { executionId: execution.id, status: "delivered" };
+      const status = execution.hubActionAcknowledgements.inputDeliveries?.[inputId];
+      if (status !== undefined) return { executionId: execution.id, status };
+    }
+    return undefined;
   }
 
   async completeAgentExecutionOutput(
@@ -2038,7 +2629,11 @@ class MemoryDatabase implements Database {
     const execution = this.agentExecutions.get(executionId);
     if (execution === undefined) return undefined;
     const current = execution.hubActionAcknowledgements;
+    if (current.turn !== undefined && acknowledgement.observedAt < current.turn.startedAt)
+      return execution;
+    if (!acknowledgementMatchesTurn(acknowledgement, current)) return undefined;
     const updatedAcknowledgements: AgentExecutionHubAcknowledgements = {
+      ...current,
       terminalAt: current.terminalAt,
       idleAt: current.idleAt,
       finishExecutionCall: current.finishExecutionCall,
@@ -3384,6 +3979,17 @@ class MemoryDatabase implements Database {
 
 function emptyHubActionAcknowledgements(): AgentExecutionHubAcknowledgements {
   return { terminalAt: null, idleAt: null, finishExecutionCall: null };
+}
+
+function acknowledgementMatchesTurn(
+  acknowledgement: AgentExecutionHubAcknowledgementInput,
+  current: AgentExecutionHubAcknowledgements,
+): boolean {
+  return (
+    acknowledgement.kind !== "finish_execution" ||
+    acknowledgement.expectedTurnId === undefined ||
+    acknowledgement.expectedTurnId === (current.turn?.id ?? null)
+  );
 }
 
 function connectionPersistenceUnavailable(): never {

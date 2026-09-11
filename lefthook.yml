@@ -8,6 +8,9 @@ pre-commit:
       run: npm run format:check:files -- {staged_files}
     - name: lint
       glob: "*.{js,jsx,ts,tsx}"
-      run: npm run lint -- {staged_files}
+      # This script owns the Node/Start file sets and their different tsconfigs.
+      # Extra paths reach lint:start only and incorrectly type-check E2E fixtures
+      # with Start's compiler options. Run the same complete lint check as CI.
+      run: npm run lint
     - name: typecheck
       run: npm run typecheck

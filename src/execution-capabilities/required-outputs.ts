@@ -8,6 +8,8 @@ export const OUTPUT_DELIVERY_FAILED_REASON = "output_delivery_failed";
 export interface OutputEmissionState {
   outputEmissions: AgentExecutionRecord["outputEmissions"];
   launchIntent: Pick<LaunchMachineIntent, "allowOutputs"> | null;
+  outputDeliveryAttempts?: AgentExecutionRecord["outputDeliveryAttempts"];
+  hubActionAcknowledgements?: Pick<AgentExecutionRecord["hubActionAcknowledgements"], "turn">;
 }
 
 export interface OutputDeliveryState extends OutputEmissionState {
@@ -19,6 +21,28 @@ export interface RequiredOutputDeliveryFailure {
   failedAttempts: number;
 }
 
+/** Completion and limits apply to the latest input; accounting retains all delivered outputs. */
+export function currentTurnOutputEmissions(
+  execution: OutputEmissionState,
+): Readonly<Record<string, number>> {
+  const turn = execution.hubActionAcknowledgements?.turn;
+  if (turn === undefined) return execution.outputEmissions;
+  const emissions: Record<string, number> = {};
+  for (const attempt of Object.values(execution.outputDeliveryAttempts ?? {})) {
+    if (attempt.turnId === turn.id && attempt.status === "succeeded") {
+      emissions[attempt.outputType] = (emissions[attempt.outputType] ?? 0) + 1;
+    }
+  }
+  return emissions;
+}
+
+export function isCurrentTurnAttempt(
+  execution: OutputEmissionState,
+  attempt: AgentExecutionRecord["outputDeliveryAttempts"][string],
+): boolean {
+  return attempt.turnId === execution.hubActionAcknowledgements?.turn?.id;
+}
+
 /**
  * The `required: true` outputs the execution has not delivered yet. Delivery
  * means a completed attempt: `outputEmissions` only counts attempts that
@@ -28,9 +52,10 @@ export interface RequiredOutputDeliveryFailure {
  * not complete an execution that `finish_execution` would have refused.
  */
 export function missingRequiredOutputs(execution: OutputEmissionState): readonly AllowedOutput[] {
+  const emissions = currentTurnOutputEmissions(execution);
   return (execution.launchIntent?.allowOutputs ?? [])
     .filter((output) => output.required === true)
-    .filter((output) => (execution.outputEmissions[output.type] ?? 0) < 1);
+    .filter((output) => (emissions[output.type] ?? 0) < 1);
 }
 
 /**
@@ -45,7 +70,10 @@ export function failedRequiredOutputDeliveries(
 ): readonly RequiredOutputDeliveryFailure[] {
   return missingRequiredOutputs(execution).flatMap((output) => {
     const failedAttempts = Object.values(execution.outputDeliveryAttempts).filter(
-      (attempt) => attempt.outputType === output.type && attempt.status === "failed",
+      (attempt) =>
+        isCurrentTurnAttempt(execution, attempt) &&
+        attempt.outputType === output.type &&
+        attempt.status === "failed",
     ).length;
     return failedAttempts === 0 ? [] : [{ type: output.type, failedAttempts }];
   });

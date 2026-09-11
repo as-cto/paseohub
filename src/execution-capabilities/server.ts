@@ -274,12 +274,34 @@ async function executeOutputCall(
   output: MaterializedOutputCapability,
   args: Record<string, unknown>,
 ) {
-  const attempt = await options.database.beginAgentExecutionOutput(
-    execution.id,
-    output.declaration.type,
-    output.declaration.max,
-    options.now?.() ?? new Date(),
+  // Bind context and attempt to one input under the same lock as prompt delivery.
+  const reservation = await options.database.withAdvisoryLock(
+    `execution.prompt:${execution.id}`,
+    async () => {
+      const current = await options.database.findAgentExecutionById(execution.id);
+      if (
+        current === undefined ||
+        current.hubActionAcknowledgements.turn?.id !== execution.hubActionAcknowledgements.turn?.id
+      )
+        return undefined;
+      const attempt = await options.database.beginAgentExecutionOutput(
+        current.id,
+        output.declaration.type,
+        output.declaration.max,
+        options.now?.() ?? new Date(),
+      );
+      return {
+        attempt,
+        outputContext: structuredClone(current.outputContext),
+        triggerContext: structuredClone(current.triggerContext),
+      };
+    },
   );
+  if (reservation === undefined)
+    return toolFailure(
+      "A newer input arrived before this reply was reserved. Review the latest input before replying.",
+    );
+  const { attempt } = reservation;
   if (attempt === undefined) {
     reportFailure(
       new Error("execution output limit reached"),
@@ -293,18 +315,21 @@ async function executeOutputCall(
     return toolFailure(`Output limit reached for ${output.declaration.type}`);
   }
   try {
-    await options.outputs.execute({
+    const result = await options.outputs.execute({
       agentExecutionId: execution.id,
       attemptId: attempt.id,
       toolType: output.declaration.type,
       args,
-      outputContext: execution.outputContext,
+      outputContext: reservation.outputContext,
+      triggerContext: reservation.triggerContext,
     });
-    const recorded = await options.database.completeAgentExecutionOutput(
-      execution.id,
-      attempt.id,
-      options.now?.() ?? new Date(),
-    );
+    const recorded =
+      result?.deliveryAcknowledged === true ||
+      (await options.database.completeAgentExecutionOutput(
+        execution.id,
+        attempt.id,
+        options.now?.() ?? new Date(),
+      ));
     if (recorded === undefined) throw new Error("output emission could not be recorded");
     return toolSuccess("Output sent");
   } catch (error) {

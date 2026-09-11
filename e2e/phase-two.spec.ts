@@ -1,6 +1,9 @@
 import { test } from "./app.js";
 
 test.describe.configure({ timeout: 120_000 });
+const sourceDaemonTest = test.extend({
+  sourceDaemonMode: "registration",
+});
 
 const alice = {
   name: "Alice",
@@ -26,25 +29,28 @@ const dana = {
   password: "dana-phase-two-password",
 };
 
-test("approves CLI access, then enrolls and manages a Paseo daemon", async ({ hub }) => {
-  await hub.signUpAs("alice", alice);
-  await hub.createOrganization("alice", "Acme");
+sourceDaemonTest(
+  "approves CLI access, then enrolls and manages a Paseo daemon",
+  async ({ hub }) => {
+    await hub.signUpAs("alice", alice);
+    await hub.createOrganization("alice", "Acme");
 
-  await test.step("approve, deny, and expire CLI login requests", async () => {
-    await hub.approveCliLogin("alice");
-    await hub.denyCliLogin("alice");
-    await hub.expireCliLogin("alice");
-  });
+    await test.step("approve, deny, and expire CLI login requests", async () => {
+      await hub.approveCliLogin("alice");
+      await hub.denyCliLogin("alice");
+      await hub.expireCliLogin("alice");
+    });
 
-  await test.step("enroll, rename, and revoke a daemon", async () => {
-    await hub.startDaemonRegistration("alice");
-    const daemonId = await hub.approveDaemon("alice", "Build Studio");
-    await hub.expectDaemon("alice", "build-studio", daemonId, "Connected");
-    await hub.proveDaemonAccessBoundaries("alice", "bob", bob, "build-studio");
-    await hub.renameDaemon("alice", "build-studio", "release-studio");
-    await hub.revokeDaemon("alice", "release-studio");
-  });
-});
+    await test.step("enroll, rename, and revoke a daemon", async () => {
+      await hub.startDaemonRegistration("alice");
+      const daemonId = await hub.approveDaemon("alice", "Build Studio");
+      await hub.expectDaemon("alice", "build-studio", daemonId, "Connected");
+      await hub.proveDaemonAccessBoundaries("alice", "bob", bob, "build-studio");
+      await hub.renameDaemon("alice", "build-studio", "release-studio");
+      await hub.revokeDaemon("alice", "release-studio");
+    });
+  },
+);
 
 test("keeps daemon browser state inside the current identity", async ({ hub }) => {
   await hub.signUpAs("alice", alice);

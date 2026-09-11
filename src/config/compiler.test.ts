@@ -56,6 +56,42 @@ function legacyCompiledConfiguration(compiled: CompiledHubConfig): unknown {
 }
 
 describe("workflow compiler", () => {
+  it("requires an explicit scoped policy before enabling Linear finalization", () => {
+    const policy = {
+      team_id: "team",
+      review_state_id: "review",
+      completed_state_id: "done",
+      allowed_assignee_ids: ["human"],
+    };
+    const filters = {
+      connection: "linear",
+      team: "team",
+      from_users: ["human"],
+      require_delegate: true,
+      publish_issue_comment: true,
+      finalize_issue: policy,
+    };
+    const build = (changes: Record<string, unknown> = {}) =>
+      configuration({
+        triggers: [
+          {
+            ...configuration().triggers[0]!,
+            on: "linear.agent_session",
+            filters: { ...filters, ...changes },
+          },
+        ],
+      });
+    assert.deepEqual(compileHubConfig(build()).triggers[0]!.filters?.finalize_issue, policy);
+    for (const changes of [
+      { require_delegate: false },
+      { publish_issue_comment: false },
+      { team: "another-team" },
+      { finalize_issue: { ...policy, review_state_id: "done" } },
+    ]) {
+      assert.throws(() => compileHubConfig(build(changes)), /finalize_issue/);
+    }
+  });
+
   it.each([
     "paseo.event.github.delivery_id",
     "paseo.prompt",
@@ -366,6 +402,45 @@ describe("workflow compiler", () => {
       /filters\.project or filters\.team/iu,
     );
   });
+  it("requires an explicit team, connection, and human allowlist for automated Linear sessions", () => {
+    const raw = configuration();
+    const trigger = raw.triggers[0]!;
+    const filters = {
+      team: "linear-team-id",
+      connection: "acme-linear",
+      from_users: ["operator"],
+      allow_automated_sessions: true,
+    };
+    const compile = (on: string, filter: Record<string, unknown>) =>
+      compileHubConfig({ ...raw, triggers: [{ ...trigger, on, filters: filter }] });
+    const compiled = compile("linear.agent_session", filters);
+    assert.equal(compiled.triggers[0]?.filters?.allow_automated_sessions, true);
+    assert.deepEqual(parseCompiledHubConfig(compiled), compiled);
+
+    for (const missing of ["team", "connection"]) {
+      const incomplete: Record<string, unknown> = { ...filters };
+      delete incomplete[missing];
+      assert.throws(
+        () => compile("linear.agent_session", incomplete),
+        /requires filters\.team and filters\.connection/iu,
+      );
+    }
+    for (const from_users of [undefined, []]) {
+      assert.throws(
+        () => compile("linear.agent_session", { ...filters, from_users }),
+        /requires a non-empty filters\.from_users/iu,
+      );
+    }
+    for (const on of ["linear.comment_created", "linear.issue_entered_scope", "manual.run"]) {
+      for (const allow_automated_sessions of [true, false]) {
+        assert.throws(
+          () => compile(on, { ...filters, allow_automated_sessions }),
+          /allow_automated_sessions is only supported for linear\.agent_session/iu,
+        );
+      }
+    }
+  });
+
   it("requires explicit repositories for non-GitHub authority", () => {
     const raw = configuration();
     const step = raw.triggers[0]!.steps[0]!;

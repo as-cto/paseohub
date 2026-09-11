@@ -80,6 +80,7 @@ test("an operator caps seats, a blocked invite explains itself, and the audit tr
 
 test.describe("metered usage", () => {
   test.describe.configure({ timeout: 180_000 });
+  test.use({ sourceDaemonMode: "execution-fixture" });
 
   test("caps executions per month, denies the second run, and shows usage on the page", async ({
     hub,
@@ -92,8 +93,8 @@ test.describe("metered usage", () => {
     await test.step("sign up, create an organization, register a daemon, become an operator", async () => {
       await hub.signUpAs("owner", meterOwner);
       await hub.createOrganization("owner", "Acme");
-      await hub.startDaemonRegistration("owner");
-      const daemonId = await hub.approveDaemon("owner", "Slice Three Runner");
+      await hub.startDaemonRegistration("owner", { deterministicExecution: true });
+      const daemonId = await hub.approveDaemon("owner", "Slice Three Runner", ["hub.execute"]);
       await hub.setDaemonSlug(daemonId, "slice-three-runner");
       await hub.grantOperator("owner");
     });
@@ -110,8 +111,8 @@ test.describe("metered usage", () => {
       await triggers.configureManual({
         name: "deploy",
         daemon: "slice-three-runner",
-        cwd: "/workspace",
-        agent: "opencode",
+        cwd: hub.sourceDaemonWorkingDirectory(),
+        agent: "hub-e2e",
         prompt: "${{ paseo.prompt }}",
       });
       await triggers.save("deploy");
@@ -121,7 +122,7 @@ test.describe("metered usage", () => {
 
     await test.step("run one execution: allowed", async () => {
       const first = await hub.runManualInput({
-        rawInput: "run it",
+        rawInput: "daemon-restart",
         deliveryKey: "slice-3-run-1",
         apiKey: runApiKey,
       });

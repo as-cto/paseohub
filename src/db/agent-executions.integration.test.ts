@@ -9,12 +9,13 @@ import {
   compiledConfigurationHash,
   type CompiledHubConfig,
 } from "../config/compiler.js";
-import type { AgentExecutionRecord, Database } from "./types.js";
+import type { AgentExecutionRecord, Database, WorkflowStepExecutionInput } from "./types.js";
 import { completesAtIdleDeadline } from "./idle-completion.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import {
   OUTPUT_DELIVERY_FAILED_REASON,
   failedRequiredOutputDeliveries,
+  currentTurnOutputEmissions,
 } from "../execution-capabilities/required-outputs.js";
 import type { DurableProviderEvent } from "../db/types.js";
 import type { RejectedTriggerProviderMatch, TriggerProviderMatch } from "../triggers/index.js";
@@ -1488,7 +1489,254 @@ describe("agent execution PostgreSQL repository", () => {
       await fixture.database.close();
     }
   });
+
+  it("persists current-turn delivery identity across reconnects without erasing lifetime replies", async () => {
+    const fixture = await executionFixture(postgres);
+    const { database, execution } = fixture;
+    try {
+      const initial = await database.beginAgentExecutionOutput(
+        execution.id,
+        "linear.reply",
+        1,
+        new Date(),
+      );
+      assert.ok(initial);
+      await database.completeAgentExecutionOutput(execution.id, initial.id, new Date());
+      await database.recordAgentExecutionHubAcknowledgement(execution.id, {
+        kind: "finish_execution",
+        status: "completed",
+        observedAt: new Date(),
+      });
+      const opened = await database.beginAgentExecutionTurn(execution.id, new Date(), "activity-1");
+      assert.ok(opened?.hubActionAcknowledgements.turn);
+      assert.deepEqual(
+        await database.findAgentExecutionInputDelivery(execution.projectId, "activity-1"),
+        {
+          executionId: execution.id,
+          status: "pending",
+        },
+      );
+      await database.recordAgentExecutionInputDelivery(execution.id, "activity-1", true);
+      assert.equal(opened.hubActionAcknowledgements.finishExecutionCall, null);
+      assert.deepEqual(opened.outputEmissions, { "linear.reply": 1 });
+      assert.deepEqual(currentTurnOutputEmissions(opened), {});
+      assert.equal(
+        await database.recordAgentExecutionHubAcknowledgement(execution.id, {
+          kind: "finish_execution",
+          status: "completed",
+          observedAt: new Date(),
+          expectedTurnId: null,
+        }),
+        undefined,
+      );
+      const reply = await database.beginAgentExecutionOutput(
+        execution.id,
+        "linear.reply",
+        1,
+        new Date(),
+      );
+      assert.ok(reply);
+      assert.equal(reply.turnId, opened.hubActionAcknowledgements.turn.id);
+      await database.completeAgentExecutionOutput(execution.id, reply.id, new Date());
+      const reconnected = await createDatabase(fixture.databaseUrl);
+      try {
+        const persisted = await reconnected.findAgentExecutionById(execution.id);
+        assert.ok(persisted);
+        assert.deepEqual(
+          await reconnected.findAgentExecutionInputDelivery(execution.projectId, "activity-1"),
+          {
+            executionId: execution.id,
+            status: "delivered",
+          },
+        );
+        assert.equal(
+          await reconnected.findAgentExecutionInputDelivery(randomUUID(), "activity-1"),
+          undefined,
+        );
+        assert.deepEqual(persisted.outputEmissions, { "linear.reply": 2 });
+        assert.deepEqual(currentTurnOutputEmissions(persisted), { "linear.reply": 1 });
+        assert.equal(
+          persisted.outputDeliveryAttempts[reply.id]?.turnId,
+          opened.hubActionAcknowledgements.turn.id,
+        );
+        assert.equal(
+          await reconnected.beginAgentExecutionOutput(execution.id, "linear.reply", 1, new Date()),
+          undefined,
+        );
+        const finished = await reconnected.recordAgentExecutionHubAcknowledgement(execution.id, {
+          kind: "finish_execution",
+          status: "completed",
+          observedAt: new Date(),
+          expectedTurnId: opened.hubActionAcknowledgements.turn.id,
+        });
+        assert.equal(finished?.hubActionAcknowledgements.finishExecutionCall?.status, "completed");
+        assert.equal(
+          finished?.hubActionAcknowledgements.inputDeliveries?.["activity-1"],
+          "delivered",
+        );
+        await reconnected.beginAgentExecutionTurn(execution.id, new Date(), "activity-2");
+        await reconnected.recordAgentExecutionInputDelivery(execution.id, "activity-2", false);
+        assert.equal(
+          await reconnected.findAgentExecutionInputDelivery(execution.projectId, "activity-2"),
+          undefined,
+        );
+        assert.equal(
+          (await reconnected.findAgentExecutionInputDelivery(execution.projectId, "activity-1"))
+            ?.status,
+          "delivered",
+        );
+      } finally {
+        await reconnected.close();
+      }
+    } finally {
+      await database.close();
+    }
+  });
+
+  it("persists verified webhook admission, retry scheduling and deduplication across reconnects", async () => {
+    const fixture = await executionFixture(postgres);
+    const other = await createDatabase(fixture.databaseUrl);
+    const input = {
+      applicationId: "app",
+      configurationVersion: 7,
+      deliveryId: randomUUID(),
+      signatureHash: randomUUID(),
+      eventName: "AgentSessionEvent",
+      payload: { organizationId: "external-org", agentSession: { id: "session" } },
+      receivedAt: new Date(),
+    };
+    try {
+      const admissions = await Promise.all([
+        fixture.database.admitLinearWebhook(input),
+        other.admitLinearWebhook(input),
+      ]);
+      assert.equal(admissions[0].id, admissions[1].id);
+      assert.equal(
+        (await other.admitLinearWebhook({ ...input, deliveryId: randomUUID() })).id,
+        admissions[0].id,
+      );
+      const due = new Date(Date.now() + 1000);
+      assert.equal((await other.listPendingLinearWebhooks("unrelated-app", due, 10)).length, 0);
+      const [pending] = await other.listPendingLinearWebhooks("app", due, 10);
+      assert.ok(pending);
+      assert.deepEqual(pending.payload, input.payload);
+      assert.equal(pending.configurationVersion, 7);
+      const retryAt = new Date(due.getTime() + 60_000);
+      await other.settleLinearWebhook(pending.id, { retryAt, error: "provider unavailable" });
+      const reconnected = await createDatabase(fixture.databaseUrl);
+      try {
+        assert.equal((await reconnected.listPendingLinearWebhooks("app", due, 10)).length, 0);
+        const [recovered] = await reconnected.listPendingLinearWebhooks("app", retryAt, 10);
+        assert.equal(recovered?.id, pending.id);
+        assert.equal(recovered?.attempts, 1);
+        assert.equal(recovered?.lastError, "provider unavailable");
+        await reconnected.settleLinearWebhook(pending.id, { completedAt: retryAt });
+        assert.equal((await reconnected.listPendingLinearWebhooks("app", retryAt, 10)).length, 0);
+        assert.equal(
+          (await reconnected.admitLinearWebhook(input)).completedAt?.getTime(),
+          retryAt.getTime(),
+        );
+      } finally {
+        await reconnected.close();
+      }
+    } finally {
+      await other.close();
+      await fixture.database.close();
+    }
+  });
+
+  it("serializes same-issue execution claims across PostgreSQL connections and restart", async () => {
+    const fixture = await executionFixture(postgres);
+    const contender = await createDatabase(fixture.databaseUrl);
+    try {
+      const first = await linearExecutionInput(fixture.database, fixture.execution);
+      const second = await linearExecutionInput(fixture.database, fixture.execution);
+      const claims = await Promise.all([
+        fixture.database.createWorkflowStepExecution(first),
+        contender.createWorkflowStepExecution(second),
+      ]);
+      assert.equal(claims.filter((claim) => claim.created).length, 1);
+      assert.equal(claims.filter((claim) => claim.deferredUntil !== undefined).length, 1);
+      const active = claims.find((claim) => claim.created)!.execution!;
+      const waiting = claims[0].created ? second : first;
+      const recovered = await createDatabase(fixture.databaseUrl);
+      try {
+        assert.ok((await recovered.createWorkflowStepExecution(waiting)).deferredUntil);
+        await recovered.transitionAgentExecution(active.id, "succeeded", {
+          hubAction: "interrupt",
+        });
+        assert.ok((await recovered.createWorkflowStepExecution(waiting)).deferredUntil);
+        await recovered.completeHubAction(active.id, "interrupt");
+        assert.equal((await recovered.createWorkflowStepExecution(waiting)).created, true);
+      } finally {
+        await recovered.close();
+      }
+    } finally {
+      await contender.close();
+      await fixture.database.close();
+    }
+  });
 });
+
+async function linearExecutionInput(
+  database: Database,
+  anchor: AgentExecutionRecord,
+): Promise<WorkflowStepExecutionInput> {
+  const now = new Date();
+  const receipt = await database.persistManualEvent({
+    organizationId: anchor.organizationId,
+    projectId: anchor.projectId,
+    source: "manual.run",
+    deliveryId: randomUUID(),
+    payload: {},
+    receivedAt: now,
+  });
+  assert.equal(receipt.status, "accepted");
+  if (receipt.status !== "accepted") throw new Error("receipt unavailable");
+  const triggerContext = {
+    provider: "linear",
+    event: {
+      linear: {
+        connection_id: "linear-connection",
+        organization: { id: "linear-org" },
+        issue: { id: "linear-issue" },
+      },
+    },
+  };
+  const run = (
+    await database.createAcceptedTriggerRun({
+      organizationId: anchor.organizationId,
+      projectId: anchor.projectId,
+      configurationRevisionId: anchor.configurationRevisionId,
+      providerEventReceiptId: receipt.event.providerEventReceiptId,
+      configuredTriggerName: "linear-session",
+      prompt: "Apply feedback",
+      inputs: {},
+      triggerContext,
+      outputContext: {},
+      deadlineAt: new Date(now.getTime() + 60_000),
+      stepIds: ["work"],
+      createdAt: now,
+    })
+  ).run;
+  return {
+    triggerRunId: run.id,
+    stepId: "work",
+    ordinal: 0,
+    executionId: randomUUID(),
+    execution: {
+      organizationId: anchor.organizationId,
+      projectId: anchor.projectId,
+      configurationRevisionId: anchor.configurationRevisionId,
+      triggerContext,
+      outputContext: {},
+      machineId: null,
+      startedAt: now,
+      deadlineAt: run.deadlineAt,
+      idleDeadlineAt: new Date(now.getTime() + 30_000),
+    },
+  };
+}
 
 /**
  * A one-step workflow whose execution idles out at 12:00:05, persisted through the

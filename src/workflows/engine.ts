@@ -1,4 +1,9 @@
 import { DatabaseUnavailableError } from "../db/errors.js";
+import { retireCompletedLinearIssueExecutions } from "../db/linear-issue-serialization.js";
+import {
+  claimWorkspacePlacementForIntent,
+  WorkspacePlacementConflictError,
+} from "../db/workspace-placements.js";
 import type {
   AgentExecutionRecord,
   Database,
@@ -47,6 +52,7 @@ import type { Logger } from "pino";
 
 const DEFAULT_WAKEUP_LEASE_MS = 30_000;
 const DEFAULT_WORKER_INTERVAL_MS = 250;
+const CONTINUED_RUN_REASON = "continued_existing_execution";
 
 type AcceptedWorkflowRun = Extract<
   Awaited<ReturnType<Database["findTriggerRunById"]>>,
@@ -245,34 +251,9 @@ export class DurableWorkflowEngine {
     if (prepared === undefined) return;
     const { run, configuration, trigger, steps, next, step, context, recoverPreHandoffDispatch } =
       prepared;
-    let shouldRun = true;
-    try {
-      shouldRun =
-        step.condition === undefined || truthy(evaluateExpression(step.condition, context));
-    } catch (error) {
-      const reason =
-        error instanceof Error ? error.message : "workflow_condition_evaluation_failed";
-      this.report(error, "workflow.condition.evaluate", { triggerRunId: run.id, stepId: step.id });
-      const failed = await database.failWorkflowRun(run.id, "failed", reason, step.id);
-      if (failed?.transitioned === true) await this.notifyWorkflowRunTerminal(failed.run);
-      return;
-    }
-    try {
-      const composedValues = composeValuesIfAvailable(trigger.values, context);
-      if (composedValues !== undefined) {
-        await database.updateTriggerRunValues(run.id, composedValues);
-      }
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : "workflow_value_evaluation_failed";
-      this.report(error, "workflow.values.evaluate", { triggerRunId: run.id, stepId: step.id });
-      const failed = await database.failWorkflowRun(run.id, "failed", reason, step.id);
-      if (failed?.transitioned === true) await this.notifyWorkflowRunTerminal(failed.run);
-      return;
-    }
-    if (!shouldRun) {
-      await database.markWorkflowStepSkipped(run.id, step.id, "condition_false");
-      return;
-    }
+    if (!(await this.shouldRunWorkflowStep(database, prepared))) return;
+    if (await this.continuePendingRun(database, prepared)) return;
+    await this.retireCompletedIssueExecutions(database, run);
     const startedAt = this.now();
     const deadlineAt = new Date(
       Math.min(run.deadlineAt.getTime(), startedAt.getTime() + step.maxRuntimeMs),
@@ -296,6 +277,8 @@ export class DurableWorkflowEngine {
     if (preparedIntent === undefined) return;
     const { executionId, intent } = preparedIntent;
     if (await this.failInvalidLaunchIntent(database, run, step, intent)) return;
+    if (await this.failConflictingWorkspacePlacement(database, run, step.id, intent, executionId))
+      return;
     const reservation = await this.reserveExecution(run.organizationId);
     const created = await database.createWorkflowStepExecution({
       triggerRunId: run.id,
@@ -321,7 +304,7 @@ export class DurableWorkflowEngine {
     });
     if (await this.failDeniedReservation(database, run, step, created.reservationDenied)) return;
     if (created.execution === undefined) {
-      await database.deleteWorkflowWakeup(run.id);
+      await this.releaseEmptyWorkflowWakeup(database, run.id, created.deferredUntil);
       return;
     }
     await this.linkWorkflowStepAndNotifyStart(
@@ -350,6 +333,85 @@ export class DurableWorkflowEngine {
     await database.deleteWorkflowWakeup(run.id);
   }
 
+  private async shouldRunWorkflowStep(
+    database: Database,
+    { run, trigger, step, context }: PreparedWorkflowWakeup,
+  ): Promise<boolean> {
+    let shouldRun = true;
+    try {
+      shouldRun =
+        step.condition === undefined || truthy(evaluateExpression(step.condition, context));
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "workflow_condition_evaluation_failed";
+      this.report(error, "workflow.condition.evaluate", { triggerRunId: run.id, stepId: step.id });
+      const failed = await database.failWorkflowRun(run.id, "failed", reason, step.id);
+      if (failed?.transitioned === true) await this.notifyWorkflowRunTerminal(failed.run);
+      return false;
+    }
+    try {
+      const composedValues = composeValuesIfAvailable(trigger.values, context);
+      if (composedValues !== undefined) {
+        await database.updateTriggerRunValues(run.id, composedValues);
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "workflow_value_evaluation_failed";
+      this.report(error, "workflow.values.evaluate", { triggerRunId: run.id, stepId: step.id });
+      const failed = await database.failWorkflowRun(run.id, "failed", reason, step.id);
+      if (failed?.transitioned === true) await this.notifyWorkflowRunTerminal(failed.run);
+      return false;
+    }
+    if (!shouldRun) {
+      await database.markWorkflowStepSkipped(run.id, step.id, "condition_false");
+      return false;
+    }
+    return true;
+  }
+
+  private async continuePendingRun(
+    database: Database,
+    { run, trigger, next, step }: PreparedWorkflowWakeup,
+  ): Promise<boolean> {
+    if (trigger.steps.length === 1 && next.agentExecutionId === null) {
+      const provider = providerForTriggerContext(this.options.providers ?? [], run.triggerContext);
+      if (
+        await provider?.continuePendingRun?.({
+          organizationId: run.organizationId,
+          projectId: run.projectId,
+          revisionId: run.configurationRevisionId,
+          trigger,
+          triggerContext: run.triggerContext,
+          outputContext: run.outputContext,
+          prompt: run.prompt,
+        })
+      ) {
+        // The input's durable ACK owns the work now. A retry after a crash deduplicates that
+        // same input before reaching here; this run must never create a second execution.
+        await database.markWorkflowStepSkipped(run.id, step.id, CONTINUED_RUN_REASON);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async failConflictingWorkspacePlacement(
+    database: Database,
+    run: AcceptedWorkflowRun,
+    stepId: string,
+    intent: LaunchMachineIntent,
+    executionId: string,
+  ): Promise<boolean> {
+    try {
+      await claimWorkspacePlacementForIntent(database, intent, executionId);
+      return false;
+    } catch (error) {
+      if (!(error instanceof WorkspacePlacementConflictError)) throw error;
+      const failed = await database.failWorkflowRun(run.id, "failed", error.message, stepId);
+      if (failed?.transitioned === true) await this.notifyWorkflowRunTerminal(failed.run);
+      return true;
+    }
+  }
+
   private async linkWorkflowStepAndNotifyStart(
     database: Database,
     triggerRunId: string,
@@ -362,6 +424,26 @@ export class DurableWorkflowEngine {
     if (steps.some((candidate) => candidate.startedAt !== null)) return;
     const started = await database.findTriggerRunById(triggerRunId);
     if (started?.outcome === "accepted") await this.deliverWorkflowRunStarted(started);
+  }
+
+  private async retireCompletedIssueExecutions(
+    database: Database,
+    run: AcceptedWorkflowRun,
+  ): Promise<void> {
+    for (const recovery of await retireCompletedLinearIssueExecutions(database, run, this.now())) {
+      // Use the same durable terminal reconciliation as successful idle-deadline completion:
+      // release watchers, send the stop, and retain issue ownership until its ACK is persisted.
+      await this.options.onWorkflowDeadlineExceeded?.(recovery);
+    }
+  }
+
+  private async releaseEmptyWorkflowWakeup(
+    database: Database,
+    runId: string,
+    deferredUntil?: Date,
+  ): Promise<void> {
+    // A blocked issue already has a durable future wakeup; only exhausted runs remove theirs.
+    if (deferredUntil === undefined) await database.deleteWorkflowWakeup(runId);
   }
 
   /**
@@ -516,6 +598,7 @@ export class DurableWorkflowEngine {
         executionId,
         provider?.keepsExecutionAliveBetweenTurns?.(run.triggerContext) === true,
         provider?.workKeyFor?.(run.triggerContext),
+        () => provider?.workspaceKeyFor?.(run.triggerContext),
       );
     } catch (error) {
       if (!(error instanceof ExpressionEvaluationError)) throw error;
@@ -738,7 +821,16 @@ export class DurableWorkflowEngine {
       );
       if (run === undefined) return;
       try {
-        const reactionState = await this.options.onWorkflowRunTerminal?.(run);
+        const steps = await database.listWorkflowStepRunsForTriggerRun(run.id);
+        const continued =
+          steps.length === 1 &&
+          steps[0]?.status === "skipped" &&
+          steps[0].failureReason === CONTINUED_RUN_REASON;
+        // Consuming an event through another live execution is not that agent's completion.
+        // Its own lifecycle will publish the result; this outbox row only acknowledges routing.
+        const reactionState = continued
+          ? terminalReactionState(run)
+          : await this.options.onWorkflowRunTerminal?.(run);
         const deliveredReactionState =
           reactionState === undefined ? terminalReactionState(run) : reactionState;
         await database.markWorkflowRunTerminalNotificationDelivered(
@@ -898,6 +990,7 @@ function buildStepIntent(
   executionId: string,
   keepAliveBetweenTurns = false,
   workKey?: string,
+  resolveWorkspaceKey?: () => string | undefined,
 ): LaunchMachineIntent {
   const environmentName = authorityString(
     renderExpressionTemplate(step.environment, context),
@@ -914,6 +1007,10 @@ function buildStepIntent(
     throw new Error(`workflow environment ${environmentName} is unavailable`);
   }
   const agent = materializeAgent(step.agent, context);
+  const workspaceKey =
+    environment.worktree?.mode === "branch-off" && environment.worktree.reuseWorkspace === true
+      ? resolveWorkspaceKey?.()
+      : undefined;
   return {
     ...buildLaunchMachineIntent({
       organizationId: run.organizationId,
@@ -929,7 +1026,14 @@ function buildStepIntent(
         ...(environment.worktree === undefined
           ? {}
           : {
-              worktree: materializeExecutionWorktree(environment.worktree, executionId, workKey),
+              worktree: materializeExecutionWorktree(
+                environment.worktree,
+                executionId,
+                workKey,
+                workspaceKey === undefined
+                  ? undefined
+                  : JSON.stringify([run.organizationId, workspaceKey]),
+              ),
             }),
       },
       ...(step.env === undefined ? {} : { env: step.env }),
@@ -1053,11 +1157,13 @@ function materializeExecutionWorktree(
   worktree: WorktreeTarget,
   executionId: string,
   workKey?: string,
+  workspaceKey?: string,
 ) {
   if (worktree.mode !== "branch-off") return worktree;
   return {
     ...worktree,
     newBranch: renderExecutionTemplate(worktree.newBranch, executionId, workKey),
+    ...(worktree.reuseWorkspace === true && workspaceKey !== undefined ? { workspaceKey } : {}),
   };
 }
 

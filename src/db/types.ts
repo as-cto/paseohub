@@ -1,3 +1,8 @@
+import type { LinearTriageIntakeStore } from "./linear-triage-intakes.js";
+import type { LinearIssueSessionBridgeStore } from "./linear-issue-session-bridges.js";
+import type { WorkspacePlacementStore } from "./workspace-placements.js";
+import type { LinearReplyDeliveryStore } from "./linear-replies.js";
+import type { LinearFinalizationStore } from "./linear-finalizations.js";
 import type { AgentExecutionStatus, MachineSource, MachineStatus } from "./schema.js";
 import type { JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
@@ -10,6 +15,24 @@ import type {
 } from "../entitlements/catalog.js";
 
 export type WorkflowDeadlineKind = "step_hard" | "step_idle" | "whole_run";
+
+export interface LinearWebhookAdmissionInput {
+  applicationId: string;
+  configurationVersion: number;
+  deliveryId: string;
+  signatureHash: string;
+  eventName: string | null;
+  payload: unknown;
+  receivedAt: Date;
+}
+
+export interface LinearWebhookInboxRecord extends LinearWebhookAdmissionInput {
+  id: string;
+  nextAttemptAt: Date;
+  attempts: number;
+  completedAt: Date | null;
+  lastError: string | null;
+}
 
 export interface ProviderEventReceiptRecord {
   id: string;
@@ -131,6 +154,8 @@ export interface AgentExecutionOutputAttempt {
   startedAt: Date;
   leaseExpiresAt: Date;
   completedAt: Date | null;
+  /** The input turn that owned this delivery; absent on the initial/legacy turn. */
+  turnId?: string;
 }
 
 export type HubAction = "interrupt" | "archive";
@@ -151,6 +176,10 @@ export interface AgentExecutionHubAcknowledgements {
   terminalAt: Date | null;
   idleAt: Date | null;
   finishExecutionCall: AgentExecutionHubFinishExecutionAcknowledgement | null;
+  /** Durable input boundary; output totals remain lifetime accounting. */
+  turn?: { id: string; startedAt: Date };
+  /** Provider input keys already handed off (or awaiting an unambiguous daemon acknowledgement). */
+  inputDeliveries?: Readonly<Record<string, "pending" | "delivered">>;
 }
 
 export type AgentExecutionHubAcknowledgementInput =
@@ -161,6 +190,8 @@ export type AgentExecutionHubAcknowledgementInput =
       callId?: string | null;
       status: AgentExecutionHubFinishExecutionStatus;
       observedAt: Date;
+      /** Reject a completion that started before a newer input turn was accepted. */
+      expectedTurnId?: string | null;
     };
 
 export interface DaemonRecord {
@@ -837,6 +868,8 @@ export interface WorkflowAgentCompletionInput {
   observedAt?: Date;
   completedByAgent?: boolean;
   deadlineCondition?: TransitionAgentExecutionFields["deadlineCondition"];
+  /** Complete only if this exact conversation turn still has confirmed idle completion. */
+  idleTurnCondition?: { turnId: string | null };
   hubAction?: HubAction | null;
 }
 
@@ -1141,7 +1174,28 @@ export interface TerminateMachineFields {
   reason: string;
 }
 
-export interface Database {
+export interface Database
+  extends
+    LinearReplyDeliveryStore,
+    LinearIssueSessionBridgeStore,
+    WorkspacePlacementStore,
+    LinearFinalizationStore,
+    LinearTriageIntakeStore {
+  claimLinearCommentBridge(
+    input: LinearCommentBridgeClaim,
+  ): Promise<{ bridge: LinearCommentBridgeRecord; claimed: boolean }>;
+  findLinearCommentBridge(
+    key: LinearCommentBridgeKey,
+  ): Promise<LinearCommentBridgeRecord | undefined>;
+  bindLinearCommentBridge(
+    key: LinearCommentBridgeKey,
+    sessionId: string,
+  ): Promise<LinearCommentBridgeRecord>;
+  startLinearCommentBridgeCreation(
+    key: LinearCommentBridgeKey,
+    leaseId: string,
+    now: Date,
+  ): Promise<boolean>;
   createAcceptedTriggerRun(
     input: CreateAcceptedTriggerRunInput,
   ): Promise<{ run: AcceptedTriggerRunRecord; created: boolean }>;
@@ -1182,6 +1236,8 @@ export interface Database {
     created: boolean;
     /** Present only when a reservation was requested and denied; no execution was created. */
     reservationDenied?: MeterReservationDenied;
+    /** Another execution still owns this issue; its pending wakeup is durably rescheduled. */
+    deferredUntil?: Date;
   }>;
   linkWorkflowStepRunExecution(
     stepRunId: string,
@@ -1234,6 +1290,17 @@ export interface Database {
   acceptDiscordEvent(input: AcceptDiscordEventInput): Promise<ProviderEventAcceptance>;
   acceptSlackEvent(input: AcceptSlackEventInput): Promise<ProviderEventAcceptance>;
   acceptLinearEvent(input: AcceptLinearEventInput): Promise<ProviderEventAcceptance>;
+  admitLinearWebhook(input: LinearWebhookAdmissionInput): Promise<LinearWebhookInboxRecord>;
+  listPendingLinearWebhooks(
+    applicationId: string,
+    now: Date,
+    limit: number,
+  ): Promise<LinearWebhookInboxRecord[]>;
+  findLinearWebhook(id: string): Promise<LinearWebhookInboxRecord | undefined>;
+  settleLinearWebhook(
+    id: string,
+    outcome: { completedAt: Date } | { retryAt: Date; error: string },
+  ): Promise<void>;
   persistManualEvent(input: PersistManualEventInput): Promise<ManualEventPersistence>;
   claimGitHubLifecycleReceipt(
     input: GitHubLifecycleReceiptClaimInput,
@@ -1350,17 +1417,28 @@ export interface Database {
     completedAt: Date,
   ): Promise<AgentExecutionRecord | undefined>;
   /**
-   * Opens a new turn on a live execution: its output counters go back to zero.
+   * Accepts new input on a live execution, invalidating the previous turn's completion.
    *
-   * A conversational execution outlives its turns, so the per-turn allowances declared by
-   * `allow_outputs` (`max: 3` for a Linear reply) have to be per turn as well — otherwise the
-   * fourth message of a session would find the agent unable to answer, having spent a budget
-   * meant for one exchange over the whole conversation.
+   * A conversational execution outlives its turns. Allowances and required outputs are per
+   * turn. Lifetime counters and delivery evidence
+   * are retained; attempts are stamped with the active turn when delivery starts.
    */
   beginAgentExecutionTurn(
     executionId: string,
     startedAt: Date,
+    inputId?: string,
+    context?: { triggerContext: unknown; outputContext: unknown },
   ): Promise<AgentExecutionRecord | undefined>;
+  recordAgentExecutionInputDelivery(
+    executionId: string,
+    inputId: string,
+    delivered: boolean,
+  ): Promise<void>;
+  findAgentExecutionInputDelivery(
+    projectId: string,
+    inputId: string,
+    initialTurnKey?: string,
+  ): Promise<{ executionId: string; status: "pending" | "delivered" } | undefined>;
   failAgentExecutionOutput(
     executionId: string,
     attemptId: string,
@@ -1593,4 +1671,32 @@ export interface Database {
   ): Promise<DiscordConnectionRecord | undefined>;
   removeDiscordConnection(guildId: string): Promise<void>;
   close(): Promise<void>;
+}
+
+/** One app-owned native session created for an authorized ordinary comment thread. */
+export interface LinearCommentBridgeKey {
+  organizationId: string;
+  projectId: string;
+  connectionId: string;
+  linearOrganizationId: string;
+  rootCommentId: string;
+}
+
+export interface LinearCommentBridgeRecord extends LinearCommentBridgeKey {
+  appUserId: string;
+  providerEventReceiptId: string;
+  sourceCommentId: string;
+  sourceActorId: string;
+  sourceBody: string;
+  sessionId: string | null;
+  creationStartedAt: Date | null;
+  leaseId: string;
+  leaseExpiresAt: Date;
+}
+
+export interface LinearCommentBridgeClaim extends Omit<
+  LinearCommentBridgeRecord,
+  "sessionId" | "creationStartedAt"
+> {
+  now: Date;
 }

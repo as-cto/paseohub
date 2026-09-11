@@ -20,6 +20,12 @@ import type {
 } from "../db/types.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { completesAtIdleDeadline } from "../db/idle-completion.js";
+import { linearDispatchKey } from "../db/linear-dispatch.js";
+import { reserveLinearNativeHandoff } from "../triggers/linear/native-handoff.js";
+import {
+  claimWorkspacePlacementForIntent,
+  WorkspacePlacementConflictError,
+} from "../db/workspace-placements.js";
 import { logger as defaultLogger } from "../logger.js";
 import { reportFailure } from "../failures/index.js";
 import type { TriggerProvider } from "../triggers/index.js";
@@ -28,6 +34,7 @@ import { OutputExecutorRegistry } from "../execution-capabilities/outputs.js";
 import {
   OUTPUT_DELIVERY_FAILED_REASON,
   failedRequiredOutputDeliveries,
+  missingRequiredOutputs,
   type RequiredOutputDeliveryFailure,
 } from "../execution-capabilities/required-outputs.js";
 import { executionToolPolicy } from "../execution-capabilities/tool-policy.js";
@@ -48,6 +55,8 @@ import {
   type DaemonConnection,
   type DaemonCreateAgentOptions,
   type DaemonEvent,
+  type DaemonExecutionPromptOptions,
+  type DaemonExecutionPromptResult,
 } from "./protocol.js";
 import type { JsonValue } from "../config/compiler.js";
 import { compileJsonSchema, formatJsonSchemaErrors } from "../workflows/json-schema.js";
@@ -139,12 +148,24 @@ export class DaemonSpawnAckTimeoutError extends Error {
   }
 }
 
+/** Replaying an unacknowledged prompt could run the user's change twice. Keep the receipt retryable. */
+export class DaemonPromptDeliveryUncertainError extends Error {
+  constructor(readonly executionId: string) {
+    super(
+      `daemon prompt delivery is uncertain for execution ${executionId}; reconcile the daemon before replaying this input`,
+    );
+    this.name = "DaemonPromptDeliveryUncertainError";
+  }
+}
+
 export class AgentExecutionCompletionFailure extends Error {
   constructor(
     readonly reason:
       | "not_found"
       | "unauthorized"
       | "expired"
+      | "required_outputs_missing"
+      | "turn_changed"
       | typeof OUTPUT_DELIVERY_FAILED_REASON,
   ) {
     super(`agent execution completion failed: ${reason}`);
@@ -176,6 +197,10 @@ export class DaemonDispatchLifecycle {
   >();
   private readonly deadlineTimersByExecution = new Map<string, () => void>();
   private readonly activeExecutionDispatches = new Map<string, Promise<unknown>>();
+  private readonly promptDeliveriesByExecution = new Map<
+    string,
+    Promise<DaemonExecutionPromptResult>
+  >();
   private readonly reconcilingHubActions = new Map<string, Promise<void>>();
   private readonly daemonRecoveries = new Set<Promise<void>>();
   private readonly recoveredSubscriptions = new Map<string, () => void>();
@@ -212,6 +237,7 @@ export class DaemonDispatchLifecycle {
       ...this.reconcilingHubActions.values(),
       ...this.pendingStreamHandlersByExecution.values(),
       ...this.activeExecutionDispatches.values(),
+      ...this.promptDeliveriesByExecution.values(),
     ]);
   }
 
@@ -438,6 +464,12 @@ export class DaemonDispatchLifecycle {
     }
 
     const executionId = durableId ?? randomUUID();
+    try {
+      await claimWorkspacePlacementForIntent(this.options.database, intent, executionId);
+    } catch (error) {
+      if (!(error instanceof WorkspacePlacementConflictError)) throw error;
+      throw new DaemonDispatchFailure("workspace_placement_conflict", { cause: error });
+    }
     const completionToken = this.completionToken(executionId);
     const deadlineAt =
       intent.deadlineAt ??
@@ -672,10 +704,29 @@ export class DaemonDispatchLifecycle {
         await this.refreshAgentIdleDeadline(executionId, observedAt);
         return;
       case "turn_completed":
-      case "turn_failed":
-      case "turn_canceled":
         await this.refreshAgentIdleDeadline(executionId, observedAt);
         return;
+      case "turn_failed":
+      case "turn_canceled": {
+        const current = await this.options.database.findAgentExecutionById(executionId);
+        const context = current?.outputContext;
+        if (
+          typeof context === "object" &&
+          context !== null &&
+          "provider" in context &&
+          context.provider === "linear" &&
+          "publishIssueComment" in context &&
+          context.publishIssueComment === true
+        ) {
+          await this.failAgentExecution(
+            executionId,
+            event.type === "turn_failed" ? "agent_turn_failed" : "agent_turn_canceled",
+          );
+        } else {
+          await this.refreshAgentIdleDeadline(executionId, observedAt);
+        }
+        return;
+      }
       case "permission_requested":
       case "permission_resolved":
       case "turn_started":
@@ -932,6 +983,14 @@ export class DaemonDispatchLifecycle {
       await this.failUndeliveredExecution(currentExecution, undelivered);
       throw new AgentExecutionCompletionFailure(OUTPUT_DELIVERY_FAILED_REASON);
     }
+    // The MCP handler's snapshot may precede a follow-up that arrived while stream events
+    // were draining. Recheck against the durable current turn before acknowledging completion.
+    if (
+      currentExecution.launchIntent?.keepAliveBetweenTurns === true &&
+      missingRequiredOutputs(currentExecution).length > 0
+    ) {
+      throw new AgentExecutionCompletionFailure("required_outputs_missing");
+    }
 
     if (currentExecution.launchIntent?.outputSchema !== undefined) {
       validateStructuredOutput(currentExecution.launchIntent.outputSchema, input.output);
@@ -986,16 +1045,20 @@ export class DaemonDispatchLifecycle {
     execution: AgentExecutionRecord,
   ): Promise<AgentExecutionRecord> {
     const observedAt = new Date(this.now());
-    const opened = await this.options.database.beginAgentExecutionTurn(execution.id, observedAt);
-    await this.options.database.recordAgentExecutionHubAcknowledgement(execution.id, {
-      kind: "finish_execution",
-      status: "completed",
-      observedAt,
-    });
+    const finished = await this.options.database.recordAgentExecutionHubAcknowledgement(
+      execution.id,
+      {
+        kind: "finish_execution",
+        status: "completed",
+        observedAt,
+        expectedTurnId: execution.hubActionAcknowledgements.turn?.id ?? null,
+      },
+    );
+    if (finished === undefined) throw new AgentExecutionCompletionFailure("turn_changed");
     // The idle deadline now measures silence between turns, not within one: the agent has
     // answered and is waiting for the user.
     await this.refreshAgentIdleDeadline(execution.id, observedAt);
-    return opened ?? execution;
+    return finished;
   }
 
   /**
@@ -1147,6 +1210,20 @@ export class DaemonDispatchLifecycle {
     const intent = current.launchIntent;
     if (intent === null || this.options.publicBaseUrl === undefined)
       throw new Error("execution launch intent cannot be recovered");
+    try {
+      await claimWorkspacePlacementForIntent(
+        this.options.database,
+        {
+          ...intent,
+          environment: { ...intent.environment, daemonId: daemon.id },
+        },
+        current.id,
+      );
+    } catch (error) {
+      if (!(error instanceof WorkspacePlacementConflictError)) throw error;
+      await this.failAgentExecution(current.id, "workspace_placement_conflict");
+      return;
+    }
     const createOptions = await this.buildCreateAgentOptions(intent, {
       executionId: current.id,
       completionToken: this.completionToken(current.id),
@@ -1312,13 +1389,27 @@ export class DaemonDispatchLifecycle {
    * the capability), one that is disconnected, or one that answers "no live agent" all resolve to
    * `delivered: false`, because the caller's fallback — start a fresh agent — is correct for every
    * one of them, and a Linear message must not be lost to a transport detail.
+   * Identified inputs with an uncertain delivery throw instead: replaying them automatically could
+   * duplicate work. Their persisted claim survives this execution and requires reconciliation.
    */
   async promptAgentExecutions(input: {
     projectId: string;
     prompt: string;
+    inputId?: string;
+    turnContext?: { triggerContext: unknown; outputContext: unknown };
     activeTurnBehavior?: "interrupt" | "steer";
-    matches: (work: { outputContext: unknown; triggerRunId: string | null }) => boolean;
+    matches: (work: {
+      outputContext: unknown;
+      triggerRunId: string | null;
+      launchIntent?: LaunchMachineIntent | null;
+    }) => boolean;
   }): Promise<{ delivered: boolean; live: boolean }> {
+    const inputKey =
+      input.inputId === undefined
+        ? undefined
+        : createHash("sha256").update(input.inputId).digest("hex");
+    if (await this.wasInputAlreadyDelivered(input.projectId, inputKey, input.inputId))
+      return { delivered: true, live: false };
     const pending = (await this.options.database.findPendingAgentExecutions()).filter(
       (execution) => execution.projectId === input.projectId && execution.daemonId !== null,
     );
@@ -1327,25 +1418,147 @@ export class DaemonDispatchLifecycle {
       const matched = input.matches({
         outputContext: execution.outputContext,
         triggerRunId: await this.triggerRunIdOf(execution),
+        launchIntent: execution.launchIntent,
       });
       if (!matched || execution.daemonId === null) continue;
       live = true;
       const connection = this.options.connectionForDaemon(execution.daemonId);
       if (connection === undefined) continue;
       try {
-        const result = await connection.promptExecution({
-          executionId: execution.id,
-          prompt: input.prompt,
-          ...(input.activeTurnBehavior === undefined
-            ? {}
-            : { activeTurnBehavior: input.activeTurnBehavior }),
-        });
+        const result = await this.deliverConversationPrompt(
+          execution,
+          connection,
+          {
+            executionId: execution.id,
+            ...(execution.daemonAgentId === null ? {} : { agentId: execution.daemonAgentId }),
+            ...(inputKey === undefined ? {} : { messageId: inputKey }),
+            prompt: input.prompt,
+            ...(input.activeTurnBehavior === undefined
+              ? {}
+              : { activeTurnBehavior: input.activeTurnBehavior }),
+          },
+          inputKey,
+          input.inputId,
+          input.turnContext,
+        );
         if (result.delivered) return { delivered: true, live: true };
       } catch (error: unknown) {
+        if (inputKey !== undefined || error instanceof DaemonPromptDeliveryUncertainError)
+          throw error;
         this.report(error, "daemon.execution.prompt", { executionId: execution.id });
       }
     }
     return { delivered: false, live };
+  }
+
+  private async wasInputAlreadyDelivered(
+    projectId: string,
+    inputKey?: string,
+    initialTurnKey?: string,
+  ): Promise<boolean> {
+    if (inputKey === undefined) return false;
+    const prior = await this.options.database.findAgentExecutionInputDelivery(
+      projectId,
+      inputKey,
+      initialTurnKey,
+    );
+    if (prior?.status !== "pending") return prior?.status === "delivered";
+    // Another worker may still be sending this exact input. Let its acknowledgement commit before
+    // deciding whether the remaining pending claim represents an unknown delivery after a crash.
+    return this.options.database.withAdvisoryLock(
+      `execution.prompt:${prior.executionId}`,
+      async () => {
+        const settled = await this.options.database.findAgentExecutionInputDelivery(
+          projectId,
+          inputKey,
+          initialTurnKey,
+        );
+        if (settled?.status === "pending")
+          throw new DaemonPromptDeliveryUncertainError(settled.executionId);
+        return settled?.status === "delivered";
+      },
+    );
+  }
+
+  /** Keep the persisted input boundary in the same order as messages sent to the daemon. */
+  private async deliverConversationPrompt(
+    execution: AgentExecutionRecord,
+    connection: DaemonConnection,
+    input: DaemonExecutionPromptOptions,
+    inputKey?: string,
+    initialTurnKey?: string,
+    turnContext?: { triggerContext: unknown; outputContext: unknown },
+  ): Promise<DaemonExecutionPromptResult> {
+    const previous = this.promptDeliveriesByExecution.get(execution.id) ?? Promise.resolve();
+    const delivery = previous
+      .catch(() => undefined)
+      .then(() =>
+        this.options.database.withAdvisoryLock(`execution.prompt:${execution.id}`, async () => {
+          if (inputKey !== undefined) {
+            const current = await this.options.database.findAgentExecutionById(execution.id);
+            // A prompted event may have started this execution through fallback before a retry
+            // found it live. Its initial prompt already belongs to the durable execution.
+            if (
+              initialTurnKey !== undefined &&
+              linearDispatchKey(current?.outputContext) === initialTurnKey
+            )
+              return { delivered: true, disposition: null };
+            const status = current?.hubActionAcknowledgements.inputDeliveries?.[inputKey];
+            if (status === "delivered") return { delivered: true, disposition: null };
+            if (status === "pending") throw new DaemonPromptDeliveryUncertainError(execution.id);
+          }
+          // Claim before sending: fast replies belong to this input, while already-started output
+          // attempts keep the old turn. This also invalidates a previous successful finish.
+          if (execution.launchIntent?.keepAliveBetweenTurns === true || inputKey !== undefined) {
+            if (turnContext !== undefined)
+              await reserveLinearNativeHandoff(
+                this.options.database,
+                execution.id,
+                turnContext.outputContext,
+                new Date(this.now()),
+              );
+            const opened = await this.options.database.beginAgentExecutionTurn(
+              execution.id,
+              new Date(this.now()),
+              inputKey,
+              turnContext,
+            );
+            if (opened === undefined) return { delivered: false, disposition: null };
+            if (turnContext !== undefined) this.streamMirrorsByExecution.delete(execution.id);
+          }
+          return this.sendConversationPrompt(execution.id, connection, input, inputKey);
+        }),
+      );
+    this.promptDeliveriesByExecution.set(execution.id, delivery);
+    try {
+      return await delivery;
+    } finally {
+      if (this.promptDeliveriesByExecution.get(execution.id) === delivery) {
+        this.promptDeliveriesByExecution.delete(execution.id);
+      }
+    }
+  }
+
+  private async sendConversationPrompt(
+    executionId: string,
+    connection: DaemonConnection,
+    input: DaemonExecutionPromptOptions,
+    inputKey?: string,
+  ): Promise<DaemonExecutionPromptResult> {
+    try {
+      const result = await connection.promptExecution(input);
+      if (inputKey !== undefined)
+        await this.options.database.recordAgentExecutionInputDelivery(
+          executionId,
+          inputKey,
+          result.delivered,
+        );
+      return result;
+    } catch (error) {
+      if (inputKey === undefined) throw error;
+      this.report(error, "daemon.execution.prompt.uncertain", { executionId });
+      throw new DaemonPromptDeliveryUncertainError(executionId);
+    }
   }
 
   private async triggerRunIdOf(execution: AgentExecutionRecord): Promise<string | null> {
@@ -2327,7 +2540,10 @@ const DISPATCH_PREPARATION_FAILURE_CODES = new Set([
 ]);
 
 function isDurablePrelaunchFailure(error: unknown): error is DaemonDispatchFailure {
-  return error instanceof DaemonDispatchFailure && error.reason === "daemon_not_registered";
+  return (
+    error instanceof DaemonDispatchFailure &&
+    (error.reason === "daemon_not_registered" || error.reason === "workspace_placement_conflict")
+  );
 }
 
 async function buildCreateAgentOptions(
