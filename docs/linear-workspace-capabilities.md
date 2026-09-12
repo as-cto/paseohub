@@ -28,7 +28,16 @@ Routes without this requirement remain configurable. Static steps check only the
 selected environment; finite dynamic input choices check only reachable environments.
 Unconstrained dynamic selections check every potentially selected daemon environment.
 
+The stable Linear issue identity is also required when replaying a persisted launch
+intent. An old reusable-workspace intent without a nonblank `workspaceKey` fails
+with `linear_workspace_identity_missing` before daemon creation or credential
+materialization. This applies both before handoff and after a daemon reconnects;
+the execution becomes terminal as well as its workflow, so it cannot retain issue
+ownership indefinitely. Recovery does not invent a key or rewrite old evidence.
+
 Coverage: `src/configuration/store-workspace-bindings.test.ts`,
 `src/daemons/registry.test.ts`,
 `src/public-operations/install-configuration.test.ts`, and
 `src/public-api/public-api.test.ts`.
+Legacy recovery coverage: `src/workflows/engine.test.ts` and
+`src/daemons/daemons.test.ts`.

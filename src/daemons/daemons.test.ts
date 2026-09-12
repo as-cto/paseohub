@@ -666,6 +666,39 @@ describe("daemon enrollment and execution", () => {
     assert.equal(hub.launchMaterializationCount(), 1);
   });
 
+  it.each([undefined, "", "   "])(
+    "rejects a persisted unbound Linear workspace before reconnect creates an agent (key %j)",
+    async (workspaceKey) => {
+      const daemonId = await hub.connectDaemon();
+      await hub.installConfiguration({ yaml: hub.manualConfigurationYaml() });
+      const persisted = await hub.persistUnlaunchedBatch(["legacy-linear"], 1, {
+        environment: {
+          kind: "daemon",
+          daemonId,
+          authoredSlug: hub.connectedDaemonSlug(),
+          cwd: "/workspace",
+          worktree: {
+            mode: "branch-off",
+            newBranch: "sen-136",
+            reuseWorkspace: true,
+            ...(workspaceKey === undefined ? {} : { workspaceKey }),
+          },
+        },
+        triggerContext: { provider: "linear" },
+      });
+      const execution = persisted.executions[0];
+      assert.ok(execution);
+
+      await hub.restartApp();
+      const recovered = await hub.waitForExecutionStatus(execution.id, "failed");
+
+      assert.equal(hub.createdAgentRequestCount(), 0);
+      assert.equal(hub.launchMaterializationCount(), 0);
+      assert.match(JSON.stringify(recovered.result), /linear_workspace_identity_missing/u);
+      assert.deepEqual(recovered.launchIntent, execution.launchIntent);
+    },
+  );
+
   it("does not materialize a stale recovery candidate after it becomes terminal", async () => {
     await hub.connectDaemon();
     await hub.installConfiguration({ yaml: hub.manualConfigurationYaml() });

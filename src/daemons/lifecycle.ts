@@ -19,6 +19,10 @@ import type {
   WorkflowAgentCompletionInput,
 } from "../db/types.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import {
+  assertLinearWorkspaceIdentity,
+  LinearWorkspaceIdentityMissingError,
+} from "../dispatcher/workspace-identity.js";
 import { completesAtIdleDeadline } from "../db/idle-completion.js";
 import { linearDispatchKey } from "../db/linear-dispatch.js";
 import { reserveLinearNativeHandoff } from "../triggers/linear/native-handoff.js";
@@ -1211,6 +1215,13 @@ export class DaemonDispatchLifecycle {
     if (intent === null || this.options.publicBaseUrl === undefined)
       throw new Error("execution launch intent cannot be recovered");
     try {
+      assertLinearWorkspaceIdentity(
+        intent.triggerContext,
+        intent.environment.worktree,
+        intent.environment.worktree?.mode === "branch-off"
+          ? intent.environment.worktree.workspaceKey
+          : undefined,
+      );
       await claimWorkspacePlacementForIntent(
         this.options.database,
         {
@@ -1220,6 +1231,10 @@ export class DaemonDispatchLifecycle {
         current.id,
       );
     } catch (error) {
+      if (error instanceof LinearWorkspaceIdentityMissingError) {
+        await this.failAgentExecution(current.id, "linear_workspace_identity_missing");
+        return;
+      }
       if (!(error instanceof WorkspacePlacementConflictError)) throw error;
       await this.failAgentExecution(current.id, "workspace_placement_conflict");
       return;

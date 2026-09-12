@@ -28,6 +28,10 @@ import {
   buildLaunchMachineIntent,
   type LaunchMachineIntent,
 } from "../dispatcher/launch-machine-intent.js";
+import {
+  assertLinearWorkspaceIdentity,
+  LinearWorkspaceIdentityMissingError,
+} from "../dispatcher/workspace-identity.js";
 import type {
   TriggerDispatchOutcome,
   TriggerEventName,
@@ -53,15 +57,6 @@ import type { Logger } from "pino";
 const DEFAULT_WAKEUP_LEASE_MS = 30_000;
 const DEFAULT_WORKER_INTERVAL_MS = 250;
 const CONTINUED_RUN_REASON = "continued_existing_execution";
-
-class LinearWorkspaceIdentityMissingError extends Error {
-  constructor() {
-    super(
-      "linear_workspace_identity_missing: reusable Linear workspaces require a stable issue identity",
-    );
-    this.name = "LinearWorkspaceIdentityMissingError";
-  }
-}
 
 type AcceptedWorkflowRun = Extract<
   Awaited<ReturnType<Database["findTriggerRunById"]>>,
@@ -737,6 +732,30 @@ export class DurableWorkflowEngine {
         triggerRunId: run.id,
         stepId: step.id,
       });
+      if (
+        error instanceof LinearWorkspaceIdentityMissingError &&
+        intent.workflowStepRunId !== undefined &&
+        intent.workflowStepRunId !== null
+      ) {
+        const existing = await database.findAgentExecutionByWorkflowStepRunId(
+          intent.workflowStepRunId,
+        );
+        if (existing !== undefined && isRecoverablePreHandoffExecution(existing)) {
+          await database.completeWorkflowAgentExecution({
+            executionId: existing.id,
+            executionStatus: "failed",
+            stepStatus: "failed",
+            result: { status: "failed", reason },
+            stepOutput: { status: "failed", reason },
+            failureReason: reason,
+            observedAt: this.now(),
+            hubAction: null,
+          });
+          const terminal = await database.findTriggerRunById(run.id);
+          if (terminal !== undefined) await this.notifyWorkflowRunTerminal(terminal);
+          return true;
+        }
+      }
       const failed = await database.failWorkflowRun(run.id, "failed", reason, step.id);
       if (failed?.transitioned === true) await this.notifyWorkflowRunTerminal(failed.run);
       return true;
@@ -1178,21 +1197,6 @@ function isRecoverablePreHandoffExecution(execution: AgentExecutionRecord): bool
 function authorityString(value: string, field: string): string {
   if (value.length === 0) throw new Error(`${field} resolved to an empty authority`);
   return value;
-}
-
-function assertLinearWorkspaceIdentity(
-  triggerContext: unknown,
-  worktree: WorktreeTarget | undefined,
-  workspaceKey: string | undefined,
-): void {
-  if (
-    isRecord(triggerContext) &&
-    triggerContext["provider"] === "linear" &&
-    worktree?.mode === "branch-off" &&
-    worktree.reuseWorkspace === true &&
-    !workspaceKey?.trim()
-  )
-    throw new LinearWorkspaceIdentityMissingError();
 }
 
 function materializeExecutionWorktree(

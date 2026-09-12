@@ -1684,6 +1684,61 @@ describe("durable multi-step workflow engine", () => {
     assert.equal((await fixture.entitlements.usage("org-1", "executions.monthly")).used, 1);
   });
 
+  it("retires an unbound legacy pre-handoff execution without dispatching or retaining issue ownership", async () => {
+    let now = new Date("2026-08-06T12:00:00.000Z");
+    const fixture = await workflowFixture({
+      rawConfiguration: executionWorktreeConfiguration(true),
+    });
+    const base = providerMatch(fixture.configuration, fixture.revisionId);
+    const provider: TriggerProvider = {
+      ...base,
+      name: "linear",
+      workKeyFor: () => "sen-136",
+      workspaceKeyFor: () => "stable-issue",
+      match: async (event) =>
+        (await base.match(event)).map((match) =>
+          Object.assign({}, match, { triggerContext: linearWorkspaceContext() }),
+        ),
+    };
+    const create = fixture.database.createWorkflowStepExecution.bind(fixture.database);
+    vi.spyOn(fixture.database, "createWorkflowStepExecution").mockImplementationOnce((input) => {
+      // Reproduce a row written before the runtime forwarded workspaceKeyFor.
+      const legacy = structuredClone(input);
+      const worktree = legacy.execution.launchIntent?.environment.worktree;
+      if (worktree?.mode === "branch-off") delete worktree.workspaceKey;
+      return create(legacy);
+    });
+    const dispatch = vi.fn(async () => {
+      throw new Error("process stopped before daemon handoff");
+    });
+    const { handler, engine } = createDurableWorkflowHandler({
+      database: fixture.database,
+      entitlements: fixture.entitlements,
+      providers: [provider],
+      now: () => now,
+      leaseMs: 1_000,
+      dispatchLaunchMachineIntent: dispatch,
+      logger: createLogger(new FailureLogStream()),
+    });
+    await handler(fixture.trigger("run"));
+    await engine.processAvailable();
+    const [legacy] = await fixture.database.findPendingAgentExecutions();
+    assert.ok(legacy);
+    now = new Date("2026-08-06T12:00:02.000Z");
+    await engine.processAvailable();
+
+    const execution = await fixture.database.findAgentExecutionById(legacy.id);
+    const [run] = await fixture.database.findTriggerRunsByProviderEventReceiptId(
+      fixture.providerEventReceiptId,
+    );
+    assert.equal(execution?.status, "failed");
+    assert.equal(run?.status, "failed");
+    assert.match(JSON.stringify(execution?.result), /linear_workspace_identity_missing/u);
+    assert.equal((await fixture.database.findPendingAgentExecutions()).length, 0);
+    assert.equal(dispatch.mock.calls.length, 1);
+    assert.equal((await fixture.entitlements.usage("org-1", "executions.monthly")).used, 1);
+  });
+
   it("does not rematerialize context when recovering a persisted pre-handoff execution", async () => {
     let now = new Date("2026-08-06T12:00:00.000Z");
     const fixture = await workflowFixture({ rawConfiguration: contextOnlyConfiguration() });
