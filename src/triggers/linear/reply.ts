@@ -5,11 +5,11 @@ import type {
   OutputExecutionInput,
 } from "../../execution-capabilities/outputs.js";
 import type { LinearApiClient } from "../../providers/linear/client.js";
-import { reportFailure } from "../../failures/index.js";
 import type { Database } from "../../db/types.js";
 import { createLinearReplyReporter, type LinearReplyReporter } from "./reporting.js";
 import type { LinearReplyPayload, LinearFinalOutcome } from "../../db/linear-replies.js";
 import { LinearIssueFinalizationContextSchema } from "./finalization.js";
+import { attachLinearReplyLinks } from "./reply-links.js";
 
 /**
  * Output type of the Linear reply tool. Shared by the provider registration
@@ -287,8 +287,7 @@ export function createLinearReplyExecutor(options: {
     if (context.publishIssueComment === true) {
       if (reporter === undefined)
         throw new Error("Publishing a durable issue report requires the Linear reply journal");
-      const result = await publishDurableReply(reporter, input, context, args);
-      await attachReplyLinks(options.client, context, args.content, result.connectionId);
+      await publishDurableReply(reporter, input, context, args);
       return { deliveryAcknowledged: true };
     }
     if (context.agentSessionId !== null) {
@@ -297,7 +296,7 @@ export function createLinearReplyExecutor(options: {
         agentSessionId: context.agentSessionId,
         ...nativeReplyActivity(args, args.content),
       });
-      await attachReplyLinks(options.client, context, args.content);
+      await attachLinearReplyLinks(options.client, context, args.content);
       return undefined;
     }
     await options.client.createComment({
@@ -373,51 +372,6 @@ function publishDurableReply(
     activity: nativeReplyActivity(args, body),
     ...(outcome === undefined ? {} : { outcome }),
   });
-}
-
-/** Session link enrichment is best effort; the complete URL remains in both final bodies. */
-async function attachReplyLinks(
-  client: LinearApiClient,
-  context: z.infer<typeof LinearReplyOutputContextSchema>,
-  content: string,
-  expectedConnectionId?: string,
-): Promise<void> {
-  if (context.agentSessionId === null) return;
-  const links = pullRequestLinks(content);
-  if (links.length === 0) return;
-  try {
-    await client.updateAgentSessionExternalUrls({
-      linearOrganizationId: context.linearOrganizationId,
-      agentSessionId: context.agentSessionId,
-      externalUrls: links,
-      ...(expectedConnectionId === undefined ? {} : { expectedConnectionId }),
-    });
-  } catch (error: unknown) {
-    reportFailure(
-      error,
-      { operation: "linear.session.external-urls", component: "triggers", provider: "linear" },
-      { diagnostic: { agentSessionId: context.agentSessionId } },
-    );
-  }
-}
-
-/**
- * GitHub pull requests named in a reply, in order and without duplicates.
- *
- * Deliberately narrow: only `/pull/<number>` URLs, because `externalUrls` is what Linear reads to
- * show "this session opened this PR". Any other link the agent mentions belongs in the text.
- */
-function pullRequestLinks(content: string): Array<{ label: string; url: string }> {
-  const matches = content.matchAll(/https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/gu);
-  const seen = new Set<string>();
-  const links: Array<{ label: string; url: string }> = [];
-  for (const match of matches) {
-    const url = match[0];
-    if (seen.has(url)) continue;
-    seen.add(url);
-    links.push({ label: `${match[1]}/${match[2]}#${match[3]}`, url });
-  }
-  return links;
 }
 
 /** Issue comments have no elicitation: a question with choices lists them in Markdown instead. */

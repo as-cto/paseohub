@@ -11,9 +11,14 @@ import {
 import type { LinearApiClient } from "../../providers/linear/client.js";
 import { reportFailure } from "../../failures/index.js";
 import type { TriggerSource } from "../index.js";
-import { finalizeLinearIssue, LinearIssueFinalizationContextSchema } from "./finalization.js";
+import {
+  canAttachLinearFinalReplyLinks,
+  finalizeLinearIssue,
+  LinearIssueFinalizationContextSchema,
+} from "./finalization.js";
 import type { LinearIssueFinalizationPolicy } from "../../db/linear-finalizations.js";
 import { authorizedLinearReplyConnection } from "./reply-authority.js";
+import { attachLinearReplyLinks } from "./reply-links.js";
 
 export interface PublishLinearReplyInput {
   executionId: string;
@@ -252,6 +257,7 @@ export function createLinearReplyReporter(options: {
           await database.confirmLinearReplyDestination(claimed.id, "activity", now());
         });
       }
+      await attachReportLinks(claimed);
       await finalizeLinearIssue({ database, client, reply: claimed, now });
       await database.acknowledgeLinearReply(claimed.id, now());
     } catch (error) {
@@ -264,6 +270,33 @@ export function createLinearReplyReporter(options: {
       );
       throw error;
     }
+  }
+
+  async function attachReportLinks(reply: LinearReplyDelivery): Promise<void> {
+    if (reply.payload.agentSessionId === null) return;
+    // Finalization uses this same lock. An expired delivery lease must never let a
+    // concurrent link update run after the issue metadata mutation was journaled.
+    await database.withAdvisoryLock(`execution.prompt:${reply.executionId}`, async () => {
+      if ((await database.findLinearFinalization(reply.id)) !== undefined) return;
+      const execution = await database.findAgentExecutionById(reply.executionId);
+      if (
+        execution === undefined ||
+        linearReplyTurnKey(execution.hubActionAcknowledgements.turn?.id) !== reply.turnKey
+      )
+        return;
+      const activeSessionId: unknown =
+        typeof execution.outputContext === "object" && execution.outputContext !== null
+          ? Reflect.get(execution.outputContext, "agentSessionId")
+          : undefined;
+      if (activeSessionId !== reply.payload.agentSessionId) return;
+      if (!(await canAttachLinearFinalReplyLinks({ database, client, reply, now }))) return;
+      await attachLinearReplyLinks(
+        client,
+        reply.payload,
+        reply.payload.body,
+        reply.payload.connectionId,
+      );
+    });
   }
 
   async function reconcileComment(payload: LinearReplyPayload): Promise<void> {

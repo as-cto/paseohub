@@ -150,7 +150,167 @@ async function fixture() {
   };
 }
 
+function configureFinalization(f: Awaited<ReturnType<typeof fixture>>) {
+  Object.assign(f.context, {
+    finalizeIssue: { teamId: "team", reviewStateId: "review", completedStateId: "done" },
+  });
+  let stateId = "started";
+  f.client.readIssue = async () => ({
+    id: "issue",
+    title: "Work",
+    description: null,
+    projectId: "project",
+    teamId: "team",
+    stateId,
+    stateType: "started",
+    assigneeId: "human",
+    delegateId: "agent",
+    labelIds: [],
+  });
+  f.client.readTeamWorkflowStates = async () => [{ id: "review", type: "started" }];
+  f.client.readTeamMembers = async () => [];
+  f.client.updateIssue = async (input) => {
+    f.calls.push("update");
+    if (input.stateId !== undefined) stateId = input.stateId;
+  };
+  f.client.updateAgentSessionExternalUrls = async (input) => {
+    assert.equal(input.expectedConnectionId, "connection");
+    const reply = await f.database.findLinearReply(f.execution.id, "initial");
+    assert.ok(reply?.commentConfirmedAt);
+    assert.ok(reply.activityConfirmedAt);
+    f.calls.push("links");
+    // Linear's PR automation may move the issue back when a session acquires a PR link.
+    stateId = "started";
+    assert.equal(await f.database.findLinearFinalization(reply.id), undefined);
+  };
+  return () => stateId;
+}
+
 describe("durable Linear final reports", () => {
+  it("finalizes after confirmed report links so PR automation cannot undo Review", async () => {
+    const f = await fixture();
+    const state = configureFinalization(f);
+    await f.reply();
+    assert.equal(state(), "review");
+    assert.deepEqual(f.calls, ["comment", "activity", "links", "update"]);
+  });
+
+  it.each(["team", "delegate", "closed"] as const)(
+    "does not attach PR links when the current issue is outside finalization authority (%s)",
+    async (change) => {
+      const f = await fixture();
+      configureFinalization(f);
+      const read = f.client.readIssue.bind(f.client);
+      f.client.readIssue = async (input) => {
+        const issue = await read(input);
+        assert.ok(issue);
+        if (change === "team") return { ...issue, teamId: "different-team" };
+        if (change === "delegate") return { ...issue, delegateId: "different-agent" };
+        return { ...issue, stateId: "done", stateType: "completed" };
+      };
+      if (change === "closed") await f.reply();
+      else await assert.rejects(f.reply(), /configured team/u);
+      assert.deepEqual(f.calls, ["comment", "activity"]);
+    },
+  );
+
+  it("recovers a lost report ACK without attaching links after finalization", async () => {
+    const f = await fixture();
+    const state = configureFinalization(f);
+    vi.spyOn(f.database, "acknowledgeLinearReply").mockRejectedValueOnce(new Error("ACK lost"));
+    await assert.rejects(f.reply(), /ACK lost/u);
+    assert.equal(state(), "review");
+    const record = await f.database.findLinearReply(f.execution.id, "initial");
+    assert.ok(record);
+    assert.equal((await f.database.findLinearFinalization(record.id))?.status, "applied");
+    f.advance();
+    await f.reporter().recover();
+    await f.reply();
+    assert.equal(state(), "review");
+    assert.deepEqual(f.calls, ["comment", "activity", "links", "update"]);
+    assert.ok((await f.database.findLinearReply(f.execution.id, "initial"))?.completedAt);
+  });
+
+  it("recovers a crash after attaching links but before reserving finalization", async () => {
+    const f = await fixture();
+    const state = configureFinalization(f);
+    vi.spyOn(f.database, "reserveLinearFinalization").mockRejectedValueOnce(new Error("crash"));
+    await assert.rejects(f.reply(), /crash/u);
+    assert.equal(state(), "started");
+    f.advance();
+    await f.reporter().recover();
+    assert.equal(state(), "review");
+    assert.deepEqual(f.calls, ["comment", "activity", "links", "links", "update"]);
+  });
+
+  it("skips PR linking when resuming an already reserved pending finalization", async () => {
+    const f = await fixture();
+    const state = configureFinalization(f);
+    vi.spyOn(f.database, "startLinearFinalization").mockRejectedValueOnce(new Error("crash"));
+    await assert.rejects(f.reply(), /crash/u);
+    const reply = await f.database.findLinearReply(f.execution.id, "initial");
+    assert.ok(reply);
+    assert.equal((await f.database.findLinearFinalization(reply.id))?.status, "pending");
+    f.advance();
+    await f.reporter().recover();
+    assert.equal(state(), "review");
+    assert.deepEqual(f.calls, ["comment", "activity", "links", "update"]);
+  });
+
+  it("serializes PR linking against finalization when a delivery lease expires", async () => {
+    const f = await fixture();
+    const state = configureFinalization(f);
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const link = f.client.updateAgentSessionExternalUrls.bind(f.client);
+    let entered = false;
+    f.client.updateAgentSessionExternalUrls = async (input) => {
+      entered = true;
+      await blocked;
+      await link(input);
+    };
+    const publication = f.reply();
+    await vi.waitFor(() => assert.equal(entered, true));
+    f.advance();
+    const claim = vi.spyOn(f.database, "claimLinearReply");
+    const recovery = f.reporter().recover();
+    await vi.waitFor(() => assert.equal(claim.mock.calls.length, 1));
+    assert.equal(f.calls.includes("update"), false);
+    release();
+    await Promise.all([publication, recovery]);
+    assert.equal(state(), "review");
+    assert.equal(f.calls.filter((call) => call === "update").length, 1);
+    assert.equal(f.calls.slice(f.calls.indexOf("update") + 1).includes("links"), false);
+  });
+
+  it("does not attach links for a contradictory report rejected by the reservation", async () => {
+    const f = await fixture();
+    const state = configureFinalization(f);
+    await f.reply();
+    await assert.rejects(
+      f.reply({ ...f.args, content: "Different PR: https://github.com/acme/project/pull/43" }),
+      /different final report/u,
+    );
+    assert.equal(state(), "review");
+    assert.deepEqual(f.calls, ["comment", "activity", "links", "update"]);
+  });
+
+  it("still finalizes when PR linking succeeded but its acknowledgement was lost", async () => {
+    const f = await fixture();
+    const state = configureFinalization(f);
+    const link = f.client.updateAgentSessionExternalUrls.bind(f.client);
+    f.client.updateAgentSessionExternalUrls = async (input) => {
+      await link(input);
+      throw new Error("link acknowledgement lost");
+    };
+    await f.reply();
+    await f.reply();
+    assert.equal(state(), "review");
+    assert.deepEqual(f.calls, ["comment", "activity", "links", "update"]);
+  });
+
   it.each(["activity", "outcome", "finalizeIssue"] as const)(
     "accepts an equivalent reservation with reordered %s properties",
     async (field) => {
@@ -523,6 +683,7 @@ describe("durable Linear final reports", () => {
 
   it("finishes an older distinct native session while leaving the current turn unacknowledged", async () => {
     const f = await fixture();
+    const links = vi.spyOn(f.client, "updateAgentSessionExternalUrls");
     const activity = vi
       .spyOn(f.client, "createAgentActivity")
       .mockRejectedValue(new Error("offline"));
@@ -536,6 +697,7 @@ describe("durable Linear final reports", () => {
     await f.reporter().recover();
     assert.deepEqual(f.calls, ["comment", "activity"]);
     assert.equal([...f.activities.values()][0]?.agentSessionId, "session");
+    assert.equal(links.mock.calls.length, 0);
     assert.ok((await f.database.findLinearReply(f.execution.id, "initial"))?.completedAt);
     const execution = await f.database.findAgentExecutionById(f.execution.id);
     assert.ok(execution);

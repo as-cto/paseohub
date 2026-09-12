@@ -81,6 +81,24 @@ export async function finalizeLinearIssue(options: {
   });
 }
 
+/** Called under execution.prompt before PR enrichment; linking can itself change issue state. */
+export async function canAttachLinearFinalReplyLinks(
+  options: Parameters<typeof finalizeLinearIssue>[0],
+): Promise<boolean> {
+  const { client, reply } = options;
+  const policy = reply.payload.finalizeIssue;
+  if (policy === undefined) return true;
+  const issue = await client.readIssue({
+    linearOrganizationId: reply.payload.linearOrganizationId,
+    expectedConnectionId: reply.payload.connectionId,
+    issueId: reply.payload.issueId,
+  });
+  if (issue === undefined || issue.id !== reply.payload.issueId) return false;
+  // Reuse finalization's live authority and outcome checks. Finalization re-reads
+  // afterwards, since the enrichment or a human may change the issue meanwhile.
+  return (await prepareFinalization(options, issue, policy)).status === "pending";
+}
+
 interface FinalizationDecision {
   target: LinearIssueFinalization["target"];
   status: "pending" | "skipped" | "refused";
