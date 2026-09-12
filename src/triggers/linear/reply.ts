@@ -182,17 +182,16 @@ export const linearReplyOutputTool: OutputToolDefinition = {
     },
     required: ["content"],
     additionalProperties: false,
-    anyOf: [
-      {
-        properties: { kind: { const: "auth" }, auth: {} },
-        required: ["kind", "auth"],
-        not: { properties: { options: {} }, required: ["options"] },
-      },
-      {
-        properties: { kind: { enum: ["response", "question", "error"] } },
-        not: { properties: { auth: {} }, required: ["auth"] },
-      },
-    ],
+    // Keep shared fields on one object: tool signature generators can otherwise
+    // render only the anyOf branches and hide content/outcome from the agent.
+    if: { properties: { kind: { const: "auth" } }, required: ["kind"] },
+    // eslint-disable-next-line unicorn/no-thenable -- JSON Schema keyword, not a Promise method.
+    then: {
+      properties: { auth: {} },
+      required: ["auth"],
+      not: { properties: { options: {} }, required: ["options"] },
+    },
+    else: { not: { properties: { auth: {} }, required: ["auth"] } },
   },
 };
 

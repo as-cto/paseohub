@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import type { Database } from "../../db/types.js";
 import {
@@ -408,14 +409,16 @@ export function createLinearReplyReporter(options: {
 }
 
 function sameReplyPayload(left: LinearReplyPayload, right: LinearReplyPayload): boolean {
+  // PostgreSQL jsonb reorders object properties. Compare their values so the first
+  // reservation and identical retries are acknowledged without accepting changed reports.
   return (
     left.body === right.body &&
     left.issueId === right.issueId &&
     left.agentSessionId === right.agentSessionId &&
     left.connectionId === right.connectionId &&
-    JSON.stringify(left.activity) === JSON.stringify(right.activity) &&
-    JSON.stringify(left.outcome) === JSON.stringify(right.outcome) &&
-    JSON.stringify(left.finalizeIssue) === JSON.stringify(right.finalizeIssue)
+    isDeepStrictEqual(left.activity, right.activity) &&
+    isDeepStrictEqual(left.outcome, right.outcome) &&
+    isDeepStrictEqual(left.finalizeIssue, right.finalizeIssue)
   );
 }
 

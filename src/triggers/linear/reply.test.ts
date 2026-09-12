@@ -256,6 +256,20 @@ describe("Linear reply output", () => {
     assert.equal(validate({ content: "Done", extra: 1 }), false);
   });
 
+  it("preserves conditional auth validation with the shared reply fields", () => {
+    const { validate } = compileJsonSchema(linearReplyOutputTool.inputSchema);
+    const auth = { url: "https://example.com/connect" };
+    const outcome = { kind: "no_action", validation: "Checked", nextAction: "None" };
+    assert.equal(validate({ content: "Done", outcome }), true);
+    assert.equal(validate({ content: "Done", outcome: "no_action" }), false);
+    assert.equal(validate({ content: "Connect", kind: "auth", auth }), true);
+    assert.equal(validate({ content: "Connect", kind: "auth" }), false);
+    assert.equal(validate({ kind: "auth", auth }), false);
+    assert.equal(validate({ content: "Connect", auth }), false);
+    assert.equal(validate({ content: "Done", kind: "response", auth }), false);
+    assert.equal(validate({ content: "Connect", kind: "auth", auth, options: ["yes"] }), false);
+  });
+
   it("drops duplicated choices before offering them", async () => {
     const client = new RecordingLinearClient();
     const execute = createLinearReplyExecutor({ client });

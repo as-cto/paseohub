@@ -151,6 +151,60 @@ async function fixture() {
 }
 
 describe("durable Linear final reports", () => {
+  it.each(["activity", "outcome", "finalizeIssue"] as const)(
+    "accepts an equivalent reservation with reordered %s properties",
+    async (field) => {
+      const f = await fixture();
+      Object.assign(f.context, {
+        finalizeIssue: { teamId: "team", reviewStateId: "review", completedStateId: "done" },
+      });
+      f.client.readIssue = async () => ({
+        id: "issue",
+        title: "Work",
+        description: null,
+        projectId: "project",
+        teamId: "team",
+        stateId: "done",
+        stateType: "completed",
+        assigneeId: "human",
+        labelIds: [],
+      });
+      const reserve = f.database.reserveLinearReply.bind(f.database);
+      vi.spyOn(f.database, "reserveLinearReply").mockImplementation(async (input) => {
+        const reserved = await reserve(input);
+        const payload = structuredClone(reserved.payload);
+        if (field === "activity") {
+          const { type, body } = payload.activity.content;
+          payload.activity.content = { body, type };
+        } else if (field === "outcome") {
+          const outcome = payload.outcome!;
+          payload.outcome = {
+            nextAction: outcome.nextAction,
+            validation: outcome.validation,
+            kind: outcome.kind,
+          };
+        } else {
+          const policy = payload.finalizeIssue!;
+          payload.finalizeIssue = {
+            completedStateId: policy.completedStateId,
+            reviewStateId: policy.reviewStateId,
+            teamId: policy.teamId,
+          };
+        }
+        assert.deepEqual(payload[field], reserved.payload[field]);
+        assert.notEqual(JSON.stringify(payload[field]), JSON.stringify(reserved.payload[field]));
+        return { ...reserved, payload };
+      });
+      assert.deepEqual(await f.reply(), { deliveryAcknowledged: true });
+      assert.deepEqual(await f.reply(), { deliveryAcknowledged: true });
+      assert.deepEqual(f.calls, ["comment", "activity"]);
+      assert.equal(
+        (await f.database.findAgentExecutionById(f.execution.id))?.outputEmissions["linear.reply"],
+        1,
+      );
+    },
+  );
+
   it.each(["reply", "terminal", "handoff"] as const)(
     "rejects a replacement connection before the first %s reservation",
     async (path) => {
