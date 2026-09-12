@@ -67,10 +67,8 @@ const IssueResponseSchema = z.object({
           .object({ id: z.string().min(1), type: z.string().optional() })
           .nullable()
           .optional(),
-        assignee: z
-          .object({ id: z.string().min(1) })
-          .nullable()
-          .optional(),
+        // The query explicitly requests this relation. Missing is not proof of unassignment.
+        assignee: z.object({ id: z.string().min(1) }).nullable(),
         delegate: z
           .object({ id: z.string().min(1) })
           .nullable()

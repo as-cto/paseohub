@@ -1,8 +1,35 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
-import { NormalizedLinearEventSchema, normalizeLinearEvent } from "./events.js";
+import {
+  NormalizedLinearEventSchema,
+  linearIssueNeedsAssigneeHydration,
+  normalizeLinearEvent,
+} from "./events.js";
 
 describe("Linear event normalization", () => {
+  it("requests assignee hydration only for an omitted relation with an explicit previous assignee", () => {
+    const payload = {
+      action: "update",
+      type: "Issue",
+      organizationId: "linear-org",
+      data: { id: "issue-1", title: "Assignment changed" },
+      updatedFrom: { assigneeId: "human" },
+    };
+    assert.equal(linearIssueNeedsAssigneeHydration(payload), true);
+    for (const other of [
+      { ...payload, action: "create" },
+      { ...payload, action: "remove" },
+      { ...payload, type: "Comment" },
+      { ...payload, updatedFrom: {} },
+      { ...payload, updatedFrom: { assigneeId: null } },
+      { ...payload, data: { ...payload.data, assigneeId: null } },
+      { ...payload, data: { ...payload.data, assigneeId: "someone" } },
+      { ...payload, data: { ...payload.data, assignee: null } },
+      { ...payload, data: { ...payload.data, assignee: {} } },
+    ])
+      assert.equal(linearIssueNeedsAssigneeHydration(other), false);
+  });
+
   it("uses a comment's own timestamp as the causal history anchor", () => {
     const event = normalizeLinearEvent({
       action: "create",
@@ -121,6 +148,35 @@ describe("Linear event normalization", () => {
       { projectId: null, teamId: null, stateId: null, assigneeId: null },
     );
   });
+
+  it.each(["unassigned", "still-assigned", "other-issue", "unavailable"] as const)(
+    "requires a current read of the same issue to confirm an omitted assignee (%s)",
+    (state) => {
+      const event = normalizeLinearEvent(
+        {
+          action: "update",
+          type: "Issue",
+          organizationId: "linear-org",
+          updatedFrom: { assigneeId: "human" },
+          data: { id: "issue-1", title: "Assignment changed" },
+        },
+        undefined,
+        state === "unavailable"
+          ? undefined
+          : {
+              ...hydratedIssue(),
+              id: state === "other-issue" ? "issue-2" : "issue-1",
+              assigneeId: state === "still-assigned" ? "human" : null,
+            },
+      );
+      assert.equal(event?.type, "issue");
+      if (event?.type !== "issue") throw new Error("expected an issue event");
+      assert.deepEqual(
+        event.changes,
+        state === "unassigned" ? [{ field: "assigneeId", before: "human", after: null }] : [],
+      );
+    },
+  );
 
   it("leaves thread authors to the trigger provider and preserves them once filled", () => {
     const event = normalizeComment({ parentId: "root-comment" });

@@ -10,6 +10,7 @@ import {
   eventProjectId,
   eventTeamId,
   hasExplicitNullLinearProject,
+  linearIssueNeedsAssigneeHydration,
   normalizeLinearEvent,
 } from "./events.js";
 import type { LinearIssueDetails } from "../../providers/linear/client.js";
@@ -174,10 +175,13 @@ async function processLinearEvent(
   const hasCompleteTeamRoute =
     eventTeamId(event) !== undefined &&
     hasExplicitNullLinearProject(verified.payload, verified.eventName);
-  // Issue webhooks carry their filter fields directly. Comment and Agent Session issue
-  // relations can be compact even when they already identify a project or team.
+  // Some unassignment updates omit the new relation entirely. Their route may already
+  // be complete, but the omitted value still requires an explicit provider confirmation.
+  // Comment and Agent Session issue relations may also be compact despite a known route.
   const needsIssueHydration =
-    event.type !== "issue" || (eventProjectId(event) === undefined && !hasCompleteTeamRoute);
+    event.type !== "issue" ||
+    (eventProjectId(event) === undefined && !hasCompleteTeamRoute) ||
+    linearIssueNeedsAssigneeHydration(verified.payload, verified.eventName);
   if (needsIssueHydration && options.resolveIssue !== undefined) {
     const source = linearEventSource(event);
     if (

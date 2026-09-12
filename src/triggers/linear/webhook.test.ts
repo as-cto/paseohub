@@ -6,6 +6,7 @@ import type { DurableProviderEvent, ProviderEventAcceptance } from "../../db/typ
 import {
   NormalizedLinearAgentSessionEventSchema,
   NormalizedLinearCommentEventSchema,
+  NormalizedLinearIssueEventSchema,
 } from "./events.js";
 import {
   createLinearWebhookSource,
@@ -17,6 +18,44 @@ const SECRET = "linear-webhook-secret";
 const NOW = 1_700_000_000_000;
 
 describe("Linear webhook", () => {
+  it("hydrates an omitted assignee removal even when the issue already has a complete project route", async () => {
+    const original = issueEnvelope();
+    const { assigneeId: previousAssignee, ...data } = original.data;
+    const resolveIssue = vi.fn(async () => ({
+      ...projectlessIssueDetails(),
+      projectId: "project-1",
+      assigneeId: null,
+    }));
+    let accepted = false;
+    const endpoint = createLinearWebhookSource({
+      signingSecret: SECRET,
+      now: () => NOW,
+      resolveIssue,
+      accept: async (input) => {
+        accepted = true;
+        const event = NormalizedLinearIssueEventSchema.parse(input.payload);
+        assert.deepEqual(event.changes, [
+          { field: "assigneeId", before: previousAssignee, after: null },
+        ]);
+        assert.equal(input.projectId, "project-1");
+        return acceptedEvent(input);
+      },
+    });
+    const response = await endpoint.handle(
+      request({
+        ...original,
+        action: "update",
+        data,
+        updatedFrom: { assigneeId: previousAssignee },
+      }),
+    );
+    assert.equal(response.status, 200);
+    assert.equal(accepted, true);
+    assert.deepEqual(resolveIssue.mock.calls, [
+      [{ linearOrganizationId: "linear-org", issueId: "issue-1" }],
+    ]);
+  });
+
   it("acknowledges durable admission before blocked hydration and dispatch, then deduplicates signature replays", async () => {
     const database = createMemoryDatabase({ now: () => new Date(NOW) });
     let release!: () => void;

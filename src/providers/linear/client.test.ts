@@ -174,6 +174,17 @@ describe("Linear connection client", () => {
     assert.match(graphqlRequest(requestBody).query, /team \{ id \}/u);
   });
 
+  it("does not turn a missing provider assignee relation into a verified unassignment", async () => {
+    const { api } = recordingApi({
+      data: { issue: { id: "issue-1", title: "Incomplete response", labels: { nodes: [] } } },
+    });
+    await assert.rejects(
+      api.readIssue({ linearOrganizationId: "linear-org", issueId: "issue-1" }),
+      (error: unknown) =>
+        error instanceof z.ZodError && error.issues[0]?.path.join(".") === "data.issue.assignee",
+    );
+  });
+
   it("reads a bounded, chronological history before the triggering comment", async () => {
     const requests: Array<{ authorization: string | null; body: string }> = [];
     const connection: LinearConnectionRecord = {

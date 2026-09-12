@@ -6,7 +6,7 @@ import { createMemoryDatabase } from "../../db/memory.js";
 import { createActiveProjectConfiguration } from "../../test-utils/project-configuration.js";
 import type { LinearIssueDetails } from "../../providers/linear/client.js";
 import type { ExternalTrigger } from "../index.js";
-import type { NormalizedLinearIssueEvent } from "./events.js";
+import { normalizeLinearEvent, type NormalizedLinearIssueEvent } from "./events.js";
 import { createLinearTriggerProvider } from "./provider.js";
 
 const issue: LinearIssueDetails = {
@@ -141,6 +141,33 @@ async function fixture(
   return { provider, client, event, external };
 }
 describe("delegated Linear issue events", () => {
+  it("routes an isolated unassignment only after hydration confirms the omitted assignee", async () => {
+    const f = await fixture();
+    const current = { ...issue, assigneeId: null };
+    f.client.readIssue.mockResolvedValue(current);
+    const event = normalizeLinearEvent(
+      {
+        action: "update",
+        type: "Issue",
+        organizationId: "linear-org",
+        actor: { id: "human" },
+        data: { id: issue.id, title: issue.title, teamId: issue.teamId, projectId: null },
+        updatedFrom: { assigneeId: "human" },
+      },
+      undefined,
+      current,
+    );
+    if (event?.type !== "issue") throw new Error("expected an issue event");
+    const result = await f.provider.match(f.external(event));
+    if (typeof result === "string") throw new Error(result);
+    assert.equal(result.length, 1);
+    assert.deepEqual(result[0]?.triggerContext.event.linear.changes, [
+      { field: "assigneeId", before: "human", after: null },
+    ]);
+    assert.equal(f.client.createAgentSessionOnIssue.mock.calls.length, 1);
+    assert.equal(f.client.updateIssue.mock.calls.length, 0);
+  });
+
   it("refuses a replaced connection before creating a native session or admitting an issue", async () => {
     for (const intake of [false, true]) {
       const f = await fixture({ intake, replacedConnection: true });

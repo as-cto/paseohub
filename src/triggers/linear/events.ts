@@ -164,6 +164,25 @@ export function eventTeamId(event: NormalizedLinearEvent): string | undefined {
   return event.issue?.teamId ?? undefined;
 }
 
+/** A compact update may omit an unassigned relation; only a provider read can confirm it. */
+export function linearIssueNeedsAssigneeHydration(
+  payload: unknown,
+  eventName?: string | null,
+): boolean {
+  const envelope = readEnvelope(payload, eventName);
+  return envelope !== undefined && hasOmittedAssigneeChange(envelope);
+}
+
+function hasOmittedAssigneeChange(envelope: LinearEnvelope): boolean {
+  return (
+    envelope.kind === "issue" &&
+    envelope.action === "update" &&
+    readString(asRecord(envelope.payload["updatedFrom"])?.["assigneeId"]) !== undefined &&
+    !hasOwn(envelope.data, "assigneeId") &&
+    !hasOwn(envelope.data, "assignee")
+  );
+}
+
 /** Distinguish a complete projectless event from a compact event that still needs hydration. */
 export function hasExplicitNullLinearProject(payload: unknown, eventName?: string | null): boolean {
   if (!isRecord(payload)) return false;
@@ -234,6 +253,14 @@ function normalizeIssueEvent(
 ): NormalizedLinearEvent | undefined {
   const issue = normalizeIssue(envelope.data, hydratedIssue);
   if (issue === undefined) return undefined;
+  // Normalized null defaults are not evidence. Use an explicit, same-issue provider result
+  // only for this omitted relation; leave all other missing fields unknown.
+  const changeData =
+    hasOmittedAssigneeChange(envelope) &&
+    hydratedIssue?.id === readString(envelope.data["id"]) &&
+    hydratedIssue?.assigneeId === null
+      ? { ...envelope.data, assigneeId: null }
+      : envelope.data;
   return NormalizedLinearIssueEventSchema.parse({
     type: "issue",
     action: envelope.action,
@@ -253,7 +280,7 @@ function normalizeIssueEvent(
     ...(envelope.action === "create" && isBotActor(envelope.payload["actor"])
       ? { sourceActorIsBot: true }
       : {}),
-    changes: linearIssueChanges(envelope.data, envelope.payload["updatedFrom"]),
+    changes: linearIssueChanges(changeData, envelope.payload["updatedFrom"]),
     ...(envelope.occurredAt === undefined ? {} : { occurredAt: envelope.occurredAt }),
   });
 }
