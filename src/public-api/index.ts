@@ -376,7 +376,7 @@ function validationResponse(requestId: string, result: ValidateConfigurationResu
         422,
         "invalid_configuration",
         "Invalid configuration",
-        "See issues for configuration errors.",
+        configurationFailureDetail(result.issues, "See issues for configuration errors."),
         result.issues,
       );
     case "infrastructure_unavailable":
@@ -447,13 +447,30 @@ function installationResponse(requestId: string, result: InstallConfigurationRes
         422,
         "invalid_configuration",
         "Invalid configuration",
-        `Configuration revision ${result.versionId} was recorded but not activated.`,
+        configurationFailureDetail(
+          result.issues,
+          result.versionId === undefined
+            ? "Configuration was rejected before creating a project or revision."
+            : `Configuration revision ${result.versionId} was recorded but not activated.`,
+        ),
         result.issues,
       );
     case "infrastructure_unavailable":
       return infrastructureProblem(requestId);
   }
   return assertNever(result);
+}
+
+function configurationFailureDetail(
+  issues: readonly { message: string }[],
+  fallback: string,
+): string {
+  const capabilityIssue = issues.find(({ message }) =>
+    /^(workspace_binding_unsupported|workspace_binding_validation_unavailable|daemon_not_connected|daemon_execution_not_allowed):/u.test(
+      message,
+    ),
+  );
+  return capabilityIssue?.message.slice(0, 1000) ?? fallback;
 }
 
 function manualRunResponse(requestId: string, result: DispatchManualRunResult): Response {

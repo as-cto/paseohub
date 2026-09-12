@@ -186,6 +186,33 @@ describe("daemon socket generations", () => {
     });
   });
 
+  it("preflights workspace bindings using only the current authenticated session", async () => {
+    assert.match(
+      JSON.stringify(daemon.validateWorkspaceBinding()),
+      /workspace_binding_unsupported/u,
+    );
+    await daemon.replaceConnection(true, "session-v1", { hubWorkspaceBindings: true });
+    assert.deepEqual(daemon.validateWorkspaceBinding(), { valid: true });
+    daemon.updatePermissions([]);
+    assert.match(
+      JSON.stringify(daemon.validateWorkspaceBinding()),
+      /daemon_execution_not_allowed/u,
+    );
+    daemon.updatePermissions(["hub.execute"]);
+    assert.deepEqual(daemon.validateWorkspaceBinding(), { valid: true });
+
+    await daemon.replaceConnection(false);
+    assert.match(JSON.stringify(daemon.validateWorkspaceBinding()), /daemon_not_connected/u);
+    await daemon.completeServerInfo();
+    assert.match(
+      JSON.stringify(daemon.validateWorkspaceBinding()),
+      /workspace_binding_unsupported/u,
+    );
+    assert.deepEqual(daemon.pendingRequestTypes(), []);
+    await daemon.disconnectCurrent();
+    assert.match(JSON.stringify(daemon.validateWorkspaceBinding()), /daemon_not_connected/u);
+  });
+
   it("forwards workspace bindings only after explicit capability negotiation", async () => {
     await daemon.replaceConnection(true, "session-v1", { hubWorkspaceBindings: true });
     const worktree = {

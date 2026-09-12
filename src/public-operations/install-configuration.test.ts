@@ -10,6 +10,7 @@ import { parseCompiledHubConfig } from "../config/compiler.js";
 import type { HubBundleFile } from "../config/bundle.js";
 import { hashPromptPartialContent } from "../config/prompt-partials.js";
 import { createMemoryDatabase } from "../db/memory.js";
+import type { LinearConnectionRecord } from "../db/types.js";
 import { enrollTestDaemon } from "../test-utils/project-configuration.js";
 import { createDatabasePublicOperationRepository } from "./database-adapter.js";
 import { createPublicOperations } from "./index.js";
@@ -312,15 +313,78 @@ describe("public configuration bundle installation", () => {
       1,
     );
   });
+
+  it.each(["workspace_binding_unsupported", "daemon_not_connected"])(
+    "rejects a new Linear project before creation when preflight reports %s",
+    async (code) => {
+      let providerChecks = 0;
+      const harness = await deploymentHarness({
+        validateWorkspaceBinding: () => ({
+          valid: false,
+          issues: [{ path: [], message: `${code}: Cannot reuse an issue workspace.` }],
+        }),
+        async validateAgentConfiguration() {
+          providerChecks += 1;
+          return { valid: true };
+        },
+      });
+      const linear: LinearConnectionRecord = {
+        id: "00000000-0000-4000-8000-000000000003",
+        organizationId: authorization.organizationId,
+        slug: "acme-linear",
+        providerApplicationId: "linear-app",
+        linearOrganizationId: "linear-org-1",
+        linearOrganizationName: "Acme",
+        appUserId: "app-user-1",
+        accessToken: "test-token",
+        refreshToken: "test-refresh",
+        accessTokenExpiresAt: null,
+        scopes: ["read", "write", "app:assignable", "app:mentionable"],
+      };
+      harness.database.organizationConnectionUsage = async () => ({
+        github: [],
+        slack: [],
+        discord: [],
+        linear: [linear],
+      });
+      const bundle = namedFiles("new-linear-project").map((file) =>
+        Object.assign({}, file, {
+          content:
+            file.path === ".paseo/hub.yml"
+              ? file.content.replace(
+                  "    cwd: /repo",
+                  "    cwd: /repo\n    worktree: { mode: branch-off, newBranch: issue, reuseWorkspace: true }",
+                )
+              : file.content.replace(
+                  "on: manual.run",
+                  "on: linear.comment_created\nfilters: { connection: acme-linear, team: team-1, from_users: [human-1] }",
+                ),
+        }),
+      );
+      const result = await harness.install(bundle);
+      assert.equal(result.status, "invalid_configuration");
+      assert.match(JSON.stringify(result), new RegExp(code, "u"));
+      assert.equal("versionId" in result, false);
+      assert.equal(providerChecks, 0);
+      assert.equal(
+        await harness.database.findProjectBySlugForOrganization(
+          authorization.organizationId,
+          "new-linear-project",
+        ),
+        undefined,
+      );
+    },
+  );
 });
 
-async function deploymentHarness() {
+async function deploymentHarness(validator?: DaemonAgentConfigurationValidator) {
   const database = createMemoryDatabase({ organizationIds: [authorization.organizationId] });
   await enrollTestDaemon(database, authorization.organizationId);
   const operations = createPublicOperations(createDatabasePublicOperationRepository(database), {
-    configurationForProject: (projectId) => new ProjectConfigurationStore(database, projectId),
+    configurationForProject: (projectId) =>
+      new ProjectConfigurationStore(database, projectId, validator),
     validateBundleForOrganization: (organizationId, bundle) =>
-      validateHubBundleForOrganization(database, organizationId, bundle),
+      validateHubBundleForOrganization(database, organizationId, bundle, validator),
     dispatchManualEvent: () => Promise.resolve(),
   });
   return {

@@ -135,7 +135,28 @@ export function createPublicOperations(
     },
     async installConfiguration(authorization, input) {
       try {
-        const resolved = await resolveConfigurationDeployment(
+        let resolved = await resolveConfigurationDeployment(
+          repository,
+          authorization.organizationId,
+          input,
+          true,
+        );
+        if (!resolved.success) return resolved.result;
+        if (resolved.target.status === "would_create") {
+          const preflight = await capabilities.validateBundleForOrganization(
+            authorization.organizationId,
+            resolved.files,
+          );
+          if (!preflight.valid) {
+            return {
+              status: "invalid_configuration",
+              issues: configurationValidationIssues(preflight.validationErrors),
+            };
+          }
+        }
+        // Resolve again so project creation/restoration retains its existing lock,
+        // and revision preparation/activation still validate the current daemon.
+        resolved = await resolveConfigurationDeployment(
           repository,
           authorization.organizationId,
           input,

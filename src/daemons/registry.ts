@@ -222,6 +222,34 @@ export class ActiveDaemonRegistry {
     });
   }
 
+  validateWorkspaceBinding(
+    daemonId: string,
+  ): { valid: true } | { valid: false; issues: readonly AgentValidationIssue[] } {
+    const active = this.active.get(daemonId);
+    const invalid = (
+      message: string,
+    ): { valid: false; issues: readonly AgentValidationIssue[] } => ({
+      valid: false,
+      issues: [{ path: [], message }],
+    });
+    if (!active?.ready || active.socket.readyState !== WebSocket.OPEN) {
+      return invalid(
+        "daemon_not_connected: Connect the selected daemon before enabling Linear issue workspace reuse.",
+      );
+    }
+    if (active.daemon.status !== "active" || !active.daemon.permissions.includes("hub.execute")) {
+      return invalid(
+        "daemon_execution_not_allowed: The selected daemon is not authorized to execute workflows.",
+      );
+    }
+    if (!active.hubWorkspaceBindings) {
+      return invalid(
+        "workspace_binding_unsupported: Update the selected Paseo daemon to support Linear issue workspace reuse, then reconnect it.",
+      );
+    }
+    return { valid: true };
+  }
+
   updatePermissions(daemon: DaemonRecord): void {
     const active = this.active.get(daemon.id);
     if (active) active.daemon = daemon;

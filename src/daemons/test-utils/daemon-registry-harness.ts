@@ -212,6 +212,14 @@ export class DaemonRegistryHarness {
     return this.registry.connection(this.daemon.id) !== undefined;
   }
 
+  validateWorkspaceBinding() {
+    return this.registry.validateWorkspaceBinding(this.daemon.id);
+  }
+
+  updatePermissions(permissions: DaemonRecord["permissions"]): void {
+    this.registry.updatePermissions({ ...this.daemon, permissions });
+  }
+
   async completeServerInfo(
     permissions: readonly string[] = this.daemon.permissions,
   ): Promise<void> {

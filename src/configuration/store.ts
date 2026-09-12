@@ -33,6 +33,12 @@ export interface StoredProjectConfiguration {
 }
 
 export interface DaemonAgentConfigurationValidator {
+  validateWorkspaceBinding?(daemonId: string):
+    | { valid: true }
+    | {
+        valid: false;
+        issues: readonly { path: readonly (string | number)[]; message: string }[];
+      };
   validateAgentConfiguration(
     daemonId: string,
     agent: import("../config/compiler.js").CompiledAgent,
@@ -210,7 +216,7 @@ export class ProjectConfigurationStore {
       throw new Error("configuration revision has no authored bundle");
     }
     const bundle = compileHubBundle(bundleFiles);
-    const validationErrors = await validateNamedAgents(
+    const validationErrors = await validateDaemonRequirements(
       configuration,
       bundle.agentValidationTargets,
       this.daemonAgentValidator,
@@ -219,6 +225,7 @@ export class ProjectConfigurationStore {
       throw new ConfigurationActivationValidationError(validationErrors);
     }
     const routes = await compileTriggerRoutes(this.database, this.projectId, configuration);
+    this.assertWorkspaceBindings(configuration);
     const revision = await this.database.activateProjectConfigurationRevision(
       this.projectId,
       revisionId,
@@ -232,12 +239,18 @@ export class ProjectConfigurationStore {
     if (target === undefined) throw new Error("configuration rollback target not found");
     const configuration = parseProjectConfiguration(target);
     const routes = await compileTriggerRoutes(this.database, this.projectId, configuration);
+    this.assertWorkspaceBindings(configuration);
     const revision = await this.database.rollbackProjectConfiguration(
       this.projectId,
       target.id,
       routes,
     );
     return { revision, configuration };
+  }
+
+  private assertWorkspaceBindings(configuration: CompiledProjectConfiguration): void {
+    const errors = validateWorkspaceBindings(configuration, this.daemonAgentValidator);
+    if (errors !== undefined) throw new ConfigurationActivationValidationError(errors);
   }
 
   async getActive(): Promise<StoredProjectConfiguration | undefined> {
@@ -363,7 +376,7 @@ async function prepareCompiledRevisionForOrganization(
       validationErrors: compiled.validationErrors ?? { formErrors: [], issues: compiled.issues },
     };
   }
-  const validationErrors = await validateNamedAgents(
+  const validationErrors = await validateDaemonRequirements(
     compiled.configuration,
     agentValidationTargets,
     daemonAgentValidator,
@@ -381,6 +394,75 @@ export class ConfigurationActivationValidationError extends Error {
     super("configuration is not valid for the selected daemon");
     this.name = "ConfigurationActivationValidationError";
   }
+}
+
+async function validateDaemonRequirements(
+  configuration: CompiledProjectConfiguration,
+  targets: readonly HubBundleAgentValidationTarget[],
+  validator: DaemonAgentConfigurationValidator | undefined,
+): Promise<ConfigurationValidationErrors | undefined> {
+  return (
+    validateWorkspaceBindings(configuration, validator) ??
+    (await validateNamedAgents(configuration, targets, validator)) ??
+    validateWorkspaceBindings(configuration, validator)
+  );
+}
+
+/** Linear supplies implicit issue identity; an explicit binding key also requires support. */
+function validateWorkspaceBindings(
+  configuration: CompiledProjectConfiguration,
+  validator: DaemonAgentConfigurationValidator | undefined,
+): ConfigurationValidationErrors | undefined {
+  const requiredEnvironments = workspaceBindingEnvironments(configuration);
+  const issues: { path: (string | number)[]; message: string }[] = [];
+  for (const environment of configuration.environments) {
+    if (environment.kind !== "daemon" || !requiredEnvironments.has(environment.name)) continue;
+    const result = validator?.validateWorkspaceBinding?.(environment.daemonId);
+    if (result?.valid === true) continue;
+    const failures = result?.issues ?? [
+      {
+        path: [],
+        message:
+          "workspace_binding_validation_unavailable: The Hub cannot verify the selected daemon's Linear issue workspace reuse capability.",
+      },
+    ];
+    for (const failure of failures) {
+      issues.push({
+        path: [HUB_RESOURCE_PATH, "environments", environment.name, "worktree", ...failure.path],
+        message: `${failure.message} (daemon: ${environment.daemon})`,
+      });
+    }
+  }
+  return issues.length === 0 ? undefined : { formErrors: [], issues };
+}
+
+function workspaceBindingEnvironments(configuration: CompiledProjectConfiguration): Set<string> {
+  const requiredEnvironments = new Set<string>();
+  for (const trigger of configuration.triggers) {
+    for (const step of trigger.steps) {
+      const inputReference = /^\$\{\{\s*paseo\.inputs\.([a-z][a-z0-9_-]*)\s*\}\}$/u.exec(
+        step.environment,
+      );
+      const choices =
+        inputReference === null ? undefined : trigger.inputs[inputReference[1]!]?.choices;
+      // An unconstrained expression can reach any daemon. Finite input choices
+      // and static targets must not make unrelated environments require a companion.
+      for (const environment of configuration.environments) {
+        if (
+          (step.environment === environment.name ||
+            (step.environment.includes("${{") &&
+              (choices === undefined || choices.includes(environment.name)))) &&
+          environment.kind === "daemon" &&
+          environment.worktree?.mode === "branch-off" &&
+          (environment.worktree.workspaceKey !== undefined ||
+            (trigger.on.startsWith("linear.") && environment.worktree.reuseWorkspace === true))
+        ) {
+          requiredEnvironments.add(environment.name);
+        }
+      }
+    }
+  }
+  return requiredEnvironments;
 }
 
 async function validateNamedAgents(

@@ -93,6 +93,53 @@ describe("public API interface", () => {
     assert.deepEqual(await response.json(), { projectSlug: "project", valid: true });
   });
 
+  it.each(["workspace_binding_unsupported", "daemon_not_connected"])(
+    "surfaces %s in both configuration error details without losing structured issues",
+    async (code) => {
+      const issues = [
+        {
+          path: [".paseo/hub.yml", "environments", "issue", "worktree"],
+          message: `${code}: Connect a compatible daemon before enabling Linear issue workspace reuse.`,
+        },
+      ];
+      for (const path of ["/api/v1/configurations/validate", "/api/v1/configurations/install"]) {
+        const api = createPublicApi(
+          { status: "enabled", authenticator: authenticator() },
+          {
+            ...successfulOperations(),
+            validateConfiguration: async () => ({ status: "invalid_configuration", issues }),
+            installConfiguration: async () => ({ status: "invalid_configuration", issues }),
+          },
+        );
+        const response = await api.handle(installRequest(path));
+        assert.equal(response.status, 422);
+        const body = ProblemSchema.parse(await response.json());
+        assert.equal(body.code, "invalid_configuration");
+        assert.equal(body.detail, issues[0]!.message);
+        assert.deepEqual(body.issues, issues);
+      }
+    },
+  );
+
+  it("describes preflight rejection without inventing a recorded revision", async () => {
+    const api = createPublicApi(
+      { status: "enabled", authenticator: authenticator() },
+      {
+        ...successfulOperations(),
+        installConfiguration: async () => ({
+          status: "invalid_configuration",
+          issues: [{ path: [], message: "Invalid resources" }],
+        }),
+      },
+    );
+    const response = await api.handle(installRequest("/api/v1/configurations/install"));
+    assert.equal(response.status, 422);
+    assert.equal(
+      ProblemSchema.parse(await response.json()).detail,
+      "Configuration was rejected before creating a project or revision.",
+    );
+  });
+
   it("returns RFC 9457 request-correlated 404 and 405 responses at the canonical router", async () => {
     const api = createPublicApi(
       { status: "enabled", authenticator: authenticator() },

@@ -78,7 +78,7 @@ export type InstallConfigurationResult =
   | { status: "invalid_bundle"; issues: readonly DomainIssue[] }
   | {
       status: "invalid_configuration";
-      versionId: string;
+      versionId?: string;
       issues: readonly DomainIssue[];
     }
   | InfrastructureUnavailable;
