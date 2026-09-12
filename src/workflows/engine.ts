@@ -1235,8 +1235,12 @@ async function collectProviderMatches(
     dropReason:
       reasons.find((reason) => reason === "agent_session_stopped") ??
       reasons.find((reason) => reason === "superseded_by_agent_session") ??
+      reasons.find((reason) => reason === "steered_into_live_session") ??
       reasons.find((reason) => reason === "configuration_unavailable") ??
       reasons.find((reason) => reason === "trigger_filters_rejected") ??
+      // Provider-specific decisions (including delegated issue filters and Triage intake)
+      // must survive aggregation. A successfully steered input must not appear unrouted.
+      reasons.find((reason) => reason !== "no_trigger_for_source") ??
       "no_trigger_for_source",
   };
 }

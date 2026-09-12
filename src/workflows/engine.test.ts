@@ -20,6 +20,7 @@ import type {
   TriggerRunRecord,
 } from "../db/types.js";
 import type { AcceptedTriggerProviderMatch } from "../triggers/index.js";
+import { PROVIDER_EVENT_DROP_REASON_CODES } from "../triggers/drop-reason.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { parseInvocation } from "../triggers/invocation.js";
 import { UNLIMITED_TEMPLATE } from "../entitlements/catalog.js";
@@ -36,6 +37,42 @@ import {
 } from "../triggers/linear/provider.js";
 
 describe("durable multi-step workflow engine", () => {
+  it.each(PROVIDER_EVENT_DROP_REASON_CODES)(
+    "preserves the provider's handled or rejected event outcome (%s)",
+    async (reason) => {
+      const fixture = await workflowFixture({ rawConfiguration: deadlineConfiguration() });
+      const { handler } = createDurableWorkflowHandler({
+        database: fixture.database,
+        entitlements: fixture.entitlements,
+        providers: [
+          {
+            name: "manual",
+            eventNames: ["manual.run"],
+            async match() {
+              return reason;
+            },
+          },
+        ],
+      });
+
+      await handler(fixture.trigger("run"));
+
+      const receipt = await fixture.database.findProviderEventReceiptById(
+        fixture.providerEventReceiptId,
+      );
+      assert.equal(receipt?.droppedReason, reason);
+      assert.equal(
+        (
+          await fixture.database.findTriggerRunsByProviderEventReceiptId(
+            fixture.providerEventReceiptId,
+          )
+        ).length,
+        0,
+      );
+      assert.equal((await fixture.database.findPendingAgentExecutions()).length, 0);
+    },
+  );
+
   it("rechecks revoked issue authority after acceptance and before a queued run wakes", async () => {
     const race = await continuationRaceFixture("revoked");
     try {
