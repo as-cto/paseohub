@@ -115,6 +115,8 @@ describe("dynamic provider runtime", () => {
     const matches = await trigger.match(externalTrigger());
     if (typeof matches === "string") throw new Error("expected a match");
     const oldMatch = matches[0];
+    assert.equal(trigger.workKeyFor?.(oldMatch!.triggerContext), "issue:A1");
+    assert.equal(trigger.workspaceKeyFor?.(oldMatch!.triggerContext), "workspace:A1");
 
     const second = await runtime.prepare(
       "slack",
@@ -129,6 +131,8 @@ describe("dynamic provider runtime", () => {
 
     // The replaced source retires immediately; later callbacks use the active registration.
     assert.deepEqual(stopped, ["A1"]);
+    assert.equal(trigger.workKeyFor?.(oldMatch!.triggerContext), "issue:A2");
+    assert.equal(trigger.workspaceKeyFor?.(oldMatch!.triggerContext), "workspace:A2");
 
     await trigger.onAgentExecutionCompleted?.(oldMatch!.triggerContext, oldMatch!.outputContext, {
       status: "succeeded",
@@ -805,6 +809,8 @@ function fakeRegistration(
   const trigger: TriggerProvider<"slack", { id: string }, { id: string }> = {
     name: "slack",
     eventNames: ["slack.mention"],
+    workKeyFor: () => `issue:${id}`,
+    workspaceKeyFor: () => `workspace:${id}`,
     match: () =>
       Promise.resolve([
         {

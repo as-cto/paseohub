@@ -468,7 +468,7 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
     return slot;
   }
 
-  private dynamicTrigger(provider: Provider, slot: Slot): TriggerProvider {
+  private dynamicTrigger(provider: Provider, slot: Slot): Required<TriggerProvider> {
     const current = () => {
       const active = slot.active;
       const trigger = active?.triggers[0];
@@ -495,8 +495,11 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
       // Synchronous by design: the lifecycle asks this on the completion path, where an await on
       // a provider lease would sit between an agent's `finish_execution` and its answer.
       workKeyFor: (triggerContext) => current().trigger.workKeyFor?.(triggerContext),
+      workspaceKeyFor: (triggerContext) => current().trigger.workspaceKeyFor?.(triggerContext),
       keepsExecutionAliveBetweenTurns: (triggerContext) =>
         current().trigger.keepsExecutionAliveBetweenTurns?.(triggerContext) === true,
+      continuePendingRun: (input) =>
+        invoke((trigger) => trigger.continuePendingRun?.(input) ?? Promise.resolve(false)),
       onDispatchAccepted: (triggerContext, outputContext, reactionState) =>
         invoke(
           (trigger) =>

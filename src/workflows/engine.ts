@@ -54,6 +54,15 @@ const DEFAULT_WAKEUP_LEASE_MS = 30_000;
 const DEFAULT_WORKER_INTERVAL_MS = 250;
 const CONTINUED_RUN_REASON = "continued_existing_execution";
 
+class LinearWorkspaceIdentityMissingError extends Error {
+  constructor() {
+    super(
+      "linear_workspace_identity_missing: reusable Linear workspaces require a stable issue identity",
+    );
+    this.name = "LinearWorkspaceIdentityMissingError";
+  }
+}
+
 type AcceptedWorkflowRun = Extract<
   Awaited<ReturnType<Database["findTriggerRunById"]>>,
   { outcome: "accepted" }
@@ -601,11 +610,21 @@ export class DurableWorkflowEngine {
         () => provider?.workspaceKeyFor?.(run.triggerContext),
       );
     } catch (error) {
-      if (!(error instanceof ExpressionEvaluationError)) throw error;
-      this.report(error, "workflow.launch-expression.evaluate", {
-        triggerRunId: run.id,
-        stepId: step.id,
-      });
+      if (
+        !(error instanceof ExpressionEvaluationError) &&
+        !(error instanceof LinearWorkspaceIdentityMissingError)
+      )
+        throw error;
+      this.report(
+        error,
+        error instanceof ExpressionEvaluationError
+          ? "workflow.launch-expression.evaluate"
+          : "workflow.launch-intent.validate",
+        {
+          triggerRunId: run.id,
+          stepId: step.id,
+        },
+      );
       const failed = await database.failWorkflowRun(run.id, "failed", error.message, step.id);
       if (failed?.transitioned === true) await this.notifyWorkflowRunTerminal(failed.run);
       return undefined;
@@ -702,6 +721,13 @@ export class DurableWorkflowEngine {
     intent: LaunchMachineIntent,
   ): Promise<boolean> {
     try {
+      assertLinearWorkspaceIdentity(
+        run.triggerContext,
+        intent.environment.worktree,
+        intent.environment.worktree?.mode === "branch-off"
+          ? intent.environment.worktree.workspaceKey
+          : undefined,
+      );
       this.options.validateLaunchMachineIntent?.(intent);
       return false;
     } catch (error) {
@@ -1011,6 +1037,7 @@ function buildStepIntent(
     environment.worktree?.mode === "branch-off" && environment.worktree.reuseWorkspace === true
       ? resolveWorkspaceKey?.()
       : undefined;
+  assertLinearWorkspaceIdentity(run.triggerContext, environment.worktree, workspaceKey);
   return {
     ...buildLaunchMachineIntent({
       organizationId: run.organizationId,
@@ -1151,6 +1178,21 @@ function isRecoverablePreHandoffExecution(execution: AgentExecutionRecord): bool
 function authorityString(value: string, field: string): string {
   if (value.length === 0) throw new Error(`${field} resolved to an empty authority`);
   return value;
+}
+
+function assertLinearWorkspaceIdentity(
+  triggerContext: unknown,
+  worktree: WorktreeTarget | undefined,
+  workspaceKey: string | undefined,
+): void {
+  if (
+    isRecord(triggerContext) &&
+    triggerContext["provider"] === "linear" &&
+    worktree?.mode === "branch-off" &&
+    worktree.reuseWorkspace === true &&
+    !workspaceKey?.trim()
+  )
+    throw new LinearWorkspaceIdentityMissingError();
 }
 
 function materializeExecutionWorktree(

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { describe, it, vi } from "vitest";
+import type { AuthServer } from "../auth/server.js";
+import { DynamicProviderRuntime } from "../provider-applications/index.js";
 import {
   compileHubConfig,
   compiledConfigurationHash,
@@ -19,7 +21,7 @@ import type {
   ProviderEventReceiptRecord,
   TriggerRunRecord,
 } from "../db/types.js";
-import type { AcceptedTriggerProviderMatch } from "../triggers/index.js";
+import type { AcceptedTriggerProviderMatch, TriggerProvider } from "../triggers/index.js";
 import { PROVIDER_EVENT_DROP_REASON_CODES } from "../triggers/drop-reason.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { parseInvocation } from "../triggers/invocation.js";
@@ -137,7 +139,7 @@ describe("durable multi-step workflow engine", () => {
     },
   );
 
-  it("persists the stable Linear workspace identity across issue renames and scopes every authority", async () => {
+  it("persists the stable Linear workspace identity through the active runtime across issue renames and authority scopes", async () => {
     const initial = await materializedLinearWorkspace({});
     const renamed = await materializedLinearWorkspace({ identifier: "OTHER-987" });
     assert.equal(initial.workspaceKey, renamed.workspaceKey);
@@ -163,6 +165,87 @@ describe("durable multi-step workflow engine", () => {
       undefined,
     );
   });
+
+  it.each([undefined, "", "   "])(
+    "rejects an unbound reusable Linear workspace before dispatch (key %j)",
+    async (workspaceKey) => {
+      const fixture = await workflowFixture({
+        rawConfiguration: executionWorktreeConfiguration(true),
+      });
+      const base = providerMatch(fixture.configuration, fixture.revisionId);
+      const provider: TriggerProvider = {
+        ...base,
+        name: "linear",
+        workKeyFor: () => "pos-41",
+        ...(workspaceKey === undefined ? {} : { workspaceKeyFor: () => workspaceKey }),
+        match: async (event) =>
+          (await base.match(event)).map((match) =>
+            Object.assign({}, match, { triggerContext: linearWorkspaceContext() }),
+          ),
+      };
+      const dispatch = vi.fn();
+      const placement = vi.spyOn(fixture.database, "claimWorkspacePlacement");
+      const { handler, engine } = createDurableWorkflowHandler({
+        database: fixture.database,
+        entitlements: fixture.entitlements,
+        providers: [provider],
+        dispatchLaunchMachineIntent: dispatch,
+        logger: createLogger(new FailureLogStream()),
+      });
+      await handler(fixture.trigger("continue"));
+      await engine.processAvailable();
+
+      const [run] = await fixture.database.findTriggerRunsByProviderEventReceiptId(
+        fixture.providerEventReceiptId,
+      );
+      assert.ok(run);
+      assert.equal(run.status, "failed");
+      assert.match(run.failureReason ?? "", /linear_workspace_identity_missing/u);
+      assert.equal(dispatch.mock.calls.length, 0);
+      assert.equal(placement.mock.calls.length, 0);
+      assert.equal((await fixture.database.findPendingAgentExecutions()).length, 0);
+      assert.equal((await fixture.entitlements.usage("org-1", "executions.monthly")).used, 0);
+    },
+  );
+
+  it.each(["github", "discord"])(
+    "preserves reusable workspaces without a Linear identity for %s",
+    async (providerName) => {
+      const fixture = await workflowFixture({
+        rawConfiguration: executionWorktreeConfiguration(true),
+      });
+      const base = providerMatch(fixture.configuration, fixture.revisionId);
+      const dispatch = vi.fn(async (intent: LaunchMachineIntent) => ({
+        execution: await fixture.database.findAgentExecutionByWorkflowStepRunId(
+          intent.workflowStepRunId!,
+        ),
+      }));
+      const { handler, engine } = createDurableWorkflowHandler({
+        database: fixture.database,
+        entitlements: fixture.entitlements,
+        providers: [
+          {
+            ...base,
+            name: providerName,
+            workKeyFor: () => "issue",
+            match: async (event) =>
+              (await base.match(event)).map((match) =>
+                Object.assign({}, match, { triggerContext: { provider: providerName } }),
+              ),
+          },
+        ],
+        dispatchLaunchMachineIntent: dispatch,
+      });
+      await handler(fixture.trigger("continue"));
+      await engine.processAvailable();
+      assert.equal(dispatch.mock.calls.length, 1);
+      assert.deepEqual(dispatch.mock.calls[0]![0].environment.worktree, {
+        mode: "branch-off",
+        newBranch: "linear/issue",
+        reuseWorkspace: true,
+      });
+    },
+  );
 
   it.each(["projectId", "daemonId", "sourceCwd"] as const)(
     "rejects a changed workspace %s before creating or dispatching another execution",
@@ -2241,6 +2324,7 @@ async function materializedLinearWorkspace(options: {
     ...(options.organizationId === undefined ? {} : { organizationId: options.organizationId }),
   });
   const context = linearWorkspaceContext(options);
+  const placement = vi.spyOn(fixture.database, "claimWorkspacePlacement");
   const linear = createLinearTriggerProvider({
     configurationStoreForProject: () => {
       throw new Error("matching is supplied by the fixture");
@@ -2269,7 +2353,7 @@ async function materializedLinearWorkspace(options: {
   const { handler, engine } = createDurableWorkflowHandler({
     database: fixture.database,
     entitlements: fixture.entitlements,
-    providers: [provider],
+    providers: [await activeLinearTrigger(fixture.database, provider)],
     dispatchLaunchMachineIntent: async (intent) => {
       dispatched = intent;
       return {
@@ -2279,7 +2363,7 @@ async function materializedLinearWorkspace(options: {
       };
     },
   });
-  await handler(fixture.trigger("continue"));
+  await handler({ ...fixture.trigger("continue"), source: "linear.issue" });
   await engine.processAvailable();
   assert.ok(dispatched);
   const persisted = await fixture.database.findAgentExecutionByWorkflowStepRunId(
@@ -2289,7 +2373,76 @@ async function materializedLinearWorkspace(options: {
   const worktree = dispatched.environment.worktree;
   assert.equal(worktree?.mode, "branch-off");
   if (worktree?.mode !== "branch-off") throw new Error("workspace missing");
+  assert.deepEqual(
+    placement.mock.calls,
+    options.reuseWorkspace === false
+      ? []
+      : [
+          [
+            {
+              organizationId: options.organizationId ?? "org-1",
+              workspaceKey: worktree.workspaceKey,
+              projectId: fixture.projectId,
+              daemonId: "daemon-1",
+              sourceCwd: "/workspace",
+              firstExecutionId: persisted!.id,
+            },
+          ],
+        ],
+  );
   return worktree;
+}
+
+/** Exercise the same stable provider wrapper used by activated applications in production. */
+async function activeLinearTrigger(database: Database, provider: TriggerProvider) {
+  const auth: AuthServer = {
+    handle: async () => {
+      throw new Error("unused");
+    },
+    resources: async () => {
+      throw new Error("unused");
+    },
+    resolveOrganizationAccess: async () => {
+      throw new Error("unused");
+    },
+    resolveAccount: async () => {
+      throw new Error("unused");
+    },
+    rejectCookieMutation: () => undefined,
+    close: async () => {},
+  };
+  const runtime = new DynamicProviderRuntime({
+    database,
+    auth,
+    applicationBaseUrl: "https://hub.test",
+    registrationFactory: () => ({
+      connection: { name: "linear", status: () => ({ status: "connected" }), actions: {} },
+      triggerProviders: [() => provider],
+      sources: [],
+      outputs: [],
+      requests: [],
+    }),
+  });
+  const registration = runtime.registrations().find((entry) => entry.connection.name === "linear")!;
+  const stable = registration.triggerProviders[0]!({
+    configurationStoreForProject: () => {
+      throw new Error("matching is supplied by the fixture");
+    },
+    connectionsForProject: () => {
+      throw new Error("unused");
+    },
+  })!;
+  await registration.sources[0]!.start(async () => {});
+  const candidate = await runtime.prepare(
+    "linear",
+    { provider: "linear", clientId: "app", clientSecret: "test", webhookSecret: "test" },
+    "https://hub.test",
+    { provider: "linear", id: "app", name: "Test Agent" },
+    1,
+  );
+  await candidate.start();
+  candidate.publish();
+  return stable;
 }
 
 function linearWorkspaceContext(
@@ -2501,7 +2654,7 @@ async function continuationRaceFixture(
   const options = {
     database,
     entitlements,
-    providers: [provider],
+    providers: [await activeLinearTrigger(database, provider)],
     now: () => now,
     leaseMs: 1000,
     logger: createLogger(new FailureLogStream()),
